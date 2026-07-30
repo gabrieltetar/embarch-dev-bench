@@ -1,0 +1,4 @@
+tests:
+  embarch_dev_bench.serial_protocol:
+    platform_allow: native_sim
+    tags: embarch_dev_bench

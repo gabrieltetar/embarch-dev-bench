@@ -1,0 +1,19 @@
+# west-managed workspace contents (embarch-dev-bench/design.md §2) -- fetched
+# by `west update`, not checked in.
+workspaces/*/.west/
+workspaces/*/zephyr/
+workspaces/*/modules/
+workspaces/*/bootloader/
+workspaces/*/tools/
+workspaces/*/nrf/
+workspaces/*/nrfxlib/
+workspaces/*/test/
+
+# Zephyr/west build output
+build/
+build-*/
+twister-out/
+
+*.pyc
+__pycache__/
+.venv/

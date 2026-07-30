@@ -1,0 +1,31 @@
+# Manifest for workspaces/nordic (embarch-dev-bench/design.md §2, §3 decisions
+# 2/3/5) -- nRF Connect SDK (NCS), pinned for nRF54L15DK support.
+#
+# Lives in this manifest/ subdirectory for the same reason as
+# workspaces/native_sim/manifest/west.yml: `west init -l manifest` (run from
+# within workspaces/nordic/) needs `manifest` to be a child of this
+# workspace's own directory so `.west/`, `zephyr/`, `modules/` all land inside
+# workspaces/nordic/ itself, independent of native_sim's topdir (decision 2).
+#
+# `nrf` (repo-path `sdk-nrf`) is Nordic's own documented "freestanding
+# application" pattern (see nrfconnect/ncs-example-application's west.yml) --
+# its own nested manifest pulls in the matching sdk-zephyr fork and every HAL
+# module NCS needs, so nothing else needs listing here.
+#
+# v3.4.0 is NCS's current LTS release (as of this writing) with confirmed
+# nRF54L15DK support (first comprehensive support landed in NCS 2.8.0) --
+# reconfirm this is still the intended pin before running `west update`, since
+# this workspace hasn't been built or tested against real hardware yet
+# (embarch-dev-bench/design.md §3 decision 20).
+manifest:
+  remotes:
+    - name: ncs
+      url-base: https://github.com/nrfconnect
+  projects:
+    - name: nrf
+      remote: ncs
+      repo-path: sdk-nrf
+      revision: v3.4.0
+      import: true
+  self:
+    path: manifest

@@ -1,0 +1,26 @@
+# Manifest for workspaces/native_sim (embarch-dev-bench/design.md §2, §3
+# decision 16) -- vanilla Zephyr, no vendor fork, for host-side iteration
+# without real hardware.
+#
+# Lives in this manifest/ subdirectory (not at workspaces/native_sim/'s own
+# root) so that `west init -l manifest` (run from within workspaces/native_sim/)
+# places `.west/`, and later `zephyr/`/`modules/` from `west update`, directly
+# inside workspaces/native_sim/ itself -- `west init -l <dir>` always creates
+# `.west/` *next to* <dir>, so <dir> must be a child of the intended topdir,
+# not the topdir itself.
+#
+# `import: true` (rather than a trimmed name-allowlist, as Zephyr's own
+# example-application template uses) pulls every module Zephyr's own manifest
+# lists, including native_simulator -- simplest way to be sure native_sim's
+# own runner dependency isn't accidentally left out.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.0
+      import: true
+  self:
+    path: manifest
