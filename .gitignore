@@ -12,6 +12,7 @@ workspaces/*/test/
 # Zephyr/west build output
 build/
 build-*/
+build_*/
 twister-out/
 
 *.pyc
