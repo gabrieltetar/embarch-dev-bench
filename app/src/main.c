@@ -1,6 +1,6 @@
 /* embarch-dev-bench firmware entry point.
  *
- * embarch-dev-bench/design.md §1, §2, §3 decisions 6/7/12/19/20. Shared
+ * embarch-dev-bench/design.md §1, §2, §3 decisions 6/7/12/19/20/21. Shared
  * across both workspaces (nordic/native_sim) — only ble_bridge_real.c vs
  * ble_bridge_stub.c differs per workspace (decision 16).
  *
@@ -33,7 +33,12 @@ static const struct device *const link_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_con
 
 static void send_message(const struct dev_bench_message *msg)
 {
-	uint8_t frame[DBM_MAX_FRAME_LEN];
+	/* `static`, not a stack local: `struct dev_bench_message`'s union is
+	 * sized by its largest member (`struct dbm_study_start`, several KB —
+	 * see serial_protocol.h), regardless of which tag this particular call
+	 * actually uses. Safe because the link is driven from this one
+	 * single-threaded RX/dispatch loop (design.md §3 decision 20). */
+	static uint8_t frame[DBM_MAX_FRAME_LEN];
 	int frame_len = dbm_encode_frame(msg, frame, sizeof(frame));
 
 	if (frame_len < 0) {
@@ -46,10 +51,70 @@ static void send_message(const struct dev_bench_message *msg)
 
 static void send_log_line(const char *text)
 {
-	struct dev_bench_message msg = {.tag = DBM_TAG_LOG_LINE};
+	static struct dev_bench_message msg;
 
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_LOG_LINE;
 	strncpy(msg.log_line.text, text, DBM_MAX_LOG_LINE_LEN);
 	msg.log_line.text[DBM_MAX_LOG_LINE_LEN] = '\0';
+	send_message(&msg);
+}
+
+static void send_study_done(bool completed)
+{
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STUDY_DONE;
+	msg.study_done.completed = completed;
+	send_message(&msg);
+}
+
+/* Builds and sends one `StepResult` from a step's device-observed `struct
+ * outcome` (ble_bridge.h) — the C-side `Outcome`/`captured_data` shapes
+ * mirror embarch-study-designer's `result::Outcome`/`StepResult` closely
+ * enough (design.md §4.5) that this is a direct field-by-field translation,
+ * not a reinterpretation. `power_samples_ref`/`waveform_ref` are never set
+ * (encoded as `None` by serial_protocol.c's own encode_body): this pass has
+ * no power/waveform capture yet (decision 21's scope). */
+static void send_step_result(uint32_t step_index, const char *step_name,
+			      const struct outcome *bridge_outcome)
+{
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STEP_RESULT;
+	msg.step_result.step_index = step_index;
+	strncpy(msg.step_result.result.step_name, step_name, DBM_MAX_NAME_LEN);
+	msg.step_result.result.step_name[DBM_MAX_NAME_LEN] = '\0';
+
+	switch (bridge_outcome->kind) {
+	case OUTCOME_PASS:
+		msg.step_result.result.outcome.tag = 0;
+		break;
+	case OUTCOME_FAIL:
+		msg.step_result.result.outcome.tag = 1;
+		strncpy(msg.step_result.result.outcome.fail_reason, bridge_outcome->fail_reason,
+			DBM_MAX_FAIL_REASON_LEN);
+		msg.step_result.result.outcome.fail_reason[DBM_MAX_FAIL_REASON_LEN] = '\0';
+		break;
+	case OUTCOME_TIMED_OUT:
+	default:
+		msg.step_result.result.outcome.tag = 2;
+		break;
+	}
+
+	if (bridge_outcome->captured_data != NULL && bridge_outcome->captured_len > 0) {
+		size_t len = bridge_outcome->captured_len;
+
+		if (len > sizeof(msg.step_result.result.captured_data)) {
+			len = sizeof(msg.step_result.result.captured_data);
+		}
+		memcpy(msg.step_result.result.captured_data, bridge_outcome->captured_data, len);
+		msg.step_result.result.captured_data_len = (uint32_t)len;
+		msg.step_result.result.has_captured_data = true;
+	}
+
 	send_message(&msg);
 }
 
@@ -86,56 +151,89 @@ static int receive_message(struct dev_bench_message *out)
 	}
 }
 
-/* A fixed, illustrative BLE action plus a couple of fake power samples,
- * standing in for a real Study's steps. No DevBenchMessage variant carries an
- * actual Study payload yet (embarch-dev-bench/design.md §4's open item on
- * this) — this proves the serial -> dispatch -> BLE action -> result plumbing
- * against ble_bridge_real.c / ble_bridge_stub.c either way, matching decision
- * 20's "even against fixed/fake decode results" bring-up scope. Replace with
- * real per-Step dispatch once that wire gap and decision 8's FFI wiring both
- * close. */
-static void run_demo_sequence(void)
+/* `Hello` doubles as a hard reset (embarch-study-designer/design.md §3
+ * decision 12 / embarch-dev-bench decision 11) and a schema-compatibility
+ * handshake. Returns whether dev-bench should now wait for a `StudyStart`
+ * (i.e. the schema versions matched) — `false` on a mismatch, matching the
+ * previous bring-up behavior of not running anything in that case. */
+static bool handle_hello(const struct dbm_hello *hello)
 {
-	struct action advertise = {
-		.kind = ACTION_BLE_ADVERTISE,
-		.advertise =
-			{
-				.has_local_name = true,
-				.local_name = "embarch-dev-bench",
-				.service_uuid_count = 0,
-				.adv_interval_ms = 100,
-			},
-	};
+	ble_bridge_reset();
 
-	send_log_line("demo: advertising");
-	struct outcome outcome = ble_bridge_execute(&advertise, 5000);
+	uint32_t our_schema = study_ffi_schema_version();
+	static struct dev_bench_message ack;
 
-	if (outcome.kind != OUTCOME_PASS) {
-		send_log_line("demo: advertise step did not pass");
+	memset(&ack, 0, sizeof(ack));
+	ack.tag = DBM_TAG_HELLO_ACK;
+	ack.hello_ack.schema_version = our_schema;
+	ack.hello_ack.compatible = (hello->schema_version == our_schema);
+	strncpy(ack.hello_ack.firmware_version, APP_FIRMWARE_VERSION, DBM_MAX_FIRMWARE_VERSION_LEN);
+	ack.hello_ack.firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN] = '\0';
+	send_message(&ack);
+
+	if (!ack.hello_ack.compatible) {
+		send_log_line("schema version mismatch, not awaiting a StudyStart");
+		return false;
+	}
+	return true;
+}
+
+/* Real per-`Study` dispatch (embarch-dev-bench/design.md §3 decision 21),
+ * scoped to `Action::BleAdvertise` steps only for this pass —
+ * `study`/`serial_protocol.c`'s own decode already rejected any other action
+ * kind whole (`has_unsupported_action`) rather than partially decoding it, so
+ * by the time a `struct dbm_study_start` reaches here every step in
+ * `study->steps[0..study->steps_len)` is a `BleAdvertise` action.
+ *
+ * `steps_crc` was already verified during decode (serial_protocol.c's own
+ * CRC-32 over the raw wire bytes of `steps`, independently reproducing
+ * embarch-study-designer's `steps_crc()` — see serial_protocol.h's doc
+ * comment on `dbm_decode_frame` for why this needs no FFI round-trip into
+ * that crate to get the identical answer `essd_study_decode_and_verify`
+ * would). This function only needs to act on the verdict.
+ */
+static void dispatch_study(const struct dbm_study_start *study)
+{
+	if (study->has_unsupported_action) {
+		send_log_line("StudyStart contains a step whose action isn't BleAdvertise "
+			      "(unsupported for now); aborting without running any step");
+		send_study_done(false);
+		return;
+	}
+	if (!study->steps_crc_valid) {
+		send_log_line("StudyStart steps_crc mismatch; aborting without running any step");
+		send_study_done(false);
 		return;
 	}
 
-	struct dev_bench_message start = {
-		.tag = DBM_TAG_STREAM_START,
-		.stream_start = {.step_index = 0, .channel = DBM_CHANNEL_POWER},
-	};
-	send_message(&start);
+	bool completed = true;
 
-	for (int i = 0; i < 3; i++) {
-		struct dev_bench_message chunk = {
-			.tag = DBM_TAG_STREAM_CHUNK,
-			.stream_chunk = {.rx_utc_ms = (uint64_t)k_uptime_get(), .value = 3.3f},
+	for (uint32_t i = 0; i < study->steps_len; i++) {
+		const struct dbm_step *step = &study->steps[i];
+		struct action action = {
+			.kind = ACTION_BLE_ADVERTISE,
+			.advertise =
+				{
+					.has_local_name = step->action.has_local_name,
+					.service_uuid_count = 0, /* not carried this far, decision 21 */
+					.adv_interval_ms = step->action.adv_interval_ms,
+				},
 		};
-		send_message(&chunk);
-		k_sleep(K_MSEC(10));
+
+		strncpy(action.advertise.local_name, step->action.local_name, BLE_MAX_LOCAL_NAME_LEN);
+		action.advertise.local_name[BLE_MAX_LOCAL_NAME_LEN] = '\0';
+
+		struct outcome bridge_outcome = ble_bridge_execute(&action, step->timeout_ms);
+
+		send_step_result(i, step->name, &bridge_outcome);
+
+		if (bridge_outcome.kind != OUTCOME_PASS && !step->continue_on_fail) {
+			completed = false;
+			break;
+		}
 	}
 
-	struct dev_bench_message end = {
-		.tag = DBM_TAG_STREAM_END,
-		.stream_end = {.step_index = 0, .channel = DBM_CHANNEL_POWER},
-	};
-	send_message(&end);
-	send_log_line("demo: complete");
+	send_study_done(completed);
 }
 
 int main(void)
@@ -144,39 +242,44 @@ int main(void)
 		return -1;
 	}
 
+	/* Whether the most recent Hello/HelloAck handshake was schema-compatible
+	 * and dev-bench is now expecting the StudyStart that follows it
+	 * (embarch-study-designer/design.md §3 decision 24: Core sends it exactly
+	 * once, immediately after that handshake completes). A fresh Hello
+	 * arriving before a StudyStart does (Core resetting again) is handled
+	 * like any other Hello rather than being dropped as "unexpected" here —
+	 * see the DBM_TAG_HELLO case below. */
+	bool awaiting_study = false;
+
 	while (1) {
-		struct dev_bench_message hello;
+		/* `static`: see send_message's own comment on why a
+		 * `struct dev_bench_message` shouldn't be a stack local here. */
+		static struct dev_bench_message msg;
 
-		if (receive_message(&hello) != 0 || hello.tag != DBM_TAG_HELLO) {
+		if (receive_message(&msg) != 0) {
 			continue;
 		}
 
-		/* embarch-study-designer/design.md §3 decision 12 / embarch-dev-bench
-		 * decision 11: Hello doubles as a hard reset. No in-progress study
-		 * execution state exists yet to abort in this bring-up pass, but the
-		 * BT bonding table clear applies unconditionally on every Hello. */
-		ble_bridge_reset();
-
-		uint32_t our_schema = study_ffi_schema_version();
-		struct dev_bench_message ack = {
-			.tag = DBM_TAG_HELLO_ACK,
-			.hello_ack =
-				{
-					.schema_version = our_schema,
-					.compatible = (hello.hello.schema_version == our_schema),
-				},
-		};
-		strncpy(ack.hello_ack.firmware_version, APP_FIRMWARE_VERSION,
-			DBM_MAX_FIRMWARE_VERSION_LEN);
-		ack.hello_ack.firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN] = '\0';
-		send_message(&ack);
-
-		if (!ack.hello_ack.compatible) {
-			send_log_line("schema version mismatch, not running demo sequence");
-			continue;
+		switch (msg.tag) {
+		case DBM_TAG_HELLO:
+			awaiting_study = handle_hello(&msg.hello);
+			break;
+		case DBM_TAG_STUDY_START:
+			if (awaiting_study) {
+				dispatch_study(&msg.study_start);
+			} else {
+				send_log_line("StudyStart received without a preceding Hello "
+					      "handshake; ignoring");
+			}
+			awaiting_study = false;
+			break;
+		default:
+			/* Core only ever sends Hello then StudyStart on this link
+			 * (embarch-study-designer/design.md §3 decisions 12/24) —
+			 * anything else here is unexpected; ignore rather than
+			 * misbehave. */
+			break;
 		}
-
-		run_demo_sequence();
 	}
 	return 0;
 }

@@ -29,7 +29,7 @@ ZTEST(serial_protocol, test_hello_round_trip)
 {
 	struct dev_bench_message msg = {
 		.tag = DBM_TAG_HELLO,
-		.hello = {.schema_version = 2, .host_utc_ms = 1753000000000ULL, .steps_crc = 0xDEADBEEF},
+		.hello = {.schema_version = 2, .host_utc_ms = 1753000000000ULL},
 	};
 	struct dev_bench_message decoded;
 
@@ -37,7 +37,6 @@ ZTEST(serial_protocol, test_hello_round_trip)
 	zassert_equal(decoded.tag, DBM_TAG_HELLO, "wrong tag");
 	zassert_equal(decoded.hello.schema_version, 2, "schema_version mismatch");
 	zassert_equal(decoded.hello.host_utc_ms, 1753000000000ULL, "host_utc_ms mismatch");
-	zassert_equal(decoded.hello.steps_crc, 0xDEADBEEF, "steps_crc mismatch");
 }
 
 ZTEST(serial_protocol, test_hello_ack_round_trip)
@@ -85,7 +84,10 @@ ZTEST(serial_protocol, test_stream_chunk_round_trip)
 {
 	struct dev_bench_message msg = {
 		.tag = DBM_TAG_STREAM_CHUNK,
-		.stream_chunk = {.rx_utc_ms = 42, .value = 3.3f},
+		.stream_chunk = {.rx_utc_ms = 42,
+				 .value = 3.3f,
+				 .unit = DBM_UNIT_MILLIAMPS,
+				 .channel_id = 5},
 	};
 	struct dev_bench_message decoded;
 
@@ -93,6 +95,8 @@ ZTEST(serial_protocol, test_stream_chunk_round_trip)
 	zassert_equal(decoded.tag, DBM_TAG_STREAM_CHUNK, "wrong tag");
 	zassert_equal(decoded.stream_chunk.rx_utc_ms, 42, "rx_utc_ms mismatch");
 	zassert_within(decoded.stream_chunk.value, 3.3f, 0.0001f, "value mismatch");
+	zassert_equal(decoded.stream_chunk.unit, DBM_UNIT_MILLIAMPS, "unit mismatch");
+	zassert_equal(decoded.stream_chunk.channel_id, 5, "channel_id mismatch");
 }
 
 ZTEST(serial_protocol, test_log_line_round_trip)
@@ -135,4 +139,159 @@ ZTEST(serial_protocol, test_encode_rejects_oversized_log_line)
 
 	zassert_true(dbm_encode_frame(&msg, frame, sizeof(frame)) < 0,
 		     "encode into an undersized buffer should fail, not overflow it");
+}
+
+/* dev_bench_message's union is large now that DBM_TAG_STUDY_START embeds a full
+ * DBM_MAX_STEPS_PER_STUDY-sized struct dbm_step array -- `static`, not a stack
+ * local, to fit this test suite's own thread stack (see app/prj.conf's/this
+ * test's own prj.conf CONFIG_ZTEST_STACK_SIZE bump). */
+static struct dev_bench_message study_start_msg;
+static struct dev_bench_message study_start_decoded;
+
+ZTEST(serial_protocol, test_study_start_round_trip_one_step)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "advertise");
+	study_start_msg.study_start.steps[0].timeout_ms = 5000;
+	study_start_msg.study_start.steps[0].continue_on_fail = false;
+	study_start_msg.study_start.steps[0].action.has_local_name = true;
+	strcpy(study_start_msg.study_start.steps[0].action.local_name, "embarch-dev-bench");
+	study_start_msg.study_start.steps[0].action.adv_interval_ms = 100;
+	/* The real steps_crc embarch-study-designer's own steps_crc() computes
+	 * for this exact single-step content (name "advertise",
+	 * BleAdvertise{local_name: Some("embarch-dev-bench"), service_uuids: [],
+	 * adv_interval_ms: 100}, timeout_ms 5000, power_sample: None,
+	 * continue_on_fail: false) -- confirmed against the real crate, not
+	 * guessed, so this test actually proves this file's CRC-32 matches that
+	 * crate's, not just that this file agrees with itself. */
+	study_start_msg.study_start.steps_crc = 0x889FAF61;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.tag, DBM_TAG_STUDY_START, "wrong tag");
+	zassert_equal(study_start_decoded.study_start.steps_len, 1, "steps_len mismatch");
+	zassert_false(study_start_decoded.study_start.has_unsupported_action,
+		      "should not flag an unsupported action");
+	zassert_str_equal(study_start_decoded.study_start.steps[0].name, "advertise", "name mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].timeout_ms, 5000, "timeout_ms mismatch");
+	zassert_true(study_start_decoded.study_start.steps[0].action.has_local_name,
+		     "has_local_name mismatch");
+	zassert_str_equal(study_start_decoded.study_start.steps[0].action.local_name,
+			   "embarch-dev-bench", "local_name mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].action.adv_interval_ms, 100,
+		      "adv_interval_ms mismatch");
+	zassert_equal(study_start_decoded.study_start.steps_crc, 0x889FAF61, "steps_crc mismatch");
+	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
+
+	/* Flipping a bit must be caught. */
+	study_start_msg.study_start.steps_crc ^= 1;
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_false(study_start_decoded.study_start.steps_crc_valid,
+		      "corrupted steps_crc should not validate");
+}
+
+ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 2;
+
+	strcpy(study_start_msg.study_start.steps[0].name, "advertise-1");
+	study_start_msg.study_start.steps[0].timeout_ms = 5000;
+	study_start_msg.study_start.steps[0].continue_on_fail = false;
+	study_start_msg.study_start.steps[0].action.has_local_name = true;
+	strcpy(study_start_msg.study_start.steps[0].action.local_name, "dev-bench");
+	study_start_msg.study_start.steps[0].action.adv_interval_ms = 100;
+
+	strcpy(study_start_msg.study_start.steps[1].name, "advertise-2");
+	study_start_msg.study_start.steps[1].timeout_ms = 2000;
+	study_start_msg.study_start.steps[1].continue_on_fail = true;
+	study_start_msg.study_start.steps[1].action.has_local_name = false;
+	study_start_msg.study_start.steps[1].action.adv_interval_ms = 250;
+
+	/* Real steps_crc for this exact two-step content, confirmed against
+	 * embarch-study-designer's own steps_crc() -- see the one-step test's
+	 * comment above. */
+	study_start_msg.study_start.steps_crc = 0xAD7A131B;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
+	zassert_str_equal(study_start_decoded.study_start.steps[1].name, "advertise-2", "name mismatch");
+	zassert_false(study_start_decoded.study_start.steps[1].action.has_local_name,
+		      "has_local_name mismatch");
+	zassert_true(study_start_decoded.study_start.steps[1].continue_on_fail,
+		     "continue_on_fail mismatch");
+	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
+}
+
+ZTEST(serial_protocol, test_study_start_rejects_too_many_steps)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = DBM_MAX_STEPS_PER_STUDY + 1;
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+
+	zassert_true(dbm_encode_frame(&study_start_msg, frame, sizeof(frame)) < 0,
+		     "steps_len beyond struct dbm_step[]'s bound should be rejected, not read OOB");
+}
+
+ZTEST(serial_protocol, test_step_result_pass_round_trip)
+{
+	struct dev_bench_message msg = {.tag = DBM_TAG_STEP_RESULT};
+
+	msg.step_result.step_index = 0;
+	strcpy(msg.step_result.result.step_name, "advertise");
+	msg.step_result.result.outcome.tag = 0; /* Pass */
+	msg.step_result.result.has_captured_data = false;
+
+	struct dev_bench_message decoded;
+
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_equal(decoded.tag, DBM_TAG_STEP_RESULT, "wrong tag");
+	zassert_equal(decoded.step_result.step_index, 0, "step_index mismatch");
+	zassert_str_equal(decoded.step_result.result.step_name, "advertise", "step_name mismatch");
+	zassert_equal(decoded.step_result.result.outcome.tag, 0, "outcome tag mismatch");
+	zassert_false(decoded.step_result.result.has_captured_data, "has_captured_data mismatch");
+}
+
+ZTEST(serial_protocol, test_step_result_fail_round_trip)
+{
+	struct dev_bench_message msg = {.tag = DBM_TAG_STEP_RESULT};
+
+	msg.step_result.step_index = 2;
+	strcpy(msg.step_result.result.step_name, "connect");
+	msg.step_result.result.outcome.tag = 1; /* Fail */
+	strcpy(msg.step_result.result.outcome.fail_reason, "no adv seen");
+	msg.step_result.result.has_captured_data = true;
+	msg.step_result.result.captured_data[0] = 0xAB;
+	msg.step_result.result.captured_data[1] = 0xCD;
+	msg.step_result.result.captured_data_len = 2;
+
+	struct dev_bench_message decoded;
+
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_equal(decoded.step_result.step_index, 2, "step_index mismatch");
+	zassert_equal(decoded.step_result.result.outcome.tag, 1, "outcome tag mismatch");
+	zassert_str_equal(decoded.step_result.result.outcome.fail_reason, "no adv seen",
+			   "fail_reason mismatch");
+	zassert_true(decoded.step_result.result.has_captured_data, "has_captured_data mismatch");
+	zassert_equal(decoded.step_result.result.captured_data_len, 2, "captured_data_len mismatch");
+	zassert_equal(decoded.step_result.result.captured_data[0], 0xAB, "captured_data[0] mismatch");
+	zassert_equal(decoded.step_result.result.captured_data[1], 0xCD, "captured_data[1] mismatch");
+}
+
+ZTEST(serial_protocol, test_study_done_round_trip)
+{
+	struct dev_bench_message msg = {.tag = DBM_TAG_STUDY_DONE, .study_done = {.completed = true}};
+	struct dev_bench_message decoded;
+
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_equal(decoded.tag, DBM_TAG_STUDY_DONE, "wrong tag");
+	zassert_true(decoded.study_done.completed, "completed mismatch");
+
+	msg.study_done.completed = false;
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_false(decoded.study_done.completed, "completed mismatch");
 }

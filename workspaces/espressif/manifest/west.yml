@@ -1,0 +1,29 @@
+# Manifest for workspaces/espressif -- vanilla Zephyr, pinned for ESP32-C5
+# support (embarch-dev-bench/design.md decision 2's per-vendor-family
+# workspace pattern, extended for the first time here).
+#
+# Interim/temporary second vendor family (2026-08-19): the real reason this
+# workspace exists is an ESP32-C5-WROOM-1 standing in for a broken
+# nRF54L15DK while a replacement is on order (~1 week) -- not a permanent
+# second-board commitment on its own, though nothing here is throwaway code
+# (same decision-2 pattern the nordic/ workspace already established).
+#
+# v4.4.0 is the first Zephyr release with esp32c5_devkitc board support
+# (confirmed against Zephyr's own release notes) -- same tag
+# workspaces/native_sim already pins, coincidentally.
+#
+# `import: true`, same choice workspaces/native_sim/manifest/west.yml already
+# makes and explains: pulls every module Zephyr's own manifest lists
+# (including hal_espressif) rather than a trimmed allowlist, simplest way to
+# be sure a real dependency isn't accidentally left out for a board this new.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.0
+      import: true
+  self:
+    path: manifest

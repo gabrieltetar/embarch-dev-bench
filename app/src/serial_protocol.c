@@ -103,6 +103,48 @@ static int pc_read_f32(const uint8_t *in, size_t in_len, size_t *pos, float *out
 	return 0;
 }
 
+/* Reads (and discards) a length-prefixed sequence of `elem_size`-byte fixed
+ * elements -- postcard's `Vec<T,N>`/`&str`/`String` encoding for any `T`
+ * with a compile-time-known size (`elem_size = 1` covers a `String`'s raw
+ * UTF-8 bytes, `elem_size = 16` covers `Vec<Uuid,4>`'s fixed 16-byte
+ * elements). Used where this firmware doesn't need the field's contents but
+ * must still walk past it correctly to decode whatever comes next. */
+static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, size_t elem_size)
+{
+	uint64_t len;
+
+	if (pc_read_varint(in, in_len, pos, &len) != 0) {
+		return -1;
+	}
+	size_t n = (size_t)len * elem_size;
+
+	if (*pos + n > in_len) {
+		return -1;
+	}
+	*pos += n;
+	return 0;
+}
+
+/* CRC-32 (ISO-HDLC / the common "CRC-32" used by zip/gzip/PNG/Ethernet;
+ * poly 0xEDB88320 reflected, init/xorout 0xFFFFFFFF) -- matches the `crc`
+ * crate's `CRC_32_ISO_HDLC` embarch-study-designer's `steps_crc()` (src/crc.rs)
+ * uses. Bitwise, not table-driven: this only ever runs once per received
+ * `StudyStart`, not a hot path worth the table's static footprint. */
+static uint32_t dbm_crc32(const uint8_t *data, size_t len)
+{
+	uint32_t crc = 0xFFFFFFFFu;
+
+	for (size_t i = 0; i < len; i++) {
+		crc ^= data[i];
+		for (int bit = 0; bit < 8; bit++) {
+			uint32_t mask = -(crc & 1u);
+
+			crc = (crc >> 1) ^ (0xEDB88320u & mask);
+		}
+	}
+	return crc ^ 0xFFFFFFFFu;
+}
+
 /* ---- COBS -----------------------------------------------------------------
  *
  * Standard Consistent Overhead Byte Stuffing (embarch-study-designer/design.md
@@ -193,7 +235,6 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 	case DBM_TAG_HELLO:
 		WRITE_VARINT(msg->hello.schema_version);
 		WRITE_VARINT(msg->hello.host_utc_ms);
-		WRITE_VARINT(msg->hello.steps_crc);
 		return 0;
 	case DBM_TAG_HELLO_ACK:
 		WRITE_VARINT(msg->hello_ack.schema_version);
@@ -213,6 +254,11 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			return -1;
 		}
 		*pos += pc_write_f32(msg->stream_chunk.value, out + *pos);
+		WRITE_VARINT(msg->stream_chunk.unit);
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = msg->stream_chunk.channel_id; /* u8: raw byte, not varint */
 		return 0;
 	case DBM_TAG_STREAM_END:
 		WRITE_VARINT(msg->stream_end.step_index);
@@ -221,6 +267,84 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 	case DBM_TAG_LOG_LINE:
 		return pc_write_bytes((const uint8_t *)msg->log_line.text,
 				       strlen(msg->log_line.text), out, out_cap, pos);
+	case DBM_TAG_STUDY_START:
+		/* dev-bench never sends StudyStart in practice (Core is the only
+		 * sender) -- this encode path exists for this file's own
+		 * round-trip tests. `service_uuids`/`power_sample` aren't stored
+		 * on `struct dbm_step` (decision 21's scope), so they're always
+		 * encoded empty/None here. */
+		if (msg->study_start.steps_len > DBM_MAX_STEPS_PER_STUDY) {
+			return -1; /* would read past struct dbm_study_start.steps[]'s bound */
+		}
+		WRITE_VARINT(msg->study_start.steps_len);
+		for (uint32_t i = 0; i < msg->study_start.steps_len; i++) {
+			const struct dbm_step *step = &msg->study_start.steps[i];
+
+			if (pc_write_bytes((const uint8_t *)step->name, strlen(step->name), out,
+					    out_cap, pos) != 0) {
+				return -1;
+			}
+			WRITE_VARINT(0); /* Action::BleAdvertise tag */
+			if (*pos + 1 > out_cap) {
+				return -1;
+			}
+			out[(*pos)++] = step->action.has_local_name ? 1 : 0;
+			if (step->action.has_local_name &&
+			    pc_write_bytes((const uint8_t *)step->action.local_name,
+					    strlen(step->action.local_name), out, out_cap, pos) != 0) {
+				return -1;
+			}
+			WRITE_VARINT(0); /* service_uuids: Vec<Uuid,4>, always empty */
+			WRITE_VARINT(step->action.adv_interval_ms);
+			WRITE_VARINT(step->timeout_ms);
+			if (*pos + 1 > out_cap) {
+				return -1;
+			}
+			out[(*pos)++] = 0; /* power_sample: Option<PowerSampleWindow>, always None */
+			if (*pos + 1 > out_cap) {
+				return -1;
+			}
+			out[(*pos)++] = step->continue_on_fail ? 1 : 0;
+		}
+		WRITE_VARINT(msg->study_start.steps_crc);
+		return 0;
+	case DBM_TAG_STEP_RESULT: {
+		const struct dbm_step_result_payload *r = &msg->step_result.result;
+
+		WRITE_VARINT(msg->step_result.step_index);
+		if (pc_write_bytes((const uint8_t *)r->step_name, strlen(r->step_name), out, out_cap,
+				    pos) != 0) {
+			return -1;
+		}
+		WRITE_VARINT(r->outcome.tag);
+		if (r->outcome.tag == 1 &&
+		    pc_write_bytes((const uint8_t *)r->outcome.fail_reason,
+				    strlen(r->outcome.fail_reason), out, out_cap, pos) != 0) {
+			return -1;
+		}
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = r->has_captured_data ? 1 : 0;
+		if (r->has_captured_data &&
+		    pc_write_bytes(r->captured_data, r->captured_data_len, out, out_cap, pos) != 0) {
+			return -1;
+		}
+		/* power_samples_ref/waveform_ref: Option<String>, always None
+		 * (this firmware has no power/waveform capture yet, decision 21). */
+		if (*pos + 2 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = 0;
+		out[(*pos)++] = 0;
+		return 0;
+	}
+	case DBM_TAG_STUDY_DONE:
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = msg->study_done.completed ? 1 : 0;
+		return 0;
 	default:
 		return -1;
 	}
@@ -230,7 +354,15 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 
 int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap)
 {
-	uint8_t raw[DBM_MAX_RAW_LEN];
+	/* `static`, not a stack-local array: DBM_MAX_RAW_LEN now scales with
+	 * DBM_MAX_STEPS_PER_STUDY (StudyStart's own worst case), too large for
+	 * a small embedded call stack, especially with dbm_decode_frame's own
+	 * same-size scratch buffer potentially live in a caller's frame at the
+	 * same time (e.g. main.c's send_message). Safe because this firmware's
+	 * serial link is driven from a single thread, one message at a time
+	 * (main.c's own RX loop) -- same posture as receive_message's static
+	 * rx_buf in main.c. */
+	static uint8_t raw[DBM_MAX_RAW_LEN];
 	size_t raw_len = 0;
 
 	if (encode_body(msg, raw, sizeof(raw), &raw_len) != 0) {
@@ -271,10 +403,6 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		msg->hello.host_utc_ms = tmp;
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->hello.steps_crc = (uint32_t)tmp;
 		return 0;
 	case DBM_TAG_HELLO_ACK:
 		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
@@ -302,7 +430,18 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		msg->stream_chunk.rx_utc_ms = tmp;
-		return pc_read_f32(raw, raw_len, &pos, &msg->stream_chunk.value);
+		if (pc_read_f32(raw, raw_len, &pos, &msg->stream_chunk.value) != 0) {
+			return -1;
+		}
+		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
+			return -1;
+		}
+		msg->stream_chunk.unit = (enum dbm_unit)tmp;
+		if (pos >= raw_len) {
+			return -1;
+		}
+		msg->stream_chunk.channel_id = raw[pos++]; /* u8: raw byte, not varint */
+		return 0;
 	case DBM_TAG_STREAM_END:
 		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
 			return -1;
@@ -316,6 +455,193 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 	case DBM_TAG_LOG_LINE:
 		return pc_read_str(raw, raw_len, &pos, msg->log_line.text,
 				    sizeof(msg->log_line.text));
+	case DBM_TAG_STUDY_START: {
+		struct dbm_study_start *ss = &msg->study_start;
+
+		memset(ss, 0, sizeof(*ss));
+
+		uint64_t steps_len;
+
+		if (pc_read_varint(raw, raw_len, &pos, &steps_len) != 0) {
+			return -1;
+		}
+		if (steps_len > DBM_MAX_STEPS_PER_STUDY) {
+			return -1;
+		}
+
+		size_t steps_start_pos = pos;
+		uint32_t decoded = 0;
+		bool unsupported = false;
+
+		for (uint32_t i = 0; i < steps_len; i++) {
+			struct dbm_step *step = &ss->steps[i];
+
+			if (pc_read_str(raw, raw_len, &pos, step->name, sizeof(step->name)) != 0) {
+				return -1;
+			}
+
+			uint64_t action_tag;
+
+			if (pc_read_varint(raw, raw_len, &pos, &action_tag) != 0) {
+				return -1;
+			}
+			if (action_tag != 0 /* Action::BleAdvertise */) {
+				/* Decision 21's initial scope: this decode surface only
+				 * understands BleAdvertise. Stop here -- everything after
+				 * this action tag (this step's remaining fields, any
+				 * further steps, steps_crc) has an unknown shape we can't
+				 * safely walk past, so the whole StudyStart is rejected
+				 * (see this function's own doc comment in the header). */
+				unsupported = true;
+				break;
+			}
+
+			if (pos >= raw_len) {
+				return -1;
+			}
+			bool has_local_name = raw[pos++] != 0;
+
+			if (has_local_name) {
+				if (pc_read_str(raw, raw_len, &pos, step->action.local_name,
+						 sizeof(step->action.local_name)) != 0) {
+					return -1;
+				}
+			} else {
+				step->action.local_name[0] = '\0';
+			}
+			step->action.has_local_name = has_local_name;
+
+			/* service_uuids: Vec<Uuid,4> -- not stored, decision 21's scope. */
+			if (pc_skip_len_prefixed(raw, raw_len, &pos, 16) != 0) {
+				return -1;
+			}
+
+			uint64_t adv_interval_ms;
+
+			if (pc_read_varint(raw, raw_len, &pos, &adv_interval_ms) != 0) {
+				return -1;
+			}
+			step->action.adv_interval_ms = (uint16_t)adv_interval_ms;
+
+			uint64_t timeout_ms;
+
+			if (pc_read_varint(raw, raw_len, &pos, &timeout_ms) != 0) {
+				return -1;
+			}
+			step->timeout_ms = (uint32_t)timeout_ms;
+
+			/* power_sample: Option<PowerSampleWindow> -- not stored. */
+			if (pos >= raw_len) {
+				return -1;
+			}
+			if (raw[pos++] != 0) {
+				uint64_t sample_rate_hz;
+
+				if (pc_read_varint(raw, raw_len, &pos, &sample_rate_hz) != 0) {
+					return -1;
+				}
+			}
+
+			if (pos >= raw_len) {
+				return -1;
+			}
+			step->continue_on_fail = raw[pos++] != 0;
+
+			decoded++;
+		}
+
+		ss->steps_len = decoded;
+		ss->has_unsupported_action = unsupported;
+
+		if (unsupported) {
+			ss->steps_crc_valid = false;
+			return 0;
+		}
+
+		size_t steps_end_pos = pos;
+		uint64_t steps_crc;
+
+		if (pc_read_varint(raw, raw_len, &pos, &steps_crc) != 0) {
+			return -1;
+		}
+		ss->steps_crc = (uint32_t)steps_crc;
+		ss->steps_crc_valid =
+			dbm_crc32(raw + steps_start_pos, steps_end_pos - steps_start_pos) == ss->steps_crc;
+		return 0;
+	}
+	case DBM_TAG_STEP_RESULT: {
+		struct dbm_step_result *sr = &msg->step_result;
+
+		memset(sr, 0, sizeof(*sr));
+
+		uint64_t step_index;
+
+		if (pc_read_varint(raw, raw_len, &pos, &step_index) != 0) {
+			return -1;
+		}
+		sr->step_index = (uint32_t)step_index;
+
+		if (pc_read_str(raw, raw_len, &pos, sr->result.step_name,
+				 sizeof(sr->result.step_name)) != 0) {
+			return -1;
+		}
+
+		uint64_t outcome_tag;
+
+		if (pc_read_varint(raw, raw_len, &pos, &outcome_tag) != 0) {
+			return -1;
+		}
+		if (outcome_tag > 2) {
+			return -1;
+		}
+		sr->result.outcome.tag = (uint8_t)outcome_tag;
+		if (outcome_tag == 1 &&
+		    pc_read_str(raw, raw_len, &pos, sr->result.outcome.fail_reason,
+				sizeof(sr->result.outcome.fail_reason)) != 0) {
+			return -1;
+		}
+
+		if (pos >= raw_len) {
+			return -1;
+		}
+		bool has_captured_data = raw[pos++] != 0;
+
+		sr->result.has_captured_data = has_captured_data;
+		if (has_captured_data) {
+			uint64_t captured_len;
+
+			if (pc_read_varint(raw, raw_len, &pos, &captured_len) != 0) {
+				return -1;
+			}
+			if (captured_len > sizeof(sr->result.captured_data) ||
+			    pos + captured_len > raw_len) {
+				return -1;
+			}
+			memcpy(sr->result.captured_data, raw + pos, (size_t)captured_len);
+			pos += (size_t)captured_len;
+			sr->result.captured_data_len = (uint32_t)captured_len;
+		}
+
+		/* power_samples_ref/waveform_ref: Option<String> -- this firmware
+		 * always encodes None, but decode must still be able to skip a Some
+		 * if one were ever received (see struct dbm_step_result_payload's
+		 * own doc comment). */
+		for (int i = 0; i < 2; i++) {
+			if (pos >= raw_len) {
+				return -1;
+			}
+			if (raw[pos++] != 0 && pc_skip_len_prefixed(raw, raw_len, &pos, 1) != 0) {
+				return -1;
+			}
+		}
+		return 0;
+	}
+	case DBM_TAG_STUDY_DONE:
+		if (pos >= raw_len) {
+			return -1;
+		}
+		msg->study_done.completed = raw[pos++] != 0;
+		return 0;
 	default:
 		return -1;
 	}
@@ -323,7 +649,8 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 
 int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out)
 {
-	uint8_t raw[DBM_MAX_RAW_LEN];
+	/* `static`, not stack-local -- see dbm_encode_frame's own comment above. */
+	static uint8_t raw[DBM_MAX_RAW_LEN];
 
 	if (in_len == 0 || in_len > DBM_MAX_FRAME_LEN) {
 		return -1;

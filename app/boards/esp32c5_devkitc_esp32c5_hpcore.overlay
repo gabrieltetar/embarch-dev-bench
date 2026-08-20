@@ -1,0 +1,37 @@
+/*
+ * ESP32-C5-WROOM-1 interim dev-bench board (embarch-dev-bench/design.md's
+ * ESP JTAG interim decision). Auto-merged by Zephyr's board devicetree
+ * overlay convention (flat filename matching the board target, same as this
+ * board's own .conf fragment) -- no extra CMake wiring needed.
+ *
+ * Why this exists: the board's own upstream .dts sets
+ * `zephyr,console = &uart0` -- a real UART wired to header pins, not to the
+ * board's USB connector. What's actually connected to the host over USB (the
+ * "USB JTAG/serial debug unit" Windows enumerates as a COM port, and the
+ * interface embarch-core's dev-bench serial link and JTAG-based flashing
+ * both already use) is a *separate* devicetree node, `usb_serial`
+ * (`espressif,esp32-usb-serial`, esp32c5_common.dtsi) -- present in the SoC
+ * devicetree but `status = "disabled"` by default, and not the board's
+ * chosen console. Confirmed by a real end-to-end symptom, not guessed: the
+ * first live self-test Study attempt against this board timed out waiting
+ * for `HelloAck` -- main.c's `link_uart` (`DT_CHOSEN(zephyr_console)`,
+ * app/src/main.c) was faithfully writing bytes to uart0's disconnected
+ * header pins while embarch-core listened on the USB port instead. This
+ * repoints the chosen console (and therefore main.c's serial link) at the
+ * node that's actually wired to the USB connector.
+ *
+ * `uart0` is left enabled (harmless, unconnected pins) rather than disabled
+ * -- nothing depends on it being off, and leaving it alone keeps this
+ * overlay's diff to exactly the two things that needed to change.
+ */
+
+/ {
+	chosen {
+		zephyr,console = &usb_serial;
+		zephyr,shell-uart = &usb_serial;
+	};
+};
+
+&usb_serial {
+	status = "okay";
+};
