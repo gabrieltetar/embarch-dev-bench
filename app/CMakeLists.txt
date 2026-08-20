@@ -30,6 +30,46 @@ endif()
 # embarch-dev-bench/design.md §3 decision 18: HelloAck.firmware_version.
 # Best-effort `git describe`; falls back to a fixed placeholder outside a git
 # checkout (e.g. a source tarball) or without git installed.
+#
+# Real bug found and fixed validating embarch-umbrella's stale-firmware
+# doctor check (decision 25) against two real commits: `execute_process`
+# only runs at CMake *configure* time, and CMake only reconfigures when one
+# of its own tracked dependencies changes -- by default just CMakeLists.txt
+# itself, not "the git commit checked out right now." An incremental
+# `west build` after a plain `git commit` (no CMakeLists.txt edit) was
+# silently re-linking with the *previous* configure's now-stale
+# APP_FIRMWARE_VERSION baked in, for every translation unit, not just ones
+# that happened to recompile -- exactly the false-negative decision 25's
+# check exists to catch, self-inflicted by the build system itself. Fixed by
+# making the checked-out commit itself a tracked configure dependency, so a
+# commit (or branch switch) that changes it forces a reconfigure and a fresh
+# `git describe`. Doesn't cover the plain-`--dirty` case (editing a tracked
+# file without staging or committing touches neither of these) -- inherent
+# to any git-describe-based scheme, not something CONFIGURE_DEPENDS can fix.
+execute_process(
+  COMMAND git rev-parse --git-dir
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+  OUTPUT_VARIABLE _embarch_git_dir
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET
+)
+if(_embarch_git_dir)
+  if(NOT IS_ABSOLUTE "${_embarch_git_dir}")
+    set(_embarch_git_dir "${CMAKE_CURRENT_SOURCE_DIR}/${_embarch_git_dir}")
+  endif()
+  if(EXISTS "${_embarch_git_dir}/HEAD")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_embarch_git_dir}/HEAD")
+    file(READ "${_embarch_git_dir}/HEAD" _embarch_head_contents)
+    if(_embarch_head_contents MATCHES "^ref: (.*)$")
+      string(STRIP "${CMAKE_MATCH_1}" _embarch_head_ref)
+      set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_embarch_git_dir}/${_embarch_head_ref}")
+    endif()
+  endif()
+  if(EXISTS "${_embarch_git_dir}/index")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_embarch_git_dir}/index")
+  endif()
+endif()
+
 execute_process(
   COMMAND git describe --always --dirty --abbrev=8
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
