@@ -786,7 +786,12 @@ static uint8_t discover_all_services_cb(struct bt_conn *conn, const struct bt_ga
 	struct ble_gatt_service_info *info = &discovered[discovered_len];
 
 	memset(info, 0, sizeof(*info));
-	from_bt_uuid(attr->uuid, info->uuid);
+	/* attr->uuid is the *declaration* attribute's own type UUID (always
+	 * 0x2800, "Primary Service") for a BT_GATT_DISCOVER_PRIMARY callback
+	 * -- identical for every service found. The service's actual UUID is
+	 * service->uuid (struct bt_gatt_service_val, attr->user_data), which
+	 * this function already fetches into `service` above but never used. */
+	from_bt_uuid(service->uuid, info->uuid);
 	service_ranges[discovered_len].start = attr->handle + 1;
 	service_ranges[discovered_len].end = service->end_handle;
 	discovered_len++;
