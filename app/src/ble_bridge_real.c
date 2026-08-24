@@ -34,8 +34,26 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
+#include <zephyr/sys/util.h>
 
 #include "ble_bridge.h"
+
+/* How many characteristics ACTION_GATT_MONITOR_ALL can subscribe to
+ * concurrently in one step -- a dev-bench-internal implementation cap, not
+ * part of embarch-study-designer's own wire-type limits (those bound
+ * `gatt_services`/`gatt_activity`'s *content*, design.md §3 decision 15's
+ * update, not how many live subscriptions this bridge itself can juggle at
+ * once). Sized to comfortably exceed any real DUT seen so far
+ * (`reference-dut-fw` has 10 notify/indicate-capable characteristics
+ * across its two services) with headroom, same placeholder-but-concrete
+ * posture as every other size constant in this codebase -- not
+ * BLE_MAX_DISCOVERED_SERVICES * BLE_MAX_CHARS_PER_SERVICE's own absolute
+ * worst case (128), which would cost several extra KB of static RAM for a
+ * count no real firmware plausibly reaches. A DUT that does exceed this is
+ * handled the same way BLE_MAX_GATT_ACTIVITY_RECORDS' own overflow is
+ * (design.md §3 decision 32's addendum): further characteristics are simply
+ * not subscribed, not a hard failure. */
+#define BLE_MAX_MONITOR_SUBSCRIPTIONS 32
 
 /* ---- state ------------------------------------------------------------- */
 
@@ -118,6 +136,44 @@ static uint16_t found_service_start;
 static uint16_t found_service_end;
 static uint16_t found_value_handle;
 
+/* ---- wildcard GATT discovery state (Action::GattDiscover/GattMonitorAll,
+ * design.md §3 decisions 31/32) -------------------------------------------
+ *
+ * `discovered`/`discovered_len` mirror StepResult.gatt_services exactly
+ * (ble_bridge.h's struct ble_gatt_service_info) -- `struct outcome` borrows
+ * directly from this array, same lifetime rule as `captured` above. Handle
+ * ranges and raw value handles are dev-bench-internal bookkeeping the wire
+ * type itself has no room for (and no need of), so they live in parallel
+ * arrays indexed the same way rather than growing the wire-shaped struct. */
+static struct ble_gatt_service_info discovered[BLE_MAX_DISCOVERED_SERVICES];
+static uint8_t discovered_len;
+static struct {
+	uint16_t start;
+	uint16_t end;
+} service_ranges[BLE_MAX_DISCOVERED_SERVICES];
+static uint16_t char_value_handles[BLE_MAX_DISCOVERED_SERVICES][BLE_MAX_CHARS_PER_SERVICE];
+/* Which service index discover_all_chars_cb is currently filling in --
+ * bt_gatt_discover's own callback signature carries no caller context
+ * pointer, so this is how run_gatt_discovery tells it. */
+static uint8_t discovering_service_index;
+
+static struct bt_gatt_discover_params all_services_params;
+static struct bt_gatt_discover_params all_chars_params;
+
+/* GattMonitorAll's own subscription set -- deliberately separate from
+ * subscribe_params/ensure_subscribed above, which is sized for exactly one
+ * concurrent subscription (every other GattOperation only ever needs one at
+ * a time). One bt_gatt_subscribe_params per subscribed characteristic, since
+ * Zephyr's host keeps a pointer to each for the subscription's whole
+ * lifetime. */
+static struct bt_gatt_subscribe_params monitor_subscribe_params[BLE_MAX_MONITOR_SUBSCRIPTIONS];
+static struct bt_gatt_discover_params monitor_ccc_discover_params[BLE_MAX_MONITOR_SUBSCRIPTIONS];
+static uint16_t monitor_char_index[BLE_MAX_MONITOR_SUBSCRIPTIONS];
+static uint8_t monitor_subscribe_count;
+
+static struct ble_gatt_activity_record activity[BLE_MAX_GATT_ACTIVITY_RECORDS];
+static size_t activity_len;
+
 /* ---- small helpers ------------------------------------------------------ */
 
 static struct outcome outcome_pass(void)
@@ -169,6 +225,47 @@ static void to_bt_uuid(const uint8_t be_bytes[16], struct bt_uuid_128 *out)
 		le_bytes[i] = be_bytes[15 - i];
 	}
 	(void)bt_uuid_create(&out->uuid, le_bytes, sizeof(le_bytes));
+}
+
+/* The reverse of to_bt_uuid, for GattDiscover/GattMonitorAll's live results
+ * (design.md §3 decisions 31/32): a discovered attribute's `bt_uuid` may be a
+ * 16-, 32-, or 128-bit type (Zephyr's own GAP/GATT services are 16-bit; a
+ * DUT's own custom services are typically 128-bit, per this crate's
+ * "UUIDs are raw, not symbolic" stance, design.md §4.3) -- expanded here into
+ * the Bluetooth Base UUID form (`0000xxxx-0000-1000-8000-00805F9B34FB`) for
+ * 16-/32-bit types, matching Zephyr's own BT_UUID_16_TO_UUID_128 convention,
+ * so `GattServiceInfo.uuid`/`GattCharacteristicInfo.uuid` are always a full
+ * 16-byte value regardless of what the DUT actually declared on the wire. */
+static void from_bt_uuid(const struct bt_uuid *uuid, uint8_t out_be[16])
+{
+	static const uint8_t bt_base_uuid[16] = {
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00,
+		0x80, 0x00, 0x00, 0x80, 0x5F, 0x9B, 0x34, 0xFB,
+	};
+
+	if (uuid->type == BT_UUID_TYPE_128) {
+		const struct bt_uuid_128 *u128 = BT_UUID_128(uuid);
+
+		for (size_t i = 0; i < 16; i++) {
+			out_be[i] = u128->val[15 - i];
+		}
+		return;
+	}
+
+	memcpy(out_be, bt_base_uuid, sizeof(bt_base_uuid));
+	if (uuid->type == BT_UUID_TYPE_16) {
+		uint16_t val = BT_UUID_16(uuid)->val;
+
+		out_be[0] = (uint8_t)(val >> 8);
+		out_be[1] = (uint8_t)val;
+	} else if (uuid->type == BT_UUID_TYPE_32) {
+		uint32_t val = BT_UUID_32(uuid)->val;
+
+		out_be[0] = (uint8_t)(val >> 24);
+		out_be[1] = (uint8_t)(val >> 16);
+		out_be[2] = (uint8_t)(val >> 8);
+		out_be[3] = (uint8_t)val;
+	}
 }
 
 /* Same reversal for a device address (ble_bridge.h's note on byte order). */
@@ -651,6 +748,318 @@ static struct outcome resolve_handles(const struct data_exchange_params *params,
 	return outcome_pass();
 }
 
+/* Forward declaration: subscribe_cb is defined below (in the "GATT
+ * operations" section), but execute_gatt_monitor_all -- which sits before
+ * that section, alongside the rest of this file's discovery logic -- reuses
+ * it for its own per-characteristic CCC-write callback (it only logs the ATT
+ * result, no state specific to the single-subscription case below). */
+static void subscribe_cb(struct bt_conn *conn, uint8_t err,
+			  struct bt_gatt_subscribe_params *params);
+
+/* ---- wildcard discovery (Action::GattDiscover/GattMonitorAll) ---------- */
+
+/* Unlike discover_service_cb/discover_chrc_cb above (a single targeted
+ * result, BT_GATT_ITER_STOP as soon as one arrives), these iterate: Zephyr
+ * keeps calling back with BT_GATT_ITER_CONTINUE-honoring callbacks until
+ * either every matching attribute has been reported or the callback itself
+ * stops early, finally calling back once more with `attr == NULL` to signal
+ * "this discovery procedure is done." */
+static uint8_t discover_all_services_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+					 struct bt_gatt_discover_params *params)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(params);
+
+	if (attr == NULL) {
+		k_sem_give(&gatt_sem);
+		return BT_GATT_ITER_STOP;
+	}
+	if (discovered_len >= BLE_MAX_DISCOVERED_SERVICES) {
+		/* Capacity reached -- stop discovering further services; what's
+		 * already found stands (mirrors design.md §3 decision 32's own
+		 * "log and skip rather than corrupt" precedent for gatt_activity). */
+		k_sem_give(&gatt_sem);
+		return BT_GATT_ITER_STOP;
+	}
+
+	const struct bt_gatt_service_val *service = attr->user_data;
+	struct ble_gatt_service_info *info = &discovered[discovered_len];
+
+	memset(info, 0, sizeof(*info));
+	from_bt_uuid(attr->uuid, info->uuid);
+	service_ranges[discovered_len].start = attr->handle + 1;
+	service_ranges[discovered_len].end = service->end_handle;
+	discovered_len++;
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+				     struct bt_gatt_discover_params *params)
+{
+	ARG_UNUSED(conn);
+	ARG_UNUSED(params);
+
+	struct ble_gatt_service_info *info = &discovered[discovering_service_index];
+
+	if (attr == NULL) {
+		k_sem_give(&gatt_sem);
+		return BT_GATT_ITER_STOP;
+	}
+	if (info->characteristics_len >= BLE_MAX_CHARS_PER_SERVICE) {
+		k_sem_give(&gatt_sem);
+		return BT_GATT_ITER_STOP;
+	}
+
+	const struct bt_gatt_chrc *chrc = attr->user_data;
+	uint8_t char_idx = info->characteristics_len;
+	struct ble_gatt_characteristic_info *cinfo = &info->characteristics[char_idx];
+
+	from_bt_uuid(chrc->uuid, cinfo->uuid);
+	cinfo->properties = chrc->properties;
+	char_value_handles[discovering_service_index][char_idx] = chrc->value_handle;
+	info->characteristics_len = char_idx + 1;
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* Walks every primary service, then every characteristic within each,
+ * populating `discovered`/`discovered_len` (design.md §4.3a's
+ * "GattDiscover"/"GattMonitorAll share one discovery walk" framing). Two
+ * discovery passes per service is unavoidable: Zephyr can't be told
+ * "discover primary services AND their characteristics" in one procedure,
+ * and a nested bt_gatt_discover() call from inside a discovery callback
+ * isn't safe -- so this runs the wildcard service pass to completion first,
+ * then a wildcard characteristic pass per discovered service afterward,
+ * bounded throughout by the same `deadline` decision 16's own doc comment
+ * already establishes for every action in this file. */
+static struct outcome run_gatt_discovery(int64_t deadline)
+{
+	discovered_len = 0;
+	memset(discovered, 0, sizeof(discovered));
+
+	all_services_params.uuid = NULL; /* wildcard: every primary service */
+	all_services_params.func = discover_all_services_cb;
+	all_services_params.start_handle = BT_ATT_FIRST_ATTRIBUTE_HANDLE;
+	all_services_params.end_handle = BT_ATT_LAST_ATTRIBUTE_HANDLE;
+	all_services_params.type = BT_GATT_DISCOVER_PRIMARY;
+
+	link_lost = false;
+	k_sem_reset(&gatt_sem);
+
+	int err = bt_gatt_discover(active_conn, &all_services_params);
+
+	if (err != 0) {
+		return outcome_fail("primary service discovery failed to start (%d)", err);
+	}
+	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+		abandon(&all_services_params);
+		return outcome_timed_out();
+	}
+	if (link_lost) {
+		return outcome_fail("disconnected during service discovery");
+	}
+
+	for (uint8_t i = 0; i < discovered_len; i++) {
+		discovering_service_index = i;
+
+		all_chars_params.uuid = NULL; /* wildcard: every characteristic */
+		all_chars_params.func = discover_all_chars_cb;
+		all_chars_params.start_handle = service_ranges[i].start;
+		all_chars_params.end_handle = service_ranges[i].end;
+		all_chars_params.type = BT_GATT_DISCOVER_CHARACTERISTIC;
+
+		k_sem_reset(&gatt_sem);
+		err = bt_gatt_discover(active_conn, &all_chars_params);
+		if (err != 0) {
+			return outcome_fail("characteristic discovery failed to start (%d)", err);
+		}
+		if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+			abandon(&all_chars_params);
+			return outcome_timed_out();
+		}
+		if (link_lost) {
+			return outcome_fail("disconnected during characteristic discovery");
+		}
+	}
+
+	return outcome_pass();
+}
+
+static struct outcome execute_gatt_discover(int64_t deadline)
+{
+	if (active_conn == NULL) {
+		return outcome_fail("no active connection -- run a BleConnect step first");
+	}
+
+	struct outcome result = run_gatt_discovery(deadline);
+
+	if (result.kind != OUTCOME_PASS) {
+		return result;
+	}
+	result.gatt_services = discovered;
+	result.gatt_service_count = discovered_len;
+	return result;
+}
+
+/* service/characteristic index, flattened service-then-characteristic in
+ * discovery order -- the exact convention design.md §4.3a documents for
+ * `GattActivityRecord.characteristic_index`, computed here in the one place
+ * both this bridge and any consumer need to agree on it. */
+static uint16_t flat_characteristic_index(uint8_t service_idx, uint8_t char_idx)
+{
+	uint16_t flat = 0;
+
+	for (uint8_t s = 0; s < service_idx; s++) {
+		flat += discovered[s].characteristics_len;
+	}
+	return flat + char_idx;
+}
+
+/* GattMonitorAll's own notify callback -- deliberately not notify_cb (below):
+ * that one serves the single shared subscribe_params ensure_subscribed()
+ * manages for GATT_OP_NOTIFY/INDICATE/SUBSCRIBE/STREAM_CAPTURE, whereas this
+ * step subscribes to many characteristics concurrently, each with its own
+ * `struct bt_gatt_subscribe_params` in monitor_subscribe_params -- `params`
+ * is one of that array's elements, so pointer arithmetic recovers which one
+ * fired without a second lookup table keyed by handle. */
+static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
+				 const void *data, uint16_t length)
+{
+	ARG_UNUSED(conn);
+
+	if (data == NULL) {
+		/* This one subscription was torn down (disconnect, or the server
+		 * clearing it) -- nothing to record; the rest keep running. */
+		return BT_GATT_ITER_STOP;
+	}
+	if (activity_len >= BLE_MAX_GATT_ACTIVITY_RECORDS) {
+		/* Overflow: stop capturing further records for this step, keep
+		 * what's already buffered and keep every subscription alive
+		 * rather than tearing anything down (design.md §3 decision 32's
+		 * own overflow addendum: still Pass, not Fail/TimedOut). */
+		return BT_GATT_ITER_CONTINUE;
+	}
+
+	ptrdiff_t idx = params - monitor_subscribe_params;
+	struct ble_gatt_activity_record *rec = &activity[activity_len];
+
+	/* Device-uptime timestamp, not yet UTC-corrected -- this firmware has
+	 * no `Hello.host_utc_ms` clock-offset tracking implemented yet for any
+	 * timestamp (design.md §7's already-open "clock-resync accuracy... not
+	 * validated" item covers `Sample.rx_utc_ms` too, an existing gap this
+	 * new field inherits rather than one introduced here). */
+	rec->rx_utc_ms = (uint64_t)k_uptime_get();
+	rec->characteristic_index = (idx >= 0 && (size_t)idx < monitor_subscribe_count)
+					     ? monitor_char_index[idx]
+					     : 0;
+	size_t copy = (length < sizeof(rec->payload)) ? length : sizeof(rec->payload);
+
+	memcpy(rec->payload, data, copy);
+	rec->payload_len = (uint16_t)copy;
+	activity_len++;
+
+	return BT_GATT_ITER_CONTINUE;
+}
+
+static struct outcome execute_gatt_monitor_all(int64_t deadline)
+{
+	if (active_conn == NULL) {
+		return outcome_fail("no active connection -- run a BleConnect step first");
+	}
+
+	struct outcome discover_result = run_gatt_discovery(deadline);
+
+	if (discover_result.kind != OUTCOME_PASS) {
+		return discover_result;
+	}
+
+	monitor_subscribe_count = 0;
+	activity_len = 0;
+
+	for (uint8_t s = 0; s < discovered_len; s++) {
+		struct ble_gatt_service_info *service = &discovered[s];
+
+		for (uint8_t c = 0; c < service->characteristics_len; c++) {
+			uint8_t props = service->characteristics[c].properties;
+			bool notify = (props & BT_GATT_CHRC_NOTIFY) != 0;
+			bool indicate = (props & BT_GATT_CHRC_INDICATE) != 0;
+
+			if (!notify && !indicate) {
+				continue;
+			}
+			if (monitor_subscribe_count >= BLE_MAX_MONITOR_SUBSCRIPTIONS) {
+				/* BLE_MAX_MONITOR_SUBSCRIPTIONS's own doc comment:
+				 * log-and-skip further characteristics, not a failure. */
+				continue;
+			}
+
+			struct bt_gatt_subscribe_params *sp =
+				&monitor_subscribe_params[monitor_subscribe_count];
+
+			memset(sp, 0, sizeof(*sp));
+			sp->notify = monitor_notify_cb;
+			sp->subscribe = subscribe_cb; /* shared: only logs the ATT result */
+			sp->value_handle = char_value_handles[s][c];
+			sp->value = indicate ? BT_GATT_CCC_INDICATE : BT_GATT_CCC_NOTIFY;
+			sp->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+			sp->end_handle = service_ranges[s].end;
+			sp->disc_params = &monitor_ccc_discover_params[monitor_subscribe_count];
+
+			ccc_att_err = 0;
+			ccc_torn_down = false;
+			k_sem_reset(&ccc_sem);
+
+			int err = bt_gatt_subscribe(active_conn, sp);
+
+			if (err != 0 && err != -EALREADY) {
+				/* This one characteristic's CCC write couldn't even
+				 * start -- move on to the next rather than failing
+				 * the whole step over one characteristic. */
+				continue;
+			}
+			if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+				abandon(sp);
+				continue;
+			}
+
+			monitor_char_index[monitor_subscribe_count] =
+				flat_characteristic_index(s, c);
+			monitor_subscribe_count++;
+		}
+	}
+
+	/* Capture window: whatever's left of the step's own timeout_ms after
+	 * discovery+subscribe -- no separate duration field, same "the step's
+	 * own budget is the window" precedent as GATT_OP_STREAM_CAPTURE
+	 * (design.md §3 decisions 20/21). Ends on the deadline (the normal
+	 * case) or early if the DUT drops the link. */
+	link_lost = false;
+	k_sem_reset(&disconn_sem);
+	bool dropped = k_sem_take(&disconn_sem, remaining(deadline)) == 0;
+
+	/* Unsubscribe everything this step subscribed, regardless of outcome --
+	 * a later step shouldn't keep receiving this step's notifications.
+	 * Fire-and-forget: by now the step's own deadline has passed, so there
+	 * is no remaining budget to wait out each CCC-clear write's response. */
+	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+		(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
+	}
+	monitor_subscribe_count = 0;
+
+	if (dropped) {
+		return outcome_fail("disconnected during GATT monitor-all capture");
+	}
+
+	struct outcome result = outcome_pass();
+
+	result.gatt_services = discovered;
+	result.gatt_service_count = discovered_len;
+	result.gatt_activity = activity;
+	result.gatt_activity_count = activity_len;
+	return result;
+}
+
 /* ---- GATT operations --------------------------------------------------- */
 
 static uint8_t read_cb(struct bt_conn *conn, uint8_t err, struct bt_gatt_read_params *params,
@@ -992,6 +1401,10 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 		return execute_connect(&action->connect, deadline);
 	case ACTION_DATA_EXCHANGE:
 		return execute_data_exchange(&action->data_exchange, deadline);
+	case ACTION_GATT_DISCOVER:
+		return execute_gatt_discover(deadline);
+	case ACTION_GATT_MONITOR_ALL:
+		return execute_gatt_monitor_all(deadline);
 	default:
 		return outcome_fail("unknown action kind");
 	}
@@ -1016,6 +1429,18 @@ void ble_bridge_reset(void)
 	}
 	subscribed = false;
 	memset(&subscribe_params, 0, sizeof(subscribe_params));
+
+	/* GattMonitorAll's own subscription set (design.md §3 decision 32) --
+	 * torn down here too, before the disconnect below, same reasoning as
+	 * the single subscribe_params case just above. */
+	if (active_conn != NULL) {
+		for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+			(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
+		}
+	}
+	monitor_subscribe_count = 0;
+	discovered_len = 0;
+	activity_len = 0;
 
 	if (active_conn != NULL) {
 		/* disconnected_cb drops the reference and clears active_conn; don't

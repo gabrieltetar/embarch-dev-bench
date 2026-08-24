@@ -15,9 +15,10 @@
 
 /* Mirrors embarch-study-designer's STUDY_DESIGNER_SCHEMA_VERSION by hand, since
  * native_sim never links the real staticlib (this file's own header comment) --
- * bump alongside that crate's own constant (currently 3, src/schema_version.rs)
+ * bump alongside that crate's own constant (currently 4, src/schema_version.rs --
+ * bumped 3 -> 4 for design.md §3 decisions 31/32's GattDiscover/GattMonitorAll)
  * whenever it changes. */
-#define STUDY_FFI_STUB_SCHEMA_VERSION 3
+#define STUDY_FFI_STUB_SCHEMA_VERSION 4
 
 uint32_t study_ffi_schema_version(void)
 {

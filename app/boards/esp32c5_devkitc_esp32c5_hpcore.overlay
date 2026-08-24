@@ -4,34 +4,32 @@
  * overlay convention (flat filename matching the board target, same as this
  * board's own .conf fragment) -- no extra CMake wiring needed.
  *
- * Why this exists: the board's own upstream .dts sets
- * `zephyr,console = &uart0` -- a real UART wired to header pins, not to the
- * board's USB connector. What's actually connected to the host over USB (the
- * "USB JTAG/serial debug unit" Windows enumerates as a COM port, and the
- * interface embarch-core's dev-bench serial link and JTAG-based flashing
- * both already use) is a *separate* devicetree node, `usb_serial`
- * (`espressif,esp32-usb-serial`, esp32c5_common.dtsi) -- present in the SoC
- * devicetree but `status = "disabled"` by default, and not the board's
- * chosen console. Confirmed by a real end-to-end symptom, not guessed: the
- * first live self-test Study attempt against this board timed out waiting
- * for `HelloAck` -- main.c's `link_uart` (`DT_CHOSEN(zephyr_console)`,
- * app/src/main.c) was faithfully writing bytes to uart0's disconnected
- * header pins while embarch-core listened on the USB port instead. This
- * repoints the chosen console (and therefore main.c's serial link) at the
- * node that's actually wired to the USB connector.
- *
- * `uart0` is left enabled (harmless, unconnected pins) rather than disabled
- * -- nothing depends on it being off, and leaving it alone keeps this
- * overlay's diff to exactly the two things that needed to change.
+ * Second real end-to-end finding on this exact link, Milestone 3 (Study
+ * Designer: Feature-Branch Iteration), 2026-08-20 -- this file previously
+ * repointed the console/protocol link at `usb_serial` (the native USB
+ * JTAG/serial peripheral, same physical USB-C port used for JTAG flashing),
+ * because `uart0`'s header pins were believed disconnected from anything
+ * the host could reach. That's wrong for this specific board: the
+ * ESP32-C5-DevKitC-1 has a *second* USB-C port, wired to `uart0` through its
+ * own onboard USB-UART bridge chip, entirely separate from the native USB
+ * JTAG/serial port both live in the same DTS as `zephyr,console = &uart0`
+ * (the board's own upstream default) already assumed. Found live: the first
+ * real `run_study` against `usb_serial` got past Core's dev-bench port
+ * *detection* (unambiguous once `EMBARCH_DEV_BENCH_SERIAL` was set) but
+ * failed decoding `HelloAck` -- consistent with the native USB JTAG/serial
+ * peripheral's poll-mode driver not reliably carrying this link's 1 Mbaud
+ * binary protocol, not a framing/logic bug (`CONFIG_LOG=n`, no stray
+ * `printk` on this path -- checked, not assumed). Switching back to the
+ * board's own default console (`uart0`, over its dedicated UART USB-C port)
+ * tests that theory with zero rewiring: both USB-C ports stay connected,
+ * JTAG flashing/reset keep using the native one, the protocol link moves to
+ * the UART one. `current-speed` overridden to 1 Mbaud here (the upstream
+ * default of 115200 predates this link needing to match
+ * `embarch-core::dev_bench_link::DEV_BENCH_BAUD`). `usb_serial` is left
+ * enabled -- harmless if unused, and JTAG/flashing over that same physical
+ * port is unaffected by what Zephyr's console is chosen to.
  */
 
-/ {
-	chosen {
-		zephyr,console = &usb_serial;
-		zephyr,shell-uart = &usb_serial;
-	};
-};
-
-&usb_serial {
-	status = "okay";
+&uart0 {
+	current-speed = <1000000>;
 };

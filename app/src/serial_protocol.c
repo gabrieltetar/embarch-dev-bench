@@ -272,7 +272,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * sender) -- this encode path exists for this file's own
 		 * round-trip tests. `service_uuids`/`power_sample` aren't stored
 		 * on `struct dbm_step` (decision 21's scope), so they're always
-		 * encoded empty/None here. */
+		 * encoded empty/None here, for every action kind. */
 		if (msg->study_start.steps_len > DBM_MAX_STEPS_PER_STUDY) {
 			return -1; /* would read past struct dbm_study_start.steps[]'s bound */
 		}
@@ -284,18 +284,77 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 					    out_cap, pos) != 0) {
 				return -1;
 			}
-			WRITE_VARINT(0); /* Action::BleAdvertise tag */
-			if (*pos + 1 > out_cap) {
+			WRITE_VARINT(step->action_tag);
+
+			switch (step->action_tag) {
+			case DBM_ACTION_BLE_ADVERTISE:
+				if (*pos + 1 > out_cap) {
+					return -1;
+				}
+				out[(*pos)++] = step->action.advertise.has_local_name ? 1 : 0;
+				if (step->action.advertise.has_local_name &&
+				    pc_write_bytes((const uint8_t *)step->action.advertise.local_name,
+						    strlen(step->action.advertise.local_name), out,
+						    out_cap, pos) != 0) {
+					return -1;
+				}
+				WRITE_VARINT(0); /* service_uuids: Vec<Uuid,4>, always empty */
+				WRITE_VARINT(step->action.advertise.adv_interval_ms);
+				break;
+
+			case DBM_ACTION_BLE_CONNECT:
+				WRITE_VARINT(step->action.connect.role);
+				if (*pos + 1 > out_cap) {
+					return -1;
+				}
+				out[(*pos)++] = step->action.connect.has_target_address ? 1 : 0;
+				if (step->action.connect.has_target_address) {
+					if (*pos + 6 > out_cap) {
+						return -1;
+					}
+					memcpy(out + *pos, step->action.connect.target_address, 6);
+					*pos += 6;
+					WRITE_VARINT(step->action.connect.target_address_kind);
+				}
+				break;
+
+			case DBM_ACTION_DATA_EXCHANGE: {
+				const struct dbm_data_exchange_action *de = &step->action.data_exchange;
+
+				if (*pos + 32 > out_cap) {
+					return -1;
+				}
+				memcpy(out + *pos, de->service_uuid, 16);
+				*pos += 16;
+				memcpy(out + *pos, de->characteristic_uuid, 16);
+				*pos += 16;
+				WRITE_VARINT(de->operation.kind);
+				switch (de->operation.kind) {
+				case DBM_GATT_OP_WRITE:
+					if (pc_write_bytes(de->operation.payload,
+							    de->operation.payload_len, out,
+							    out_cap, pos) != 0) {
+						return -1;
+					}
+					break;
+				case DBM_GATT_OP_NOTIFY:
+				case DBM_GATT_OP_INDICATE:
+					WRITE_VARINT(de->operation.timeout_ms);
+					break;
+				default:
+					break; /* Read/Subscribe/StreamCapture: no fields */
+				}
+				break;
+			}
+
+			case DBM_ACTION_GATT_DISCOVER:
+			case DBM_ACTION_GATT_MONITOR_ALL:
+				break; /* field-less */
+
+			default:
 				return -1;
 			}
-			out[(*pos)++] = step->action.has_local_name ? 1 : 0;
-			if (step->action.has_local_name &&
-			    pc_write_bytes((const uint8_t *)step->action.local_name,
-					    strlen(step->action.local_name), out, out_cap, pos) != 0) {
-				return -1;
-			}
-			WRITE_VARINT(0); /* service_uuids: Vec<Uuid,4>, always empty */
-			WRITE_VARINT(step->action.adv_interval_ms);
+
 			WRITE_VARINT(step->timeout_ms);
 			if (*pos + 1 > out_cap) {
 				return -1;
@@ -337,6 +396,65 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		}
 		out[(*pos)++] = 0;
 		out[(*pos)++] = 0;
+
+		/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
+		 * unlike power_samples_ref/waveform_ref above, this firmware does
+		 * populate these for real. */
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = r->has_gatt_services ? 1 : 0;
+		if (r->has_gatt_services) {
+			if (r->gatt_services_len > DBM_MAX_DISCOVERED_SERVICES) {
+				return -1;
+			}
+			WRITE_VARINT(r->gatt_services_len);
+			for (uint32_t s = 0; s < r->gatt_services_len; s++) {
+				const struct dbm_gatt_service_info *svc = &r->gatt_services[s];
+
+				if (*pos + 16 > out_cap) {
+					return -1;
+				}
+				memcpy(out + *pos, svc->uuid, 16);
+				*pos += 16;
+				if (svc->characteristics_len > DBM_MAX_CHARS_PER_SERVICE) {
+					return -1;
+				}
+				WRITE_VARINT(svc->characteristics_len);
+				for (uint32_t c = 0; c < svc->characteristics_len; c++) {
+					const struct dbm_gatt_characteristic_info *chr =
+						&svc->characteristics[c];
+
+					if (*pos + 17 > out_cap) {
+						return -1;
+					}
+					memcpy(out + *pos, chr->uuid, 16);
+					*pos += 16;
+					out[(*pos)++] = chr->properties; /* u8: raw byte */
+				}
+			}
+		}
+
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = r->has_gatt_activity ? 1 : 0;
+		if (r->has_gatt_activity) {
+			if (r->gatt_activity_len > DBM_MAX_GATT_ACTIVITY_RECORDS) {
+				return -1;
+			}
+			WRITE_VARINT(r->gatt_activity_len);
+			for (uint32_t a = 0; a < r->gatt_activity_len; a++) {
+				const struct dbm_gatt_activity_record *rec = &r->gatt_activity[a];
+
+				WRITE_VARINT(rec->rx_utc_ms);
+				WRITE_VARINT(rec->characteristic_index);
+				if (pc_write_bytes(rec->payload, rec->payload_len, out, out_cap,
+						    pos) != 0) {
+					return -1;
+				}
+			}
+		}
 		return 0;
 	}
 	case DBM_TAG_STUDY_DONE:
@@ -485,43 +603,162 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			if (pc_read_varint(raw, raw_len, &pos, &action_tag) != 0) {
 				return -1;
 			}
-			if (action_tag != 0 /* Action::BleAdvertise */) {
-				/* Decision 21's initial scope: this decode surface only
-				 * understands BleAdvertise. Stop here -- everything after
-				 * this action tag (this step's remaining fields, any
-				 * further steps, steps_crc) has an unknown shape we can't
-				 * safely walk past, so the whole StudyStart is rejected
-				 * (see this function's own doc comment in the header). */
-				unsupported = true;
+
+			bool recognized = true;
+
+			switch (action_tag) {
+			case DBM_ACTION_BLE_ADVERTISE: {
+				if (pos >= raw_len) {
+					return -1;
+				}
+				bool has_local_name = raw[pos++] != 0;
+
+				if (has_local_name) {
+					if (pc_read_str(raw, raw_len, &pos,
+							 step->action.advertise.local_name,
+							 sizeof(step->action.advertise.local_name)) !=
+					    0) {
+						return -1;
+					}
+				} else {
+					step->action.advertise.local_name[0] = '\0';
+				}
+				step->action.advertise.has_local_name = has_local_name;
+
+				/* service_uuids: Vec<Uuid,4> -- not stored, decision 21's
+				 * original scope note, unchanged by decisions 31/32. */
+				if (pc_skip_len_prefixed(raw, raw_len, &pos, 16) != 0) {
+					return -1;
+				}
+
+				uint64_t adv_interval_ms;
+
+				if (pc_read_varint(raw, raw_len, &pos, &adv_interval_ms) != 0) {
+					return -1;
+				}
+				step->action.advertise.adv_interval_ms = (uint16_t)adv_interval_ms;
 				break;
 			}
 
-			if (pos >= raw_len) {
-				return -1;
-			}
-			bool has_local_name = raw[pos++] != 0;
+			case DBM_ACTION_BLE_CONNECT: {
+				uint64_t role;
 
-			if (has_local_name) {
-				if (pc_read_str(raw, raw_len, &pos, step->action.local_name,
-						 sizeof(step->action.local_name)) != 0) {
+				if (pc_read_varint(raw, raw_len, &pos, &role) != 0) {
 					return -1;
 				}
-			} else {
-				step->action.local_name[0] = '\0';
-			}
-			step->action.has_local_name = has_local_name;
+				step->action.connect.role = (uint8_t)role;
 
-			/* service_uuids: Vec<Uuid,4> -- not stored, decision 21's scope. */
-			if (pc_skip_len_prefixed(raw, raw_len, &pos, 16) != 0) {
-				return -1;
+				if (pos >= raw_len) {
+					return -1;
+				}
+				bool has_target = raw[pos++] != 0;
+
+				step->action.connect.has_target_address = has_target;
+				if (has_target) {
+					if (pos + 6 > raw_len) {
+						return -1;
+					}
+					memcpy(step->action.connect.target_address, raw + pos, 6);
+					pos += 6;
+
+					uint64_t kind;
+
+					if (pc_read_varint(raw, raw_len, &pos, &kind) != 0) {
+						return -1;
+					}
+					step->action.connect.target_address_kind = (uint8_t)kind;
+				} else {
+					memset(step->action.connect.target_address, 0, 6);
+					step->action.connect.target_address_kind = 0;
+				}
+				break;
 			}
 
-			uint64_t adv_interval_ms;
+			case DBM_ACTION_DATA_EXCHANGE: {
+				struct dbm_data_exchange_action *de = &step->action.data_exchange;
 
-			if (pc_read_varint(raw, raw_len, &pos, &adv_interval_ms) != 0) {
-				return -1;
+				if (pos + 32 > raw_len) {
+					return -1;
+				}
+				memcpy(de->service_uuid, raw + pos, 16);
+				pos += 16;
+				memcpy(de->characteristic_uuid, raw + pos, 16);
+				pos += 16;
+
+				uint64_t op_kind;
+
+				if (pc_read_varint(raw, raw_len, &pos, &op_kind) != 0) {
+					return -1;
+				}
+				de->operation.kind = (uint8_t)op_kind;
+				de->operation.payload_len = 0;
+				de->operation.timeout_ms = 0;
+
+				switch (op_kind) {
+				case DBM_GATT_OP_WRITE: {
+					uint64_t len;
+
+					if (pc_read_varint(raw, raw_len, &pos, &len) != 0) {
+						return -1;
+					}
+					if (len > sizeof(de->operation.payload) ||
+					    pos + len > raw_len) {
+						return -1;
+					}
+					memcpy(de->operation.payload, raw + pos, (size_t)len);
+					pos += (size_t)len;
+					de->operation.payload_len = (uint32_t)len;
+					break;
+				}
+				case DBM_GATT_OP_NOTIFY:
+				case DBM_GATT_OP_INDICATE: {
+					uint64_t t;
+
+					if (pc_read_varint(raw, raw_len, &pos, &t) != 0) {
+						return -1;
+					}
+					de->operation.timeout_ms = (uint32_t)t;
+					break;
+				}
+				case DBM_GATT_OP_READ:
+				case DBM_GATT_OP_SUBSCRIBE:
+				case DBM_GATT_OP_STREAM_CAPTURE:
+					break;
+				default:
+					/* A malformed/future GattOperation kind this decoder
+					 * doesn't recognize -- unlike an unrecognized Action
+					 * kind (which can safely be reported as
+					 * has_unsupported_action, since GattDiscover/
+					 * GattMonitorAll's own field-less shape means nothing
+					 * after the tag needs walking), an operation kind this
+					 * decoder can't parse leaves the remaining bytes of
+					 * this DataExchange action unwalkable -- so this is a
+					 * hard decode error, not a per-step "unsupported"
+					 * fallback. */
+					return -1;
+				}
+				break;
 			}
-			step->action.adv_interval_ms = (uint16_t)adv_interval_ms;
+
+			case DBM_ACTION_GATT_DISCOVER:
+			case DBM_ACTION_GATT_MONITOR_ALL:
+				break; /* field-less */
+
+			default:
+				/* A future Action variant this decoder predates. Everything
+				 * after this tag (this step's remaining fields, any further
+				 * steps, steps_crc) has an unknown shape we can't safely
+				 * walk past, so the whole StudyStart is rejected (see this
+				 * function's own doc comment in the header). */
+				recognized = false;
+				break;
+			}
+
+			if (!recognized) {
+				unsupported = true;
+				break;
+			}
+			step->action_tag = (uint8_t)action_tag;
 
 			uint64_t timeout_ms;
 
@@ -633,6 +870,100 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			if (raw[pos++] != 0 && pc_skip_len_prefixed(raw, raw_len, &pos, 1) != 0) {
 				return -1;
 			}
+		}
+
+		/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
+		 * this firmware only ever encodes these (see encode_body), but
+		 * decode is exercised by this file's own round-trip tests too. */
+		if (pos >= raw_len) {
+			return -1;
+		}
+		bool has_gatt_services = raw[pos++] != 0;
+
+		sr->result.has_gatt_services = has_gatt_services;
+		if (has_gatt_services) {
+			uint64_t services_len;
+
+			if (pc_read_varint(raw, raw_len, &pos, &services_len) != 0) {
+				return -1;
+			}
+			if (services_len > DBM_MAX_DISCOVERED_SERVICES) {
+				return -1;
+			}
+			for (uint32_t s = 0; s < services_len; s++) {
+				struct dbm_gatt_service_info *svc = &sr->result.gatt_services[s];
+
+				if (pos + 16 > raw_len) {
+					return -1;
+				}
+				memcpy(svc->uuid, raw + pos, 16);
+				pos += 16;
+
+				uint64_t chars_len;
+
+				if (pc_read_varint(raw, raw_len, &pos, &chars_len) != 0) {
+					return -1;
+				}
+				if (chars_len > DBM_MAX_CHARS_PER_SERVICE) {
+					return -1;
+				}
+				for (uint32_t c = 0; c < chars_len; c++) {
+					struct dbm_gatt_characteristic_info *chr =
+						&svc->characteristics[c];
+
+					if (pos + 17 > raw_len) {
+						return -1;
+					}
+					memcpy(chr->uuid, raw + pos, 16);
+					pos += 16;
+					chr->properties = raw[pos++]; /* u8: raw byte */
+				}
+				svc->characteristics_len = (uint32_t)chars_len;
+			}
+			sr->result.gatt_services_len = (uint32_t)services_len;
+		}
+
+		if (pos >= raw_len) {
+			return -1;
+		}
+		bool has_gatt_activity = raw[pos++] != 0;
+
+		sr->result.has_gatt_activity = has_gatt_activity;
+		if (has_gatt_activity) {
+			uint64_t activity_len;
+
+			if (pc_read_varint(raw, raw_len, &pos, &activity_len) != 0) {
+				return -1;
+			}
+			if (activity_len > DBM_MAX_GATT_ACTIVITY_RECORDS) {
+				return -1;
+			}
+			for (uint32_t a = 0; a < activity_len; a++) {
+				struct dbm_gatt_activity_record *rec = &sr->result.gatt_activity[a];
+				uint64_t tmp2;
+
+				if (pc_read_varint(raw, raw_len, &pos, &tmp2) != 0) {
+					return -1;
+				}
+				rec->rx_utc_ms = tmp2;
+				if (pc_read_varint(raw, raw_len, &pos, &tmp2) != 0) {
+					return -1;
+				}
+				rec->characteristic_index = (uint16_t)tmp2;
+
+				uint64_t payload_len;
+
+				if (pc_read_varint(raw, raw_len, &pos, &payload_len) != 0) {
+					return -1;
+				}
+				if (payload_len > sizeof(rec->payload) || pos + payload_len > raw_len) {
+					return -1;
+				}
+				memcpy(rec->payload, raw + pos, (size_t)payload_len);
+				pos += (size_t)payload_len;
+				rec->payload_len = (uint32_t)payload_len;
+			}
+			sr->result.gatt_activity_len = (uint32_t)activity_len;
 		}
 		return 0;
 	}

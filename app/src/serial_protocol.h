@@ -27,21 +27,76 @@
 #define DBM_MAX_LOG_LINE_LEN 128
 #define DBM_MAX_LOCAL_NAME_LEN 26
 #define DBM_MAX_NAME_LEN 32
-#define DBM_MAX_STEPS_PER_STUDY 64
+/* A dev-bench-internal capacity cap, NOT a mirror of the crate's own
+ * limits::MAX_STEPS_PER_STUDY (still 64 there, unaffected -- Core/embarch-api
+ * still validate/CRC a `Study` against that ceiling). Real gap found and
+ * fixed, Milestone 3 (Study Designer: Feature-Branch Iteration): once
+ * `struct dbm_step`'s action union had to grow to also hold
+ * `Action::DataExchange`'s up-to-512-byte `Write` payload (decisions
+ * 31/32's own GattDiscover/GattMonitorAll additions triggered writing this
+ * union out in full for the first time), a full 64-slot `steps[]` array
+ * pushed `struct dev_bench_message`'s union well past what this board's
+ * available RAM can hold several static copies of (confirmed empirically --
+ * a real build at 64 slots would not fit; see design.md's own changelog for
+ * the measured numbers). 16 is sized well above every `Study` this suite
+ * has actually authored so far (the largest is this milestone's own 3-step
+ * self-test) with real headroom, not against a proven fuzzing need -- a
+ * `StudyStart` claiming more than this many steps is rejected outright by
+ * `dbm_decode_frame` (a real, disclosed dev-bench capacity limit, not a
+ * silent truncation), the same way an oversized `steps_len` already was
+ * before this cap existed for any other reason. Revisit this number, not
+ * the crate's own MAX_STEPS_PER_STUDY, if a real fuzzing workload ever
+ * needs more steps than this against real dev-bench hardware.
+ */
+#define DBM_MAX_STEPS_PER_STUDY 16
 #define DBM_MAX_FAIL_REASON_LEN 64
 #define DBM_MAX_PAYLOAD_LEN 512
+/* Mirrors embarch-study-designer's limits::MAX_DISCOVERED_SERVICES/
+ * MAX_CHARS_PER_SERVICE (design.md §3 decisions 31/32/33's update) --
+ * these two, unlike DBM_MAX_STEPS_PER_STUDY above, are small enough that
+ * mirroring the crate's own real ceiling costs no meaningful RAM. */
+#define DBM_MAX_DISCOVERED_SERVICES 8
+#define DBM_MAX_CHARS_PER_SERVICE 16
+/* Mirrors limits::MAX_GATT_ACTIVITY_RECORDS -- the single largest
+ * contributor to `struct dbm_step_result_payload`'s size (32 records at up
+ * to DBM_MAX_PAYLOAD_LEN bytes each), flagged as a real stack/static-RAM
+ * risk from the outset by embarch-study-designer/design.md §3 decision 32's
+ * own text -- kept at the crate's full ceiling rather than shrunk further
+ * (unlike DBM_MAX_STEPS_PER_STUDY above) so this milestone's own "a normal
+ * acquisition window, nothing dropped" validation isn't manufactured into
+ * an overflow case by an artificially small dev-bench-side cap. */
+#define DBM_MAX_GATT_ACTIVITY_RECORDS 32
 
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
- * StudyStart with a full MAX_STEPS_PER_STUDY of BleAdvertise-only steps dominates every
- * other variant (LogLine's 128 bytes, StepResult's captured_data up to
- * DBM_MAX_PAYLOAD_LEN, included alongside for safety): per-step worst case is roughly
- * tag(1) + name len+bytes(1+DBM_MAX_NAME_LEN) + timeout_ms varint(5) +
- * continue_on_fail(1) + action tag(1) + has_local_name+local_name
- * len+bytes(1+1+DBM_MAX_LOCAL_NAME_LEN) + adv_interval_ms varint(3), generously
- * rounded up to 128 bytes/step; plus StudyStart's own steps_len/steps_crc varints and
- * a StepResult's captured_data headroom. */
-#define DBM_MAX_STUDY_START_LEN (8 + (DBM_MAX_STEPS_PER_STUDY * 128) + 8)
-#define DBM_MAX_STEP_RESULT_LEN (16 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN)
+ *
+ * StudyStart's per-step worst case grew once decode had to cover every
+ * `Action` kind, not just BleAdvertise (design.md §3 decisions 31/32):
+ * `DataExchange { GattOperation::Write { payload } }` dominates a single
+ * step's own encoding now (service_uuid+characteristic_uuid, 16 bytes each,
+ * plus a Write payload up to DBM_MAX_PAYLOAD_LEN bytes with its own length
+ * varint), well past BleAdvertise's own ~30 bytes -- generously rounded up
+ * to DBM_MAX_PAYLOAD_LEN + 64 bytes/step to cover it plus every other
+ * per-step field with margin. GattDiscover/GattMonitorAll are both
+ * field-less and add only their own action tag varint, cheaper than
+ * BleAdvertise, so they don't move this bound.
+ *
+ * StepResult's own worst case grew independently: `gatt_services` (up to
+ * DBM_MAX_DISCOVERED_SERVICES services, each up to DBM_MAX_CHARS_PER_SERVICE
+ * characteristics at 17 bytes each) plus `gatt_activity` (up to
+ * DBM_MAX_GATT_ACTIVITY_RECORDS records, each up to DBM_MAX_PAYLOAD_LEN
+ * bytes) now dominates over `captured_data` alone -- this is what makes
+ * StepResult, not StudyStart, this file's actual largest message once both
+ * are computed for real (see the constants immediately below).
+ */
+#define DBM_MAX_STUDY_START_LEN \
+	(8 + (DBM_MAX_STEPS_PER_STUDY * (DBM_MAX_PAYLOAD_LEN + 64)) + 8)
+#define DBM_MAX_GATT_SERVICES_LEN \
+	(4 + (DBM_MAX_DISCOVERED_SERVICES * (16 + 4 + (DBM_MAX_CHARS_PER_SERVICE * 17))))
+#define DBM_MAX_GATT_ACTIVITY_LEN \
+	(4 + (DBM_MAX_GATT_ACTIVITY_RECORDS * (8 + 2 + 4 + DBM_MAX_PAYLOAD_LEN)))
+#define DBM_MAX_STEP_RESULT_LEN                                                                  \
+	(24 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN +                  \
+	 DBM_MAX_GATT_SERVICES_LEN + DBM_MAX_GATT_ACTIVITY_LEN)
 #define DBM_MAX_RAW_LEN (DBM_MAX_STUDY_START_LEN > DBM_MAX_STEP_RESULT_LEN ? DBM_MAX_STUDY_START_LEN \
 										  : DBM_MAX_STEP_RESULT_LEN)
 /* COBS worst case adds one overhead byte per 254 payload bytes, plus a leading code byte
@@ -112,22 +167,81 @@ struct dbm_log_line {
 	char text[DBM_MAX_LOG_LINE_LEN + 1];
 };
 
-/* Mirrors the FFI-side EssdStep/EssdBleAdvertiseAction shape 1:1 -- see
- * study_ffi.h. Only BleAdvertise is representable here for now (decision 21's
- * initial scope) -- a step whose Action isn't BleAdvertise fails the whole
- * StudyStart decode (see dbm_decode_frame's doc comment).
- */
+/* Mirrors embarch-study-designer's `Action` (src/study.rs), one variant per
+ * enum tag -- design.md §3 decisions 31/32 added the last two of these.
+ * Append-only, same discipline as `enum dbm_tag`: the tag values below match
+ * `Action`'s own declared variant order exactly, since postcard encodes an
+ * enum discriminant positionally. */
+enum dbm_action_tag {
+	DBM_ACTION_BLE_ADVERTISE = 0,
+	DBM_ACTION_BLE_CONNECT = 1,
+	DBM_ACTION_DATA_EXCHANGE = 2,
+	DBM_ACTION_GATT_DISCOVER = 3,
+	DBM_ACTION_GATT_MONITOR_ALL = 4,
+};
+
+/* Mirrors the FFI-side EssdBleAdvertiseAction shape 1:1 -- see study_ffi.h. */
 struct dbm_ble_advertise_action {
 	char local_name[DBM_MAX_LOCAL_NAME_LEN + 1]; /* NUL-terminated */
 	bool has_local_name;
 	uint16_t adv_interval_ms;
 };
 
+/* Mirrors `Action::BleConnect` (src/study.rs) -- `target_address` bytes are
+ * in embarch-study-designer's own display order (design.md §4.3: most
+ * significant byte first), same convention `ble_bridge.h`'s
+ * `struct ble_connect_params` already documents. */
+struct dbm_ble_connect_action {
+	uint8_t role; /* 0 = Central, 1 = Peripheral (mirrors BleRole) */
+	bool has_target_address;
+	uint8_t target_address_kind; /* 0 = Public, 1 = Random (mirrors BleAddressKind) */
+	uint8_t target_address[6];
+};
+
+/* Mirrors `GattOperation` (src/study.rs). `payload`/`payload_len` are valid
+ * only when `kind == DBM_GATT_OP_WRITE`; `timeout_ms` only for
+ * `DBM_GATT_OP_NOTIFY`/`DBM_GATT_OP_INDICATE`. */
+enum dbm_gatt_op_kind {
+	DBM_GATT_OP_READ = 0,
+	DBM_GATT_OP_WRITE = 1,
+	DBM_GATT_OP_NOTIFY = 2,
+	DBM_GATT_OP_INDICATE = 3,
+	DBM_GATT_OP_SUBSCRIBE = 4,
+	DBM_GATT_OP_STREAM_CAPTURE = 5,
+};
+
+struct dbm_gatt_operation {
+	uint8_t kind;
+	uint8_t payload[DBM_MAX_PAYLOAD_LEN];
+	uint32_t payload_len;
+	uint32_t timeout_ms;
+};
+
+/* Mirrors `Action::DataExchange` (src/study.rs) -- UUIDs are raw big-endian
+ * bytes, same convention as everywhere else in this header. */
+struct dbm_data_exchange_action {
+	uint8_t service_uuid[16];
+	uint8_t characteristic_uuid[16];
+	struct dbm_gatt_operation operation;
+};
+
+/* Action::GattDiscover/GattMonitorAll (design.md §3 decisions 31/32) are both
+ * field-less -- no struct needed; `dbm_step.action_tag` alone identifies
+ * them, matching this crate's "simplest possible FFI/wire surface" framing
+ * for both. */
+
 struct dbm_step {
 	char name[DBM_MAX_NAME_LEN + 1];
 	uint32_t timeout_ms;
 	bool continue_on_fail;
-	struct dbm_ble_advertise_action action;
+	uint8_t action_tag; /* enum dbm_action_tag */
+	union {
+		struct dbm_ble_advertise_action advertise;
+		struct dbm_ble_connect_action connect;
+		struct dbm_data_exchange_action data_exchange;
+		/* DBM_ACTION_GATT_DISCOVER/DBM_ACTION_GATT_MONITOR_ALL carry no
+		 * fields of their own. */
+	} action;
 };
 
 struct dbm_study_start {
@@ -152,6 +266,31 @@ struct dbm_outcome {
 	char fail_reason[DBM_MAX_FAIL_REASON_LEN + 1]; /* valid only if tag == 1 */
 };
 
+/* Mirrors `GattCharacteristicInfo`/`GattServiceInfo` (embarch-study-designer/
+ * src/gatt.rs, design.md §4.3a) -- `properties` is the raw ATT
+ * characteristic-properties byte, passed through unchanged. */
+struct dbm_gatt_characteristic_info {
+	uint8_t uuid[16];
+	uint8_t properties;
+};
+
+struct dbm_gatt_service_info {
+	uint8_t uuid[16];
+	struct dbm_gatt_characteristic_info characteristics[DBM_MAX_CHARS_PER_SERVICE];
+	uint32_t characteristics_len;
+};
+
+/* Mirrors `GattActivityRecord` -- `characteristic_index` indexes into this
+ * same StepResult's `gatt_services`, flattened service-then-characteristic
+ * in discovery order (that type's own documented convention, design.md
+ * §4.3a). */
+struct dbm_gatt_activity_record {
+	uint64_t rx_utc_ms;
+	uint16_t characteristic_index;
+	uint8_t payload[DBM_MAX_PAYLOAD_LEN];
+	uint32_t payload_len;
+};
+
 struct dbm_step_result_payload {
 	char step_name[DBM_MAX_NAME_LEN + 1];
 	struct dbm_outcome outcome;
@@ -163,6 +302,17 @@ struct dbm_step_result_payload {
 	 * encoded as None (0x00) on the wire; decode skips over a Some if one
 	 * were ever received (a length-prefixed string), no C-side field to
 	 * hold it. */
+	/* gatt_services/gatt_activity (design.md §3 decisions 31/32): populated
+	 * by GattDiscover (services only) and GattMonitorAll (both). Unlike
+	 * power_samples_ref/waveform_ref above, this firmware does set these --
+	 * encode_body/decode_body both handle a real Some, not just a
+	 * permanent None. */
+	bool has_gatt_services;
+	struct dbm_gatt_service_info gatt_services[DBM_MAX_DISCOVERED_SERVICES];
+	uint32_t gatt_services_len;
+	bool has_gatt_activity;
+	struct dbm_gatt_activity_record gatt_activity[DBM_MAX_GATT_ACTIVITY_RECORDS];
+	uint32_t gatt_activity_len;
 };
 
 struct dbm_step_result {
@@ -202,13 +352,19 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
  * message, or a string field too long for its buffer.
  *
  * For DBM_TAG_STUDY_START specifically (embarch-study-designer/design.md §3
- * decisions 17/19, embarch-dev-bench/design.md §3 decision 21): each step's
- * Action must be BleAdvertise (decision 21's initial scope) — hitting any
- * other action kind stops decoding that step immediately and returns 0 with
- * `out->study_start.has_unsupported_action` set (`steps_len` reflects only
- * the steps successfully decoded before that point, `steps_crc_valid` is
- * left `false` since the CRC can't be computed without decoding every step's
- * raw bytes). Otherwise `steps_crc_valid` reports whether the CRC-32 (ISO-HDLC)
+ * decisions 17/19/31/32, embarch-dev-bench/design.md §3 decision 21): every
+ * step's Action kind this crate defines is decodable now
+ * (BleAdvertise/BleConnect/DataExchange/GattDiscover/GattMonitorAll) —
+ * decision 21's original BleAdvertise-only scope is closed. `steps_len`
+ * beyond DBM_MAX_STEPS_PER_STUDY (a dev-bench-internal capacity cap, see
+ * that constant's own doc comment — smaller than the crate's own
+ * limits::MAX_STEPS_PER_STUDY) still stops decoding immediately and returns
+ * -1 rather than reading out of bounds. Encountering an action tag this
+ * decoder doesn't recognize at all (a future crate-side append this
+ * firmware predates) still sets `out->study_start.has_unsupported_action`
+ * and stops decoding that step, same fallback behavior decision 21
+ * originally established, just no longer reachable for any of today's five
+ * kinds. Otherwise `steps_crc_valid` reports whether the CRC-32 (ISO-HDLC)
  * computed over the raw wire bytes of the decoded `steps` matches the
  * `steps_crc` field also received on the wire — independently reproducing
  * embarch-study-designer's own `steps_crc()` (src/crc.rs), which hashes each

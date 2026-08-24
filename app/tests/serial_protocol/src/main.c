@@ -156,9 +156,11 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 	strcpy(study_start_msg.study_start.steps[0].name, "advertise");
 	study_start_msg.study_start.steps[0].timeout_ms = 5000;
 	study_start_msg.study_start.steps[0].continue_on_fail = false;
-	study_start_msg.study_start.steps[0].action.has_local_name = true;
-	strcpy(study_start_msg.study_start.steps[0].action.local_name, "embarch-dev-bench");
-	study_start_msg.study_start.steps[0].action.adv_interval_ms = 100;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_BLE_ADVERTISE;
+	study_start_msg.study_start.steps[0].action.advertise.has_local_name = true;
+	strcpy(study_start_msg.study_start.steps[0].action.advertise.local_name,
+	       "embarch-dev-bench");
+	study_start_msg.study_start.steps[0].action.advertise.adv_interval_ms = 100;
 	/* The real steps_crc embarch-study-designer's own steps_crc() computes
 	 * for this exact single-step content (name "advertise",
 	 * BleAdvertise{local_name: Some("embarch-dev-bench"), service_uuids: [],
@@ -175,11 +177,13 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 		      "should not flag an unsupported action");
 	zassert_str_equal(study_start_decoded.study_start.steps[0].name, "advertise", "name mismatch");
 	zassert_equal(study_start_decoded.study_start.steps[0].timeout_ms, 5000, "timeout_ms mismatch");
-	zassert_true(study_start_decoded.study_start.steps[0].action.has_local_name,
+	zassert_equal(study_start_decoded.study_start.steps[0].action_tag, DBM_ACTION_BLE_ADVERTISE,
+		      "action_tag mismatch");
+	zassert_true(study_start_decoded.study_start.steps[0].action.advertise.has_local_name,
 		     "has_local_name mismatch");
-	zassert_str_equal(study_start_decoded.study_start.steps[0].action.local_name,
+	zassert_str_equal(study_start_decoded.study_start.steps[0].action.advertise.local_name,
 			   "embarch-dev-bench", "local_name mismatch");
-	zassert_equal(study_start_decoded.study_start.steps[0].action.adv_interval_ms, 100,
+	zassert_equal(study_start_decoded.study_start.steps[0].action.advertise.adv_interval_ms, 100,
 		      "adv_interval_ms mismatch");
 	zassert_equal(study_start_decoded.study_start.steps_crc, 0x889FAF61, "steps_crc mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
@@ -200,15 +204,17 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 	strcpy(study_start_msg.study_start.steps[0].name, "advertise-1");
 	study_start_msg.study_start.steps[0].timeout_ms = 5000;
 	study_start_msg.study_start.steps[0].continue_on_fail = false;
-	study_start_msg.study_start.steps[0].action.has_local_name = true;
-	strcpy(study_start_msg.study_start.steps[0].action.local_name, "dev-bench");
-	study_start_msg.study_start.steps[0].action.adv_interval_ms = 100;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_BLE_ADVERTISE;
+	study_start_msg.study_start.steps[0].action.advertise.has_local_name = true;
+	strcpy(study_start_msg.study_start.steps[0].action.advertise.local_name, "dev-bench");
+	study_start_msg.study_start.steps[0].action.advertise.adv_interval_ms = 100;
 
 	strcpy(study_start_msg.study_start.steps[1].name, "advertise-2");
 	study_start_msg.study_start.steps[1].timeout_ms = 2000;
 	study_start_msg.study_start.steps[1].continue_on_fail = true;
-	study_start_msg.study_start.steps[1].action.has_local_name = false;
-	study_start_msg.study_start.steps[1].action.adv_interval_ms = 250;
+	study_start_msg.study_start.steps[1].action_tag = DBM_ACTION_BLE_ADVERTISE;
+	study_start_msg.study_start.steps[1].action.advertise.has_local_name = false;
+	study_start_msg.study_start.steps[1].action.advertise.adv_interval_ms = 250;
 
 	/* Real steps_crc for this exact two-step content, confirmed against
 	 * embarch-study-designer's own steps_crc() -- see the one-step test's
@@ -218,11 +224,179 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
 	zassert_str_equal(study_start_decoded.study_start.steps[1].name, "advertise-2", "name mismatch");
-	zassert_false(study_start_decoded.study_start.steps[1].action.has_local_name,
+	zassert_false(study_start_decoded.study_start.steps[1].action.advertise.has_local_name,
 		      "has_local_name mismatch");
 	zassert_true(study_start_decoded.study_start.steps[1].continue_on_fail,
 		     "continue_on_fail mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
+}
+
+/* design.md §3 decisions 31/32: every Action kind this crate defines must
+ * round-trip through a StudyStart, not just BleAdvertise. These don't assert
+ * steps_crc_valid -- the hardcoded steps_crc values above are real, crate-
+ * confirmed CRCs for their own exact content, and computing a new one by
+ * hand here isn't worth it just to decode-round-trip a single step's action
+ * shape (round_trip() itself already proves encode/decode agree either
+ * way). */
+ZTEST(serial_protocol, test_study_start_ble_connect_action_round_trip)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "connect");
+	study_start_msg.study_start.steps[0].timeout_ms = 5000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_BLE_CONNECT;
+	study_start_msg.study_start.steps[0].action.connect.role = 0; /* Central */
+	study_start_msg.study_start.steps[0].action.connect.has_target_address = true;
+	study_start_msg.study_start.steps[0].action.connect.target_address_kind = 1; /* Random */
+	memcpy(study_start_msg.study_start.steps[0].action.connect.target_address,
+	       (uint8_t[]){0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}, 6);
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.study_start.steps_len, 1, "steps_len mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].action_tag, DBM_ACTION_BLE_CONNECT,
+		      "action_tag mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].action.connect.role, 0,
+		      "role mismatch");
+	zassert_true(study_start_decoded.study_start.steps[0].action.connect.has_target_address,
+		     "has_target_address mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].action.connect.target_address_kind, 1,
+		      "target_address_kind mismatch");
+	zassert_mem_equal(study_start_decoded.study_start.steps[0].action.connect.target_address,
+			   ((uint8_t[]){0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF}), 6,
+			   "target_address mismatch");
+}
+
+ZTEST(serial_protocol, test_study_start_data_exchange_write_action_round_trip)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "write-cfg");
+	study_start_msg.study_start.steps[0].timeout_ms = 2000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_DATA_EXCHANGE;
+	memset(study_start_msg.study_start.steps[0].action.data_exchange.service_uuid, 0x11, 16);
+	memset(study_start_msg.study_start.steps[0].action.data_exchange.characteristic_uuid, 0x22,
+	       16);
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.kind = DBM_GATT_OP_WRITE;
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.payload[0] = 0xDE;
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.payload[1] = 0xAD;
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.payload_len = 2;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	const struct dbm_data_exchange_action *de =
+		&study_start_decoded.study_start.steps[0].action.data_exchange;
+
+	zassert_equal(study_start_decoded.study_start.steps[0].action_tag, DBM_ACTION_DATA_EXCHANGE,
+		      "action_tag mismatch");
+	uint8_t expect_service[16], expect_char[16];
+
+	memset(expect_service, 0x11, 16);
+	memset(expect_char, 0x22, 16);
+	zassert_mem_equal(de->service_uuid, expect_service, 16, "service_uuid mismatch");
+	zassert_mem_equal(de->characteristic_uuid, expect_char, 16, "characteristic_uuid mismatch");
+	zassert_equal(de->operation.kind, DBM_GATT_OP_WRITE, "operation kind mismatch");
+	zassert_equal(de->operation.payload_len, 2, "payload_len mismatch");
+	zassert_equal(de->operation.payload[0], 0xDE, "payload[0] mismatch");
+	zassert_equal(de->operation.payload[1], 0xAD, "payload[1] mismatch");
+}
+
+ZTEST(serial_protocol, test_study_start_gatt_discover_and_monitor_all_round_trip)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 2;
+	strcpy(study_start_msg.study_start.steps[0].name, "discover");
+	study_start_msg.study_start.steps[0].timeout_ms = 3000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_GATT_DISCOVER;
+	strcpy(study_start_msg.study_start.steps[1].name, "monitor-all");
+	study_start_msg.study_start.steps[1].timeout_ms = 10000;
+	study_start_msg.study_start.steps[1].action_tag = DBM_ACTION_GATT_MONITOR_ALL;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].action_tag, DBM_ACTION_GATT_DISCOVER,
+		      "step 0 action_tag mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[1].action_tag,
+		      DBM_ACTION_GATT_MONITOR_ALL, "step 1 action_tag mismatch");
+	zassert_false(study_start_decoded.study_start.has_unsupported_action,
+		      "should not flag an unsupported action");
+}
+
+/* design.md §3 decisions 31/32: StepResult.gatt_services/gatt_activity, the
+ * new fields GattDiscover/GattMonitorAll populate. */
+static struct dev_bench_message gatt_step_result_msg;
+static struct dev_bench_message gatt_step_result_decoded;
+
+ZTEST(serial_protocol, test_step_result_gatt_services_round_trip)
+{
+	memset(&gatt_step_result_msg, 0, sizeof(gatt_step_result_msg));
+	gatt_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	gatt_step_result_msg.step_result.step_index = 1;
+	strcpy(gatt_step_result_msg.step_result.result.step_name, "discover");
+	gatt_step_result_msg.step_result.result.outcome.tag = 0; /* Pass */
+
+	struct dbm_step_result_payload *r = &gatt_step_result_msg.step_result.result;
+
+	r->has_gatt_services = true;
+	r->gatt_services_len = 2;
+	memset(r->gatt_services[0].uuid, 0x01, 16);
+	r->gatt_services[0].characteristics_len = 1;
+	memset(r->gatt_services[0].characteristics[0].uuid, 0x02, 16);
+	r->gatt_services[0].characteristics[0].properties = 0x10; /* Notify */
+	memset(r->gatt_services[1].uuid, 0x03, 16);
+	r->gatt_services[1].characteristics_len = 0;
+
+	zassert_equal(round_trip(&gatt_step_result_msg, &gatt_step_result_decoded), 0,
+		      "decode failed");
+	const struct dbm_step_result_payload *d = &gatt_step_result_decoded.step_result.result;
+
+	zassert_true(d->has_gatt_services, "has_gatt_services mismatch");
+	zassert_equal(d->gatt_services_len, 2, "gatt_services_len mismatch");
+	zassert_equal(d->gatt_services[0].characteristics_len, 1,
+		      "service 0 characteristics_len mismatch");
+	zassert_equal(d->gatt_services[0].characteristics[0].properties, 0x10,
+		      "service 0 characteristic 0 properties mismatch");
+	zassert_equal(d->gatt_services[1].characteristics_len, 0,
+		      "service 1 characteristics_len mismatch");
+	zassert_false(d->has_gatt_activity, "has_gatt_activity should default false");
+}
+
+ZTEST(serial_protocol, test_step_result_gatt_activity_round_trip)
+{
+	memset(&gatt_step_result_msg, 0, sizeof(gatt_step_result_msg));
+	gatt_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	gatt_step_result_msg.step_result.step_index = 2;
+	strcpy(gatt_step_result_msg.step_result.result.step_name, "monitor-all");
+	gatt_step_result_msg.step_result.result.outcome.tag = 0; /* Pass */
+
+	struct dbm_step_result_payload *r = &gatt_step_result_msg.step_result.result;
+
+	r->has_gatt_activity = true;
+	r->gatt_activity_len = 2;
+	r->gatt_activity[0].rx_utc_ms = 1753000000123ULL;
+	r->gatt_activity[0].characteristic_index = 3;
+	r->gatt_activity[0].payload[0] = 0x01;
+	r->gatt_activity[0].payload[1] = 0x02;
+	r->gatt_activity[0].payload_len = 2;
+	r->gatt_activity[1].rx_utc_ms = 1753000000456ULL;
+	r->gatt_activity[1].characteristic_index = 7;
+	r->gatt_activity[1].payload_len = 0;
+
+	zassert_equal(round_trip(&gatt_step_result_msg, &gatt_step_result_decoded), 0,
+		      "decode failed");
+	const struct dbm_step_result_payload *d = &gatt_step_result_decoded.step_result.result;
+
+	zassert_true(d->has_gatt_activity, "has_gatt_activity mismatch");
+	zassert_equal(d->gatt_activity_len, 2, "gatt_activity_len mismatch");
+	zassert_equal(d->gatt_activity[0].rx_utc_ms, 1753000000123ULL, "record 0 rx_utc_ms mismatch");
+	zassert_equal(d->gatt_activity[0].characteristic_index, 3,
+		      "record 0 characteristic_index mismatch");
+	zassert_equal(d->gatt_activity[0].payload_len, 2, "record 0 payload_len mismatch");
+	zassert_equal(d->gatt_activity[0].payload[1], 0x02, "record 0 payload[1] mismatch");
+	zassert_equal(d->gatt_activity[1].characteristic_index, 7,
+		      "record 1 characteristic_index mismatch");
+	zassert_false(d->has_gatt_services, "has_gatt_services should stay false");
 }
 
 ZTEST(serial_protocol, test_study_start_rejects_too_many_steps)

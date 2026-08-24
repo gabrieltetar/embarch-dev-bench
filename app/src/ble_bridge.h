@@ -90,6 +90,11 @@ enum action_kind {
 	ACTION_BLE_ADVERTISE,
 	ACTION_BLE_CONNECT,
 	ACTION_DATA_EXCHANGE,
+	/* Both field-less (embarch-study-designer/src/study.rs's `Action::GattDiscover {}`/
+	 * `Action::GattMonitorAll {}`) -- no params struct needed, matching design.md §3
+	 * decisions 31/32's own "simplest possible" framing. */
+	ACTION_GATT_DISCOVER,
+	ACTION_GATT_MONITOR_ALL,
 };
 
 struct action {
@@ -98,7 +103,40 @@ struct action {
 		struct ble_advertise_params advertise;
 		struct ble_connect_params connect;
 		struct data_exchange_params data_exchange;
+		/* ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL carry no params. */
 	};
+};
+
+/* Mirrors embarch-study-designer's `GattCharacteristicInfo`/`GattServiceInfo`
+ * (src/gatt.rs, design.md §4.3a) -- `properties` is the raw ATT
+ * characteristic-properties byte, passed through unchanged (that decision's
+ * "raw, not symbolic" stance). UUID byte order matches every other UUID in
+ * this header: big-endian, embarch-study-designer's own convention. */
+#define BLE_MAX_DISCOVERED_SERVICES 8 /* mirrors limits::MAX_DISCOVERED_SERVICES */
+#define BLE_MAX_CHARS_PER_SERVICE 16  /* mirrors limits::MAX_CHARS_PER_SERVICE */
+#define BLE_MAX_GATT_ACTIVITY_RECORDS 32 /* mirrors limits::MAX_GATT_ACTIVITY_RECORDS */
+
+struct ble_gatt_characteristic_info {
+	uint8_t uuid[16];
+	uint8_t properties;
+};
+
+struct ble_gatt_service_info {
+	uint8_t uuid[16];
+	struct ble_gatt_characteristic_info characteristics[BLE_MAX_CHARS_PER_SERVICE];
+	uint8_t characteristics_len;
+};
+
+/* Mirrors `GattActivityRecord` (src/gatt.rs) -- `characteristic_index` indexes
+ * into the same step's `gatt_services`, flattened service-then-characteristic
+ * in discovery order (that type's own documented convention); this bridge
+ * computes it directly against the `struct ble_gatt_service_info` array below,
+ * so there is exactly one place that flattening happens. */
+struct ble_gatt_activity_record {
+	uint64_t rx_utc_ms;
+	uint16_t characteristic_index;
+	uint8_t payload[BLE_MAX_PAYLOAD_LEN];
+	uint16_t payload_len;
 };
 
 enum outcome_kind {
@@ -122,6 +160,18 @@ struct outcome {
 	 * a 512-byte stack copy. */
 	const uint8_t *captured_data;
 	size_t captured_len;
+
+	/* Populated by ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL, mirroring
+	 * `StepResult.gatt_services` (embarch-study-designer/src/result.rs, design.md
+	 * §3 decisions 31/32) -- a borrow into a bridge-owned static buffer, same
+	 * posture and same lifetime rule as `captured_data` above. NULL/0 for every
+	 * other action kind. */
+	const struct ble_gatt_service_info *gatt_services;
+	size_t gatt_service_count;
+	/* Populated only by ACTION_GATT_MONITOR_ALL, mirroring `StepResult.gatt_activity`.
+	 * NULL/0 for every other action kind, including ACTION_GATT_DISCOVER. */
+	const struct ble_gatt_activity_record *gatt_activity;
+	size_t gatt_activity_count;
 };
 
 /* Brings up the BLE bridge (Zephyr BT host enable for _real; a no-op for
