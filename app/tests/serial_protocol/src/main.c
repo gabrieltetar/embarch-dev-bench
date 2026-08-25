@@ -57,46 +57,120 @@ ZTEST(serial_protocol, test_hello_ack_round_trip)
 			   "firmware_version mismatch");
 }
 
-ZTEST(serial_protocol, test_stream_start_and_end_round_trip)
+/* ---- Stream taps (embarch-study-designer schema v8, that doc's §3
+ * decision 39) --------------------------------------------------------
+ *
+ * All three of these are pinned as literal COBS frames rather than
+ * round-tripped through this file's own decoder, for the reason the GATT
+ * transcript already was and now more so: there *is* no C decoder for them.
+ * dev-bench only ever sends a StreamOpen/StreamChunkBatch/StreamClose, and
+ * the only reader is embarch-core's Rust postcard decode. A C-side round
+ * trip would prove this encoder self-consistent while saying nothing about
+ * whether Rust agrees, which is the only thing that matters.
+ *
+ * embarch-study-designer pins the identical bytes (pre-COBS) from the Rust
+ * side, in `stream_open_matches_dev_bench_firmwares_own_hand_written_encoding`
+ * and its two siblings, and asserts postcard both decodes them into the
+ * matching `DevBenchMessage` *and* re-encodes to the same bytes. Changing a
+ * shape must break both tests, in both languages -- that pairing is the whole
+ * point, and it found a real discrepancy the first time it ran.
+ */
+
+ZTEST(serial_protocol, test_stream_open_encodes_to_the_pinned_wire_bytes)
 {
-	struct dev_bench_message start = {
-		.tag = DBM_TAG_STREAM_START,
-		.stream_start = {.step_index = 7, .channel = DBM_CHANNEL_SENSOR_WAVEFORM},
+	/* body: 0x02 tag, 0x02 id -- no zero bytes, so COBS is one leading
+	 * code byte (len + 1) plus the data plus the delimiter. */
+	static const uint8_t expected[] = {0x03, 0x02, 0x02, 0x00};
+
+	struct dev_bench_message msg = {
+		.tag = DBM_TAG_STREAM_OPEN,
+		.stream_open = {.id = 2},
 	};
-	struct dev_bench_message decoded;
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
 
-	zassert_equal(round_trip(&start, &decoded), 0, "decode failed");
-	zassert_equal(decoded.tag, DBM_TAG_STREAM_START, "wrong tag");
-	zassert_equal(decoded.stream_start.step_index, 7, "step_index mismatch");
-	zassert_equal(decoded.stream_start.channel, DBM_CHANNEL_SENSOR_WAVEFORM, "channel mismatch");
-
-	struct dev_bench_message end = {
-		.tag = DBM_TAG_STREAM_END,
-		.stream_end = {.step_index = 7, .channel = DBM_CHANNEL_POWER},
-	};
-
-	zassert_equal(round_trip(&end, &decoded), 0, "decode failed");
-	zassert_equal(decoded.tag, DBM_TAG_STREAM_END, "wrong tag");
-	zassert_equal(decoded.stream_end.channel, DBM_CHANNEL_POWER, "channel mismatch");
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
-ZTEST(serial_protocol, test_stream_chunk_round_trip)
+ZTEST(serial_protocol, test_stream_close_encodes_to_the_pinned_wire_bytes)
 {
-	struct dev_bench_message msg = {
-		.tag = DBM_TAG_STREAM_CHUNK,
-		.stream_chunk = {.rx_utc_ms = 42,
-				 .value = 3.3f,
-				 .unit = DBM_UNIT_MILLIAMPS,
-				 .channel_id = 5},
-	};
-	struct dev_bench_message decoded;
+	/* body: 0x04 tag, 0x02 id (raw u8), 0x05 dropped (varint). */
+	static const uint8_t expected[] = {0x04, 0x04, 0x02, 0x05, 0x00};
 
-	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
-	zassert_equal(decoded.tag, DBM_TAG_STREAM_CHUNK, "wrong tag");
-	zassert_equal(decoded.stream_chunk.rx_utc_ms, 42, "rx_utc_ms mismatch");
-	zassert_within(decoded.stream_chunk.value, 3.3f, 0.0001f, "value mismatch");
-	zassert_equal(decoded.stream_chunk.unit, DBM_UNIT_MILLIAMPS, "unit mismatch");
-	zassert_equal(decoded.stream_chunk.channel_id, 5, "channel_id mismatch");
+	struct dev_bench_message msg = {
+		.tag = DBM_TAG_STREAM_CLOSE,
+		.stream_close = {.id = 0, .dropped = 0},
+	};
+
+	msg.stream_close.id = 2;
+	msg.stream_close.dropped = 5;
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
+}
+
+ZTEST(serial_protocol, test_stream_close_with_zero_fields_encodes_to_the_pinned_wire_bytes)
+{
+	/* Every byte of the body but the tag is zero (0x04, 0x00, 0x00), which
+	 * is the interesting case for COBS: three overhead bytes and one
+	 * literal. The Rust side pins the same body in
+	 * `a_stream_close_with_zero_fields_still_round_trips`. */
+	static const uint8_t expected[] = {0x02, 0x04, 0x01, 0x01, 0x00};
+
+	struct dev_bench_message msg = {
+		.tag = DBM_TAG_STREAM_CLOSE,
+		.stream_close = {.id = 0, .dropped = 0},
+	};
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
+}
+
+ZTEST(serial_protocol, test_stream_chunk_batch_encodes_to_the_pinned_wire_bytes)
+{
+	/* body: 0x03 tag, 0x02 id (raw u8), 0x01 records_len (varint),
+	 * then one record: 0x89 0x06 rx_utc_ms=777 (varint), 0x04 bytes_len,
+	 * "ok\r\n". Ten bytes, none of them zero. */
+	static const uint8_t expected[] = {0x0b, 0x03, 0x02, 0x01, 0x89, 0x06,
+					    0x04, 0x6f, 0x6b, 0x0d, 0x0a, 0x00};
+
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STREAM_CHUNK_BATCH;
+	msg.stream_chunk_batch.id = 2;
+	msg.stream_chunk_batch.records_len = 1;
+	msg.stream_chunk_batch.records[0].rx_utc_ms = 777;
+	memcpy(msg.stream_chunk_batch.records[0].bytes, "ok\r\n", 4);
+	msg.stream_chunk_batch.records[0].bytes_len = 4;
+
+	static uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
+}
+
+ZTEST(serial_protocol, test_stream_chunk_batch_refuses_more_records_than_it_can_hold)
+{
+	/* A disclosed capacity limit, not a silent truncation -- same posture
+	 * `dbm_decode_frame` already takes for an oversized `steps_len`. */
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STREAM_CHUNK_BATCH;
+	msg.stream_chunk_batch.records_len = DBM_MAX_STREAM_RECORDS_PER_BATCH + 1;
+
+	static uint8_t frame[DBM_MAX_FRAME_LEN];
+
+	zassert_true(dbm_encode_frame(&msg, frame, sizeof(frame)) < 0,
+		      "an over-capacity batch must fail, not read past records[]");
 }
 
 ZTEST(serial_protocol, test_log_line_round_trip)
@@ -165,10 +239,14 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 	 * for this exact single-step content (name "advertise",
 	 * BleAdvertise{local_name: Some("embarch-dev-bench"), service_uuids: [],
 	 * adv_interval_ms: 100}, timeout_ms 5000, power_sample: None,
-	 * continue_on_fail: false) -- confirmed against the real crate, not
-	 * guessed, so this test actually proves this file's CRC-32 matches that
-	 * crate's, not just that this file agrees with itself. */
-	study_start_msg.study_start.steps_crc = 0x889FAF61;
+	 * continue_on_fail: false, delay_before_ms: 0) -- confirmed against the
+	 * real crate, not guessed, so this test actually proves this file's
+	 * CRC-32 matches that crate's, not just that this file agrees with
+	 * itself. Changed with schema v6 (Step gained delay_before_ms, which
+	 * every step's encoding now feeds into the digest); the crate-side
+	 * counterpart that keeps this honest is
+	 * embarch-study-designer/tests/firmware_test_vectors.rs. */
+	study_start_msg.study_start.steps_crc = 0xE83F21EC;
 
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_equal(study_start_decoded.tag, DBM_TAG_STUDY_START, "wrong tag");
@@ -185,7 +263,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 			   "embarch-dev-bench", "local_name mismatch");
 	zassert_equal(study_start_decoded.study_start.steps[0].action.advertise.adv_interval_ms, 100,
 		      "adv_interval_ms mismatch");
-	zassert_equal(study_start_decoded.study_start.steps_crc, 0x889FAF61, "steps_crc mismatch");
+	zassert_equal(study_start_decoded.study_start.steps_crc, 0xE83F21EC, "steps_crc mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
 
 	/* Flipping a bit must be caught. */
@@ -219,7 +297,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 	/* Real steps_crc for this exact two-step content, confirmed against
 	 * embarch-study-designer's own steps_crc() -- see the one-step test's
 	 * comment above. */
-	study_start_msg.study_start.steps_crc = 0xAD7A131B;
+	study_start_msg.study_start.steps_crc = 0x91923654;
 
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
@@ -228,7 +306,184 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 		      "has_local_name mismatch");
 	zassert_true(study_start_decoded.study_start.steps[1].continue_on_fail,
 		     "continue_on_fail mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].delay_before_ms, 0,
+		      "delay_before_ms mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[1].delay_before_ms, 0,
+		      "delay_before_ms mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
+}
+
+/* Schema v6 (embarch-study-designer/design.md §3 decision 42): Step's
+ * delay_before_ms is a *trailing* varint, which is exactly the shape that
+ * round-trips convincingly while actually being misaligned -- a decoder that
+ * forgot to read it, or read it one field early, still produces plausible
+ * output for an all-zero study. So the two steps here deliberately disagree
+ * about it, and the values are multi-byte varints (>= 128) rather than small
+ * ones, so a length error can't hide. steps_crc isn't asserted valid: these
+ * values aren't in the crate-confirmed CRCs pinned above, and round_trip()
+ * proving encode/decode agree is the whole point of this test.
+ */
+ZTEST(serial_protocol, test_study_start_round_trip_delay_before_ms)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 2;
+
+	strcpy(study_start_msg.study_start.steps[0].name, "settle");
+	study_start_msg.study_start.steps[0].timeout_ms = 5000;
+	study_start_msg.study_start.steps[0].delay_before_ms = 2500;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_GATT_MONITOR_START;
+
+	strcpy(study_start_msg.study_start.steps[1].name, "stimulate");
+	study_start_msg.study_start.steps[1].timeout_ms = 3000;
+	study_start_msg.study_start.steps[1].delay_before_ms = 128;
+	study_start_msg.study_start.steps[1].continue_on_fail = true;
+	study_start_msg.study_start.steps[1].action_tag = DBM_ACTION_GATT_MONITOR_STOP;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[0].delay_before_ms, 2500,
+		      "step 0 delay_before_ms mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[1].delay_before_ms, 128,
+		      "step 1 delay_before_ms mismatch");
+	/* The fields either side of it must survive too -- the failure mode
+	 * this guards against shifts everything after the misread. */
+	zassert_equal(study_start_decoded.study_start.steps[0].timeout_ms, 5000,
+		      "step 0 timeout_ms mismatch");
+	zassert_str_equal(study_start_decoded.study_start.steps[1].name, "stimulate",
+			   "step 1 name mismatch");
+	zassert_true(study_start_decoded.study_start.steps[1].continue_on_fail,
+		     "step 1 continue_on_fail mismatch");
+	zassert_equal(study_start_decoded.study_start.steps[1].action_tag,
+		      DBM_ACTION_GATT_MONITOR_STOP, "step 1 action_tag mismatch");
+}
+
+/* The real bytes embarch-core puts on the wire, decoded by this file's own
+ * decoder. Every other StudyStart test here round-trips through
+ * dbm_encode_frame first, which means a decoder bug that this file's encoder
+ * mirrors exactly passes them all while failing against Core -- precisely
+ * the failure mode that produced a silent, message-less study timeout on
+ * real hardware the first time the stimulate-and-capture path ran
+ * (receive_message() returns non-zero and main.c's loop just `continue`s,
+ * so a rejected frame looks identical to a dead link).
+ *
+ * These are postcard bytes for DevBenchMessage::StudyStart carrying the
+ * four-step study, produced by
+ * embarch-study-designer/tests/firmware_test_vectors.rs's
+ * dump_study_start_wire_bytes -- run that with --nocapture to regenerate
+ * after any wire change (last regenerated for schema v8). This is the *payload*, pre-COBS, which is what
+ * dbm_decode_frame takes.
+ */
+static const uint8_t core_study_start_frame[] = {
+	/* 0x06: DevBenchMessage's StudyStart variant index, i.e. the message tag
+	 * -- the first byte of the payload, not part of the COBS framing. */
+	0x06, 0x04, 0x07, 0x63, 0x6f, 0x6e, 0x6e, 0x65, 0x63, 0x74, 0x01, 0x00, 0x00, 0x01,
+	0x0f, 0x45, 0x69, 0x67, 0x68, 0x74, 0x20, 0x53, 0x6c, 0x65, 0x65, 0x70, 0x20, 0x53,
+	0x31, 0x31, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x6f, 0x70, 0x65, 0x6e, 0x2d,
+	0x63, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x05, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x00,
+	0x09, 0x73, 0x74, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x02, 0x6e, 0x40, 0x00,
+	0x01, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x6e,
+	0x40, 0x00, 0x02, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca,
+	0x9e, 0x01, 0x10, 0x6b, 0x65, 0x72, 0x6e, 0x65, 0x6c, 0x20, 0x76, 0x65, 0x72, 0x73,
+	0x69, 0x6f, 0x6e, 0x0d, 0x0a, 0x88, 0x27, 0x00, 0x00, 0xe8, 0x07, 0x0d, 0x63, 0x6c,
+	0x6f, 0x73, 0x65, 0x2d, 0x63, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x06, 0x88, 0x27,
+	0x00, 0x00, 0xc0, 0x3e, 0xeb, 0x8d, 0xf5, 0xe2, 0x06,
+	/* Schema v8's trailing `streams` field on StudyStart
+	 * (embarch-study-designer/design.md §3 decision 39): an empty
+	 * `Vec<StreamTap, _>`, i.e. one zero-length varint. Appended after
+	 * `steps_crc` rather than inserted, on purpose -- exactly the
+	 * append-don't-insert discipline decision 42 used -- so this decoder,
+	 * which does not read taps yet (Milestone 7 Phase B's work), sees only
+	 * one unconsumed trailing byte rather than a re-shuffled sequence. */
+	0x00,
+};
+
+/* An independent COBS encoder, deliberately not serial_protocol.c's own
+ * (which is `static` anyway): the point of the test below is to feed the
+ * decoder bytes it didn't produce, so borrowing the implementation's encoder
+ * would reintroduce exactly the blind spot being closed. Standard COBS, no
+ * trailing 0x00 delimiter -- dbm_decode_frame takes the frame without it. */
+static size_t test_cobs_encode(const uint8_t *in, size_t len, uint8_t *out)
+{
+	size_t code_index = 0;
+	size_t write_index = 1;
+	uint8_t code = 1;
+
+	for (size_t read_index = 0; read_index < len; read_index++) {
+		if (in[read_index] == 0) {
+			out[code_index] = code;
+			code = 1;
+			code_index = write_index++;
+		} else {
+			out[write_index++] = in[read_index];
+			if (++code == 0xFF) {
+				out[code_index] = code;
+				code = 1;
+				code_index = write_index++;
+			}
+		}
+	}
+	out[code_index] = code;
+	return write_index;
+}
+
+ZTEST(serial_protocol, test_decodes_cores_real_study_start_bytes)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+
+	/* dbm_decode_frame expects a COBS-encoded frame, the same way
+	 * receive_message() hands it one -- so the raw postcard payload above is
+	 * COBS-encoded here first, exactly as Core's own transport does. */
+	size_t framed_len = test_cobs_encode(core_study_start_frame,
+					     sizeof(core_study_start_frame), framed);
+
+	zassert_true(framed_len > 0, "COBS encode of Core's payload failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode the bytes embarch-core actually sends");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(study_start_decoded.tag, DBM_TAG_STUDY_START, "wrong tag");
+	zassert_equal(ss->steps_len, 4, "steps_len mismatch");
+	zassert_false(ss->has_unsupported_action, "should recognize every action");
+	zassert_true(ss->steps_crc_valid,
+		     "steps_crc computed over Core's own bytes must validate");
+
+	zassert_str_equal(ss->steps[0].name, "connect", "step 0 name");
+	zassert_equal(ss->steps[0].action_tag, DBM_ACTION_BLE_CONNECT, "step 0 action");
+	zassert_equal(ss->steps[0].timeout_ms, 20000, "step 0 timeout");
+	zassert_equal(ss->steps[0].delay_before_ms, 0, "step 0 delay");
+	/* Schema v7's trailing field on the BleConnect variant (design.md §3
+	 * decision 43). It sits *before* the step's own timeout/delay on the
+	 * wire, so getting its length wrong shifts everything after it -- which
+	 * is exactly what the two assertions above would then catch. */
+	zassert_true(ss->steps[0].action.connect.has_target_name, "step 0 has_target_name");
+	zassert_str_equal(ss->steps[0].action.connect.target_name, "the client S11",
+			   "step 0 target_name");
+
+	zassert_str_equal(ss->steps[1].name, "open-capture", "step 1 name");
+	zassert_equal(ss->steps[1].action_tag, DBM_ACTION_GATT_MONITOR_START, "step 1 action");
+
+	zassert_str_equal(ss->steps[2].name, "stimulate", "step 2 name");
+	zassert_equal(ss->steps[2].action_tag, DBM_ACTION_DATA_EXCHANGE, "step 2 action");
+	zassert_equal(ss->steps[2].delay_before_ms, 1000, "step 2 delay");
+	zassert_equal(ss->steps[2].action.data_exchange.operation.kind, DBM_GATT_OP_WRITE,
+		      "step 2 operation");
+	zassert_equal(ss->steps[2].action.data_exchange.operation.payload_len, 16,
+		      "step 2 payload_len");
+	zassert_mem_equal(ss->steps[2].action.data_exchange.operation.payload,
+			  "kernel version\r\n", 16, "step 2 payload");
+	/* NUS RX, from embarch-study-designer's vendor table (decision 41). */
+	static const uint8_t nus_rx[16] = {0x6e, 0x40, 0x00, 0x02, 0xb5, 0xa3, 0xf3, 0x93,
+					   0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e};
+	zassert_mem_equal(ss->steps[2].action.data_exchange.characteristic_uuid, nus_rx, 16,
+			  "step 2 characteristic_uuid");
+
+	zassert_str_equal(ss->steps[3].name, "close-capture", "step 3 name");
+	zassert_equal(ss->steps[3].action_tag, DBM_ACTION_GATT_MONITOR_STOP, "step 3 action");
+	zassert_equal(ss->steps[3].delay_before_ms, 8000, "step 3 delay");
 }
 
 /* design.md §3 decisions 31/32: every Action kind this crate defines must
@@ -468,4 +723,143 @@ ZTEST(serial_protocol, test_study_done_round_trip)
 	msg.study_done.completed = false;
 	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
 	zassert_false(decoded.study_done.completed, "completed mismatch");
+}
+
+/* ---- GATT transcript (embarch-dev-bench/design.md §3 decision 36) -------- */
+
+/* The exact bytes `dbm_encode_transcript_entry` must produce for one
+ * `GattTranscriptEntry`.
+ *
+ * These used to be pinned as a whole DBM_TAG_GATT_TRANSCRIPT_RECORD frame.
+ * That message is retired at schema v8 (embarch-study-designer/design.md §3
+ * decision 39): the entry itself, its both-directions coverage, its uncapped
+ * streaming and its `gatt.csv` columns are all unchanged, but it now rides as
+ * the byte payload of a DBM_TAG_STREAM_CHUNK_BATCH record on a tap declared
+ * `StreamEncoding::GattTranscript`. So what is pinned is the entry, which is
+ * what actually crosses the wire; the bytes below are byte-for-byte the entry
+ * half of the frame decision 36 originally pinned.
+ *
+ * embarch-study-designer pins the identical bytes in
+ * `gatt_transcript_entry_matches_dev_bench_firmwares_own_hand_written_encoding`
+ * and asserts postcard decodes and re-encodes them. Changing the entry's
+ * shape must break both.
+ */
+static const uint8_t expected_transcript_entry[] = {
+	0x89, 0x06, 0x01, 0x0b, 0x01, 0x6e, 0x40, 0x00, 0x01, 0xb5, 0xa3, 0xf3,
+	0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x01, 0x6e, 0x40,
+	0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc,
+	0xca, 0x9e, 0x00, 0x04, 0x6f, 0x6b, 0x0d, 0x0a,
+};
+
+ZTEST(serial_protocol, test_gatt_transcript_entry_encodes_to_the_pinned_wire_bytes)
+{
+	static const uint8_t nus_service[16] = {0x6e, 0x40, 0x00, 0x01, 0xb5, 0xa3, 0xf3, 0x93,
+						0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e};
+	static const uint8_t nus_tx[16] = {0x6e, 0x40, 0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93,
+					   0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e};
+
+	static struct dbm_gatt_transcript_entry entry;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.rx_utc_ms = 777;
+	entry.direction = DBM_GATT_DIR_IN;
+	entry.kind = DBM_GATT_EVT_NOTIFICATION;
+	entry.has_service_uuid = true;
+	memcpy(entry.service_uuid, nus_service, 16);
+	entry.has_characteristic_uuid = true;
+	memcpy(entry.characteristic_uuid, nus_tx, 16);
+	entry.att_status = 0;
+	memcpy(entry.payload, "ok\r\n", 4);
+	entry.payload_len = 4;
+
+	static uint8_t bytes[DBM_MAX_TRANSCRIPT_RECORD_LEN];
+	int len = dbm_encode_transcript_entry(&entry, bytes, sizeof(bytes));
+
+	zassert_equal(len, (int)sizeof(expected_transcript_entry), "entry length mismatch");
+	zassert_mem_equal(bytes, expected_transcript_entry, sizeof(expected_transcript_entry),
+			   "encoded entry differs from the pinned wire bytes");
+}
+
+ZTEST(serial_protocol, test_a_transcript_entry_rides_a_stream_record_unchanged)
+{
+	/* The whole message dev-bench will send for one transcript line once
+	 * Phase B rewires main.c onto a tap: the pinned entry above, verbatim,
+	 * as a generic record's payload. Pinned here as the frame; pinned on
+	 * the Rust side, pre-COBS, in
+	 * `a_transcript_entry_carried_as_a_stream_record_matches_the_pinned_frame`. */
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STREAM_CHUNK_BATCH;
+	msg.stream_chunk_batch.id = 2;
+	msg.stream_chunk_batch.records_len = 1;
+	msg.stream_chunk_batch.records[0].rx_utc_ms = 777;
+	memcpy(msg.stream_chunk_batch.records[0].bytes, expected_transcript_entry,
+	       sizeof(expected_transcript_entry));
+	msg.stream_chunk_batch.records[0].bytes_len = sizeof(expected_transcript_entry);
+
+	static uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+	/* body = tag, id, records_len, rx_utc_ms varint (2), bytes_len (1),
+	 * then the 44-byte entry = 50 bytes; COBS adds a leading code byte and
+	 * a trailing delimiter, and relocates the entry's own zero bytes. */
+	zassert_equal(frame_len, 50 + 2, "frame length mismatch");
+	zassert_equal(frame[frame_len - 1], 0x00, "frame missing trailing delimiter");
+}
+
+ZTEST(serial_protocol, test_gatt_transcript_entry_with_no_uuids_encodes_to_the_pinned_bytes)
+{
+	/* A connect/disconnect/discovery-started entry carries neither UUID --
+	 * both Options must encode as a bare 0 discriminant with no bytes
+	 * following, or every field after them shifts. */
+	static struct dbm_gatt_transcript_entry entry;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.rx_utc_ms = 5;
+	entry.direction = DBM_GATT_DIR_LOCAL;
+	entry.kind = DBM_GATT_EVT_DISCOVERY_STARTED;
+	entry.att_status = 0;
+	entry.payload_len = 0;
+
+	/* rx_utc_ms, direction, kind, None, None, att_status, payload_len --
+	 * seven single bytes. */
+	static const uint8_t expected[] = {0x05, 0x02, 0x02, 0x00, 0x00, 0x00, 0x00};
+
+	static uint8_t bytes[DBM_MAX_TRANSCRIPT_RECORD_LEN];
+	int len = dbm_encode_transcript_entry(&entry, bytes, sizeof(bytes));
+
+	zassert_equal(len, (int)sizeof(expected), "entry length mismatch");
+	zassert_mem_equal(bytes, expected, sizeof(expected), "encoded entry mismatch");
+}
+
+ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
+{
+	/* design.md §3 decision 36's two new Action tags must decode as
+	 * field-less, and must not trip `has_unsupported_action` -- the check
+	 * that would otherwise make a whole Study abort before running. */
+	static struct dev_bench_message msg;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.tag = DBM_TAG_STUDY_START;
+	msg.study_start.steps_len = 2;
+	strcpy(msg.study_start.steps[0].name, "open-window");
+	msg.study_start.steps[0].timeout_ms = 10000;
+	msg.study_start.steps[0].action_tag = DBM_ACTION_GATT_MONITOR_START;
+	strcpy(msg.study_start.steps[1].name, "close-window");
+	msg.study_start.steps[1].timeout_ms = 5000;
+	msg.study_start.steps[1].action_tag = DBM_ACTION_GATT_MONITOR_STOP;
+
+	static struct dev_bench_message decoded;
+
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_false(decoded.study_start.has_unsupported_action,
+		       "monitor start/stop reported as unsupported");
+	zassert_equal(decoded.study_start.steps_len, 2, "steps_len mismatch");
+	zassert_equal(decoded.study_start.steps[0].action_tag, DBM_ACTION_GATT_MONITOR_START,
+		       "step 0 action tag mismatch");
+	zassert_equal(decoded.study_start.steps[1].action_tag, DBM_ACTION_GATT_MONITOR_STOP,
+		       "step 1 action tag mismatch");
+	zassert_str_equal(decoded.study_start.steps[0].name, "open-window", "step 0 name mismatch");
+	zassert_equal(decoded.study_start.steps[1].timeout_ms, 5000, "step 1 timeout mismatch");
 }
