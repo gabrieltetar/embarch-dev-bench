@@ -174,6 +174,113 @@ static uint8_t monitor_subscribe_count;
 static struct ble_gatt_activity_record activity[BLE_MAX_GATT_ACTIVITY_RECORDS];
 static size_t activity_len;
 
+/* ---- GATT transcript (design.md §3 decision 36) ------------------------- */
+
+static ble_transcript_sink transcript_sink;
+static void *transcript_user_data;
+
+/* True while a capture window opened by ACTION_GATT_MONITOR_START is still
+ * armed -- i.e. between a GattMonitorStart and its GattMonitorStop, across
+ * every step that runs in between. Exposed through
+ * ble_bridge_monitor_window_open() so main.c can close a window a study left
+ * open. */
+static bool monitor_window_open;
+
+/* The (service, characteristic) UUID pair the last resolve_handles() settled
+ * on, or NULL/NULL when nothing is cached -- what every DataExchange-side
+ * transcript entry is labelled with, since execute_read/execute_write are
+ * handed only a raw value handle. */
+static const uint8_t *cached_service_uuid(void)
+{
+	return handle_cache.valid ? handle_cache.service_uuid : NULL;
+}
+
+static const uint8_t *cached_characteristic_uuid(void)
+{
+	return handle_cache.valid ? handle_cache.characteristic_uuid : NULL;
+}
+
+/* Resolves a flattened characteristic index back to its (service,
+ * characteristic) UUID pair, against `discovered`/`discovered_len`.
+ *
+ * "Flattened" is ble_bridge.h's own documented convention for
+ * `ble_gatt_activity_record.characteristic_index`: service 0's characteristics
+ * first, then service 1's, and so on, in discovery order. This is the one
+ * place that flattening is inverted, so a transcript entry and an activity
+ * record can never disagree about which characteristic an index names.
+ *
+ * Returns false with both outputs left NULL when the index is out of range --
+ * a transcript entry with no UUIDs is still a truthful record of the event,
+ * which is why callers `(void)` this rather than failing the step. */
+static bool uuids_for_flat_index(uint16_t flat, const uint8_t **service_uuid,
+				 const uint8_t **characteristic_uuid)
+{
+	uint16_t seen = 0;
+
+	*service_uuid = NULL;
+	*characteristic_uuid = NULL;
+	for (uint8_t si = 0; si < discovered_len; si++) {
+		uint8_t count = discovered[si].characteristics_len;
+
+		if (flat < seen + count) {
+			*service_uuid = discovered[si].uuid;
+			*characteristic_uuid = discovered[si].characteristics[flat - seen].uuid;
+			return true;
+		}
+		seen += count;
+	}
+	return false;
+}
+
+/* Hands one GATT event to the registered transcript sink.
+ *
+ * Called from both Zephyr's BT RX thread (anything inbound) and the dispatch
+ * thread (anything this bridge initiates), so `entry` is a stack local rather
+ * than a shared static -- the two would otherwise interleave and corrupt each
+ * other's entry. ~290 bytes of stack per call, which is why the payload is
+ * capped at BLE_MAX_TRANSCRIPT_PAYLOAD_LEN rather than BLE_MAX_PAYLOAD_LEN.
+ *
+ * A NULL uuid means "this event has no such UUID" (a connect, a discovery
+ * starting) and is recorded as absent rather than as sixteen zero bytes,
+ * which would be indistinguishable from a real all-zero UUID. Payload bytes
+ * beyond the cap are truncated, not dropped: a truncated record still says
+ * what happened and when. With no sink registered this is a no-op -- the
+ * transcript is observability, never a precondition for a step running. */
+static void transcript_emit(uint8_t direction, uint8_t kind, const uint8_t *service_uuid,
+			    const uint8_t *characteristic_uuid, uint8_t att_status,
+			    const void *payload, size_t payload_len)
+{
+	if (transcript_sink == NULL) {
+		return;
+	}
+
+	struct ble_transcript_entry entry = {
+		/* Same uptime-based convention as ble_gatt_activity_record's own
+		 * rx_utc_ms: no Hello.host_utc_ms clock-offset tracking exists
+		 * on this board yet, and Core restamps on receipt regardless. */
+		.rx_utc_ms = (uint64_t)k_uptime_get(),
+		.direction = direction,
+		.kind = kind,
+		.att_status = att_status,
+	};
+
+	if (service_uuid != NULL) {
+		entry.has_service_uuid = true;
+		memcpy(entry.service_uuid, service_uuid, 16);
+	}
+	if (characteristic_uuid != NULL) {
+		entry.has_characteristic_uuid = true;
+		memcpy(entry.characteristic_uuid, characteristic_uuid, 16);
+	}
+	if (payload != NULL && payload_len > 0) {
+		size_t len = MIN(payload_len, (size_t)BLE_MAX_TRANSCRIPT_PAYLOAD_LEN);
+
+		memcpy(entry.payload, payload, len);
+		entry.payload_len = (uint16_t)len;
+	}
+	transcript_sink(&entry, transcript_user_data);
+}
+
 /* ---- small helpers ------------------------------------------------------ */
 
 static struct outcome outcome_pass(void)
@@ -256,8 +363,27 @@ static void from_bt_uuid(const struct bt_uuid *uuid, uint8_t out_be[16])
 	if (uuid->type == BT_UUID_TYPE_16) {
 		uint16_t val = BT_UUID_16(uuid)->val;
 
-		out_be[0] = (uint8_t)(val >> 8);
-		out_be[1] = (uint8_t)val;
+		/* A 16-bit UUID expands to 0000xxxx-0000-1000-8000-00805F9B34FB
+		 * (Bluetooth Core Spec Vol 3, Part B) -- so its two bytes land at
+		 * offsets 2 and 3 of the big-endian form, NOT 0 and 1. This wrote
+		 * them at 0 and 1 until Milestone 6, which reported every 16-bit
+		 * service and characteristic shifted two bytes left: the Device
+		 * Information Service came back as `180a0000-0000-1000-8000-
+		 * 00805f9b34fb` instead of `0000180a-...`.
+		 *
+		 * Not cosmetic. `Uuid::parse` in embarch-study-designer expands
+		 * "180a" correctly, so a `DataExchange` authored against any
+		 * 16-bit UUID could never match the same characteristic discovery
+		 * had just reported -- the two representations disagreed, and the
+		 * study simply failed to find a service that was plainly there in
+		 * its own discovery output. 128-bit UUIDs were never affected
+		 * (they take the byte-reversing branch above), which is why every
+		 * custom-service study to date worked and this went unnoticed.
+		 * The 32-bit branch below was always right: a 32-bit UUID really
+		 * does occupy offsets 0..3.
+		 */
+		out_be[2] = (uint8_t)(val >> 8);
+		out_be[3] = (uint8_t)val;
 	} else if (uuid->type == BT_UUID_TYPE_32) {
 		uint32_t val = BT_UUID_32(uuid)->val;
 
@@ -484,21 +610,228 @@ static bool peer_matches(const struct ble_connect_params *params)
 	return bt_addr_le_cmp(bt_conn_get_dst(active_conn), &want) == 0;
 }
 
+
+/* Diagnostic log sink (ble_bridge.h's `ble_log_sink`) and the one helper that
+ * writes to it. Only ever called from the dispatch thread -- see that
+ * typedef's own doc comment for why that restriction is the point. */
+static ble_log_sink log_sink;
+static void *log_sink_user;
+
+void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data)
+{
+	log_sink = sink;
+	log_sink_user = user_data;
+}
+
+static void bridge_log(const char *fmt, ...)
+{
+	if (log_sink == NULL) {
+		return;
+	}
+
+	/* Sized to the link's own log-line limit so the sink never has to
+	 * truncate what it's handed. `static`, not a stack local: the dispatch
+	 * thread is the only caller (the typedef's contract), and these call
+	 * sites sit under an already-deep BLE call stack. */
+	static char line[BLE_MAX_LOG_LINE_LEN + 1];
+	va_list args;
+
+	va_start(args, fmt);
+	vsnprintk(line, sizeof(line), fmt, args);
+	va_end(args);
+	log_sink(line, log_sink_user);
+}
+
+/* Advertised-name filter (embarch-study-designer/design.md §3 decision 43).
+ * `scan_name[0] == '\0'` means no name filter. */
+static char scan_name[BLE_MAX_LOCAL_NAME_LEN + 1];
+
+/* What this scan has seen, keyed by advertiser address.
+ *
+ * Address-keyed rather than a single "last name that matched" slot, which is
+ * what this started as and what was wrong with it. A peripheral's name often
+ * arrives in its scan response, which is not itself connectable, so the name
+ * and the connectable advertisement are two separate callbacks in an order
+ * this code does not control. Remembering per address means either order
+ * works: whichever packet completes the pair triggers the connect, because
+ * the entry records both facts independently.
+ *
+ * It also serves as the diagnostic for a scan that matched nothing. A bare
+ * `TimedOut` cannot distinguish "the DUT is silent" from "the DUT is on the
+ * air but advertises no name" -- and the second is invisible to a name
+ * filter by construction, so a name-only report can never rule it out. Live
+ * finding, Milestone 6: a five-minute scan for a DUT's configured
+ * `CONFIG_BT_DEVICE_NAME` reported only two unrelated names, which left
+ * exactly those two possibilities open and no way to choose between them. */
+/* Raised from 8 -> 24 -> 256. The first real census hit 8 and said so ("more
+ * than this firmware records"); the next found 12 distinct advertisers in
+ * three minutes, so 24 was only one busy room away from truncating again. A
+ * cap that silently truncates defeats the whole purpose of the diagnostic:
+ * the advertiser that matters can be any of them, and "not in the list" has
+ * to mean "not on the air", not "list was full".
+ *
+ * 256 is a deliberate over-provision at ~9 KB of static RAM on a board
+ * already at ~96% SRAM (decision 27's own finding) -- affordable only because
+ * this is a flat table of 35-byte entries rather than anything frame-sized
+ * (contrast decision 29's ring buffer, which explicitly could not be sized to
+ * a worst-case frame). The lookup is a linear scan per advertisement, which
+ * is fine: it runs a few hundred byte-comparisons per packet, against a step
+ * timeout measured in seconds. */
+#define SCAN_SEEN_MAX 256
+struct scan_seen_entry {
+	bt_addr_le_t addr;
+	/* Empty until a Local Name AD element is seen for this address. */
+	char name[BLE_MAX_LOCAL_NAME_LEN + 1];
+	/* Set once this address has sent a connectable advertisement --
+	 * ADV_IND/ADV_DIRECT_IND. A scan response alone doesn't set it. */
+	bool connectable;
+};
+static struct scan_seen_entry scan_seen[SCAN_SEEN_MAX];
+static uint8_t scan_seen_len;
+static bool scan_seen_overflowed;
+
+/* Find-or-insert by address. NULL when the table is full (recorded as an
+ * overflow so a report can say so rather than quietly under-listing). */
+static struct scan_seen_entry *scan_seen_entry_for(const bt_addr_le_t *addr)
+{
+	for (uint8_t i = 0; i < scan_seen_len; i++) {
+		if (bt_addr_le_cmp(&scan_seen[i].addr, addr) == 0) {
+			return &scan_seen[i];
+		}
+	}
+	if (scan_seen_len >= SCAN_SEEN_MAX) {
+		scan_seen_overflowed = true;
+		return NULL;
+	}
+
+	struct scan_seen_entry *entry = &scan_seen[scan_seen_len++];
+
+	bt_addr_le_copy(&entry->addr, addr);
+	entry->name[0] = '\0';
+	entry->connectable = false;
+	return entry;
+}
+
+/* bt_data_parse callback: copies any Local Name AD element into the
+ * `struct scan_seen_entry *` passed as user_data. */
+static bool name_ad_record(struct bt_data *data, void *user_data)
+{
+	struct scan_seen_entry *entry = user_data;
+
+	if (data->type != BT_DATA_NAME_COMPLETE && data->type != BT_DATA_NAME_SHORTENED) {
+		return true; /* keep parsing the remaining AD elements */
+	}
+
+	size_t len = MIN((size_t)data->data_len, (size_t)BLE_MAX_LOCAL_NAME_LEN);
+
+	/* A complete name replaces a shortened one; a shortened one does not
+	 * overwrite a complete one already recorded. Longest-wins is a good
+	 * enough proxy and avoids tracking which kind produced the stored
+	 * value. */
+	if (len >= strlen(entry->name)) {
+		memcpy(entry->name, data->data, len);
+		entry->name[len] = '\0';
+	}
+	return true;
+}
+
+/* One line per advertiser seen, emitted through the bridge's log sink from
+ * the dispatch thread once a name-filtered scan has given up. */
+static void report_scan_seen(void)
+{
+	bridge_log("scan saw %u advertiser(s)%s:", (unsigned int)scan_seen_len,
+		   scan_seen_overflowed ? " (more than this firmware records)" : "");
+	for (uint8_t i = 0; i < scan_seen_len; i++) {
+		char addr_str[BT_ADDR_LE_STR_LEN];
+
+		bt_addr_le_to_str(&scan_seen[i].addr, addr_str, sizeof(addr_str));
+		bridge_log("  %s %s name=%s", addr_str,
+			   scan_seen[i].connectable ? "connectable" : "non-connectable",
+			   scan_seen[i].name[0] != '\0' ? scan_seen[i].name : "(none advertised)");
+	}
+}
+
+/* Comma-separated list of the names seen this scan, into a static buffer --
+ * the compact form that fits an `Outcome`'s 64-byte `fail_reason`. The full
+ * per-advertiser detail goes through `report_scan_seen` instead.
+ *
+ * The requested name is deliberately not repeated by the caller: the caller
+ * already knows what it asked for, whereas the names actually on the air are
+ * the part it cannot get any other way. Echoing both truncated the list
+ * exactly where it mattered -- found the first time this ran on a real bench,
+ * where the one interesting name got cut in half. */
+static const char *scan_seen_names_summary(void)
+{
+	static char summary[OUTCOME_MAX_FAIL_REASON_LEN + 1];
+	size_t used = 0;
+	uint8_t named = 0;
+
+	summary[0] = '\0';
+	for (uint8_t i = 0; i < scan_seen_len; i++) {
+		if (scan_seen[i].name[0] == '\0') {
+			continue;
+		}
+
+		int written = snprintk(summary + used, sizeof(summary) - used, "%s'%s'",
+				       (named == 0) ? "" : ", ", scan_seen[i].name);
+
+		if (written < 0 || (size_t)written >= sizeof(summary) - used) {
+			break; /* truncated -- the names that fit are still the useful part */
+		}
+		used += (size_t)written;
+		named++;
+	}
+	if (named == 0) {
+		return (scan_seen_len == 0) ? "(nothing advertising at all)"
+					    : "(advertisers seen, none named)";
+	}
+	return summary;
+}
+
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 		    struct net_buf_simple *buf)
 {
 	ARG_UNUSED(rssi);
-	ARG_UNUSED(buf);
 
 	if (scan_matched) {
 		return;
 	}
-	/* Only a connectable advertiser can be connected to; skip scan responses
-	 * and non-connectable beacons rather than failing on them. */
-	if (adv_type != BT_GAP_ADV_TYPE_ADV_IND && adv_type != BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+
+	struct scan_seen_entry *entry = scan_seen_entry_for(addr);
+
+	if (entry == NULL) {
+		return; /* table full; nothing this call can usefully record or match */
+	}
+
+	/* Recorded for *every* advertisement type, scan responses included --
+	 * that's usually where the name is. Done before any connectable-type
+	 * filtering, which would otherwise discard the packet carrying it.
+	 * `bt_data_parse` consumes the buffer it's given and this callback does
+	 * not own `buf`, so it gets a copy. */
+	if (buf != NULL) {
+		struct net_buf_simple copy = *buf;
+
+		bt_data_parse(&copy, name_ad_record, entry);
+	}
+	if (adv_type == BT_GAP_ADV_TYPE_ADV_IND || adv_type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
+		entry->connectable = true;
+	}
+
+	/* Only a connectable advertiser can be connected to -- but the decision
+	 * is made from the *entry*, not from this packet's own type, so a name
+	 * arriving in a scan response can complete a match whose connectable
+	 * advertisement already went by. */
+	if (!entry->connectable) {
 		return;
 	}
 	if (scan_target_set && bt_addr_le_cmp(addr, &scan_target) != 0) {
+		return;
+	}
+	/* Both filters are ANDed: with a name set, only an address that
+	 * advertised exactly that name is connected to. Exact match -- a loose
+	 * one would reintroduce the failure decision 43 exists to remove, just
+	 * less visibly. */
+	if (scan_name[0] != '\0' && strcmp(entry->name, scan_name) != 0) {
 		return;
 	}
 
@@ -534,11 +867,40 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 	if (scan_target_set) {
 		to_bt_addr(params, &scan_target);
 	}
+	if (params->has_target_name) {
+		strncpy(scan_name, params->target_name, sizeof(scan_name) - 1);
+		scan_name[sizeof(scan_name) - 1] = '\0';
+	} else {
+		scan_name[0] = '\0';
+	}
+	scan_seen_len = 0;
+	scan_seen_overflowed = false;
 	scan_matched = false;
 	conn_err = 0;
 	k_sem_reset(&conn_sem);
 
-	int err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, scan_cb);
+	/* Deliberately NOT BT_LE_SCAN_ACTIVE: that macro sets
+	 * BT_LE_SCAN_OPT_FILTER_DUPLICATE, which reports each advertiser at most
+	 * once per scan. That is fine for "connect to the first thing you see",
+	 * but it breaks the name filter (design.md §3 decision 32): a name that
+	 * arrives in a scan response has to be matched against a *connectable*
+	 * advertisement from the same address, and with duplicate filtering
+	 * there is no second advertisement to match it against -- the name is
+	 * recorded and then nothing connectable ever arrives again.
+	 *
+	 * Same type (active, so scan responses are solicited at all) and same
+	 * interval/window as BT_LE_SCAN_ACTIVE; only the duplicate-filter option
+	 * is dropped. The cost is more callbacks per second, which is bounded by
+	 * the step's own timeout and cheap -- scan_cb returns immediately once
+	 * scan_matched, and scan_seen_names de-duplicates for itself. */
+	static const struct bt_le_scan_param scan_param = {
+		.type = BT_LE_SCAN_TYPE_ACTIVE,
+		.options = BT_LE_SCAN_OPT_NONE,
+		.interval = BT_GAP_SCAN_FAST_INTERVAL,
+		.window = BT_GAP_SCAN_FAST_WINDOW,
+	};
+
+	int err = bt_le_scan_start(&scan_param, scan_cb);
 
 	if (err != 0 && err != -EALREADY) {
 		return outcome_fail("bt_le_scan_start failed (%d)", err);
@@ -551,6 +913,19 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 		 * (and no later step expects). Disconnecting a connecting object is
 		 * Zephyr's documented way to cancel bt_conn_le_create. */
 		release_pending_conn(true);
+		if (scan_name[0] != '\0') {
+			/* A name filter that matched nothing is reported as a
+			 * Fail naming what *was* advertised, not as a bare
+			 * TimedOut: "nothing called X appeared, but these did"
+			 * is actionable. The per-advertiser detail (addresses,
+			 * connectability, whether a name was advertised at all)
+			 * goes through the log sink, because `fail_reason` is
+			 * 64 bytes and cannot hold it. */
+			report_scan_seen();
+			return outcome_fail("no name match; on air: %s%s",
+					    scan_seen_names_summary(),
+					    scan_seen_overflowed ? ", ..." : "");
+		}
 		return outcome_timed_out();
 	}
 
@@ -796,6 +1171,9 @@ static uint8_t discover_all_services_cb(struct bt_conn *conn, const struct bt_ga
 	service_ranges[discovered_len].end = service->end_handle;
 	discovered_len++;
 
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_SERVICE_DISCOVERED, info->uuid, NULL, 0,
+			NULL, 0);
+
 	return BT_GATT_ITER_CONTINUE;
 }
 
@@ -825,6 +1203,14 @@ static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_
 	char_value_handles[discovering_service_index][char_idx] = chrc->value_handle;
 	info->characteristics_len = char_idx + 1;
 
+	/* `att_status` carries the raw ATT properties byte here rather than an
+	 * error code -- the one field on the entry with room for it, and the
+	 * fact a reader most wants next to a discovered characteristic
+	 * (is it writable? does it notify?). Documented rather than adding a
+	 * field used by exactly one event kind. */
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_CHARACTERISTIC_DISCOVERED, info->uuid,
+			cinfo->uuid, chrc->properties, NULL, 0);
+
 	return BT_GATT_ITER_CONTINUE;
 }
 
@@ -840,6 +1226,9 @@ static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_
  * already establishes for every action in this file. */
 static struct outcome run_gatt_discovery(int64_t deadline)
 {
+	transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_DISCOVERY_STARTED, NULL, NULL, 0, NULL,
+			0);
+
 	discovered_len = 0;
 	memset(discovered, 0, sizeof(discovered));
 
@@ -938,11 +1327,30 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 		 * clearing it) -- nothing to record; the rest keep running. */
 		return BT_GATT_ITER_STOP;
 	}
+	ptrdiff_t idx_for_transcript = params - monitor_subscribe_params;
+	uint16_t flat_for_transcript =
+		(idx_for_transcript >= 0 && (size_t)idx_for_transcript < monitor_subscribe_count)
+			? monitor_char_index[idx_for_transcript]
+			: 0;
+	const uint8_t *tr_service_uuid = NULL;
+	const uint8_t *tr_char_uuid = NULL;
+
+	(void)uuids_for_flat_index(flat_for_transcript, &tr_service_uuid, &tr_char_uuid);
+	/* Emitted before the cap check below, deliberately: the streamed
+	 * transcript is bounded only by the study's own duration (design.md §3
+	 * decision 36), where `activity` is a fixed-size inline summary. This
+	 * is the one line that makes "exhaustive" true -- a capture past
+	 * BLE_MAX_GATT_ACTIVITY_RECORDS still reaches Core in full, even though
+	 * the `events.json` summary stops growing. */
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, tr_service_uuid,
+			tr_char_uuid, 0, data, length);
+
 	if (activity_len >= BLE_MAX_GATT_ACTIVITY_RECORDS) {
-		/* Overflow: stop capturing further records for this step, keep
+		/* Overflow: stop adding to the inline summary for this step, keep
 		 * what's already buffered and keep every subscription alive
 		 * rather than tearing anything down (design.md §3 decision 32's
-		 * own overflow addendum: still Pass, not Fail/TimedOut). */
+		 * own overflow addendum: still Pass, not Fail/TimedOut). The
+		 * transcript above is unaffected. */
 		return BT_GATT_ITER_CONTINUE;
 	}
 
@@ -967,7 +1375,12 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 	return BT_GATT_ITER_CONTINUE;
 }
 
-static struct outcome execute_gatt_monitor_all(int64_t deadline)
+/* Discovery + subscribe-to-everything, shared by ACTION_GATT_MONITOR_ALL and
+ * ACTION_GATT_MONITOR_START (design.md §3 decision 36). Leaves every
+ * subscription armed; the caller decides whether to tear them down at the end
+ * of its own step (MonitorAll) or leave them live across the steps that
+ * follow (MonitorStart). */
+static struct outcome monitor_subscribe_all(int64_t deadline)
 {
 	if (active_conn == NULL) {
 		return outcome_fail("no active connection -- run a BleConnect step first");
@@ -995,7 +1408,14 @@ static struct outcome execute_gatt_monitor_all(int64_t deadline)
 			}
 			if (monitor_subscribe_count >= BLE_MAX_MONITOR_SUBSCRIPTIONS) {
 				/* BLE_MAX_MONITOR_SUBSCRIPTIONS's own doc comment:
-				 * log-and-skip further characteristics, not a failure. */
+				 * log-and-skip further characteristics, not a failure.
+				 * Recorded in the transcript so a reader can see that
+				 * a characteristic was deliberately not subscribed
+				 * rather than silently producing nothing. */
+				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
+						service->uuid,
+						service->characteristics[c].uuid, 0,
+						"subscription limit reached", 26);
 				continue;
 			}
 
@@ -1021,17 +1441,68 @@ static struct outcome execute_gatt_monitor_all(int64_t deadline)
 				/* This one characteristic's CCC write couldn't even
 				 * start -- move on to the next rather than failing
 				 * the whole step over one characteristic. */
+				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
+						service->uuid,
+						service->characteristics[c].uuid, 0,
+						"bt_gatt_subscribe failed", 24);
 				continue;
 			}
 			if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
 				abandon(sp);
+				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
+						service->uuid,
+						service->characteristics[c].uuid, 0,
+						"CCC write timed out", 19);
 				continue;
 			}
+
+			transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_SUBSCRIBED, service->uuid,
+					service->characteristics[c].uuid, 0, NULL, 0);
 
 			monitor_char_index[monitor_subscribe_count] =
 				flat_characteristic_index(s, c);
 			monitor_subscribe_count++;
 		}
+	}
+
+	return outcome_pass();
+}
+
+/* Tears down every subscription monitor_subscribe_all armed. Fire-and-forget:
+ * by the time this runs the owning step's deadline has usually passed, so
+ * there is no budget left to wait out each CCC-clear write's response. */
+static void monitor_unsubscribe_all(void)
+{
+	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+		const uint8_t *service_uuid = NULL;
+		const uint8_t *char_uuid = NULL;
+
+		(void)uuids_for_flat_index(monitor_char_index[i], &service_uuid, &char_uuid);
+		(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
+		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED, service_uuid,
+				char_uuid, 0, NULL, 0);
+	}
+	monitor_subscribe_count = 0;
+}
+
+/* Fills in the two discovery/activity fields every monitor action reports. */
+static struct outcome monitor_result(void)
+{
+	struct outcome result = outcome_pass();
+
+	result.gatt_services = discovered;
+	result.gatt_service_count = discovered_len;
+	result.gatt_activity = activity;
+	result.gatt_activity_count = activity_len;
+	return result;
+}
+
+static struct outcome execute_gatt_monitor_all(int64_t deadline)
+{
+	struct outcome subscribed_result = monitor_subscribe_all(deadline);
+
+	if (subscribed_result.kind != OUTCOME_PASS) {
+		return subscribed_result;
 	}
 
 	/* Capture window: whatever's left of the step's own timeout_ms after
@@ -1045,24 +1516,61 @@ static struct outcome execute_gatt_monitor_all(int64_t deadline)
 
 	/* Unsubscribe everything this step subscribed, regardless of outcome --
 	 * a later step shouldn't keep receiving this step's notifications.
-	 * Fire-and-forget: by now the step's own deadline has passed, so there
-	 * is no remaining budget to wait out each CCC-clear write's response. */
-	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
-		(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
-	}
-	monitor_subscribe_count = 0;
+	 * This is exactly the behaviour ACTION_GATT_MONITOR_START exists to
+	 * opt out of (design.md §3 decision 36). */
+	monitor_unsubscribe_all();
 
 	if (dropped) {
 		return outcome_fail("disconnected during GATT monitor-all capture");
 	}
 
+	return monitor_result();
+}
+
+/* design.md §3 decision 36. Subscribes to everything and returns immediately,
+ * leaving the window open: the step costs only discovery+subscribe time, not
+ * its whole timeout_ms, because the capture happens during the steps that
+ * follow rather than during this one. */
+static struct outcome execute_gatt_monitor_start(int64_t deadline)
+{
+	if (monitor_window_open) {
+		/* Re-arming over a live window would silently orphan the first
+		 * set of subscriptions in Zephyr's host. Close it first. */
+		monitor_unsubscribe_all();
+	}
+
+	struct outcome subscribed_result = monitor_subscribe_all(deadline);
+
+	if (subscribed_result.kind != OUTCOME_PASS) {
+		monitor_window_open = false;
+		return subscribed_result;
+	}
+
+	monitor_window_open = true;
+
+	/* Reports what it subscribed to, so the step's own result is useful on
+	 * its own; `gatt_activity` is necessarily empty this early, and the
+	 * matching GattMonitorStop is what carries the window's summary. */
 	struct outcome result = outcome_pass();
 
 	result.gatt_services = discovered;
 	result.gatt_service_count = discovered_len;
-	result.gatt_activity = activity;
-	result.gatt_activity_count = activity_len;
 	return result;
+}
+
+/* design.md §3 decision 36. A Stop with no open window is a no-op Pass, not a
+ * Fail: a study that ends without one still has its window closed for it
+ * (main.c), so an explicit-but-redundant Stop is a harmless authoring
+ * pattern, not an error worth aborting a study over. */
+static struct outcome execute_gatt_monitor_stop(void)
+{
+	if (!monitor_window_open) {
+		return outcome_pass();
+	}
+
+	monitor_unsubscribe_all();
+	monitor_window_open = false;
+	return monitor_result();
 }
 
 /* ---- GATT operations --------------------------------------------------- */
@@ -1127,8 +1635,16 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		if (stream_handler != NULL) {
 			stream_handler(data, length, stream_user_data);
 		}
+		/* Recorded even though the bytes also go to the stream handler:
+		 * "exhaustive" means the transcript accounts for every
+		 * notification, including the ones another channel consumes. */
+		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, data, length);
 		return BT_GATT_ITER_CONTINUE;
 	}
+
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
+			cached_characteristic_uuid(), 0, data, length);
 
 	capture_reset();
 	capture_append(data, length);
@@ -1148,21 +1664,34 @@ static struct outcome execute_read(uint16_t value_handle, int64_t deadline)
 	capture_reset();
 	k_sem_reset(&gatt_sem);
 
+	transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_READ_REQUEST, cached_service_uuid(),
+			cached_characteristic_uuid(), 0, NULL, 0);
+
 	int err = bt_gatt_read(active_conn, &read_params);
 
 	if (err != 0) {
+		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, "bt_gatt_read failed", 19);
 		return outcome_fail("bt_gatt_read failed (%d)", err);
 	}
 	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
 		abandon(&read_params);
+		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, "read timed out", 14);
 		return outcome_timed_out();
 	}
 	if (link_lost) {
 		return outcome_fail("disconnected during read");
 	}
 	if (att_err != 0) {
+		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), att_err, NULL, 0);
 		return outcome_fail("read rejected (ATT 0x%02x)", att_err);
 	}
+	/* The value itself, not just "a read happened" -- `captured` holds
+	 * whatever read_cb appended. */
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_READ_RESPONSE, cached_service_uuid(),
+			cached_characteristic_uuid(), 0, captured, captured_len);
 	return outcome_pass();
 }
 
@@ -1180,21 +1709,36 @@ static struct outcome execute_write(uint16_t value_handle, const uint8_t *payloa
 	capture_reset();
 	k_sem_reset(&gatt_sem);
 
+	/* The stimulus itself, recorded before it goes out -- design.md §3
+	 * decision 36's "record what dev-bench sent, not only what it
+	 * received". Without this a transcript shows a DUT's response with
+	 * nothing explaining what provoked it. */
+	transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_WRITE_REQUEST, cached_service_uuid(),
+			cached_characteristic_uuid(), 0, payload, payload_len);
+
 	int err = bt_gatt_write(active_conn, &write_params);
 
 	if (err != 0) {
+		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, "bt_gatt_write failed", 20);
 		return outcome_fail("bt_gatt_write failed (%d)", err);
 	}
 	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
 		abandon(&write_params);
+		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, "write timed out", 15);
 		return outcome_timed_out();
 	}
 	if (link_lost) {
 		return outcome_fail("disconnected during write");
 	}
 	if (att_err != 0) {
+		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_ERROR, cached_service_uuid(),
+				cached_characteristic_uuid(), att_err, NULL, 0);
 		return outcome_fail("write rejected (ATT 0x%02x)", att_err);
 	}
+	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_WRITE_RESPONSE, cached_service_uuid(),
+			cached_characteristic_uuid(), 0, NULL, 0);
 	return outcome_pass();
 }
 
@@ -1394,7 +1938,11 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	const int64_t deadline = deadline_from(timeout_ms);
 
 	/* Each action reports only what it observed itself: no captured bytes and
-	 * no already-pending notification carry over from a previous step. */
+	 * no already-pending notification carry over from a previous step.
+	 * Note what is deliberately *not* reset here: `activity`/`activity_len`
+	 * and the monitor subscriptions, which by design span steps once a
+	 * window is open (design.md §3 decision 36) -- monitor_subscribe_all
+	 * clears them when a new window opens instead. */
 	capture_reset();
 	link_lost = false;
 	k_sem_reset(&notify_sem);
@@ -1410,6 +1958,10 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 		return execute_gatt_discover(deadline);
 	case ACTION_GATT_MONITOR_ALL:
 		return execute_gatt_monitor_all(deadline);
+	case ACTION_GATT_MONITOR_START:
+		return execute_gatt_monitor_start(deadline);
+	case ACTION_GATT_MONITOR_STOP:
+		return execute_gatt_monitor_stop();
 	default:
 		return outcome_fail("unknown action kind");
 	}
@@ -1419,6 +1971,17 @@ void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user
 {
 	stream_handler = handler;
 	stream_user_data = user_data;
+}
+
+void ble_bridge_set_transcript_sink(ble_transcript_sink sink, void *user_data)
+{
+	transcript_sink = sink;
+	transcript_user_data = user_data;
+}
+
+bool ble_bridge_monitor_window_open(void)
+{
+	return monitor_window_open;
 }
 
 void ble_bridge_reset(void)
@@ -1444,13 +2007,37 @@ void ble_bridge_reset(void)
 		}
 	}
 	monitor_subscribe_count = 0;
+	/* A Hello is a hard reset (design.md §3 decision 12/16) -- any window
+	 * left open by a previous study dies with it. */
+	monitor_window_open = false;
 	discovered_len = 0;
 	activity_len = 0;
 
 	if (active_conn != NULL) {
 		/* disconnected_cb drops the reference and clears active_conn; don't
-		 * unref here as well. */
-		(void)bt_conn_disconnect(active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+		 * unref here as well.
+		 *
+		 * And *wait* for it. bt_conn_disconnect only requests the
+		 * disconnect -- active_conn stays set until disconnected_cb runs
+		 * on the BT RX thread. Returning before that made a `Hello`'s
+		 * "hard reset" contract a lie: the very next study's BleConnect
+		 * would find active_conn still populated and fail with "already
+		 * connected to a different peer", which is exactly what happened
+		 * running two back-to-back studies against different addresses in
+		 * Milestone 6 -- the first attempt failed, the identical retry
+		 * passed, which is the signature of a race rather than a
+		 * configuration problem.
+		 *
+		 * A fixed bound rather than a caller-supplied deadline: this
+		 * function is `void` and is a reset, not a step, so it has no
+		 * budget to draw from. Two seconds is far longer than a local
+		 * disconnect needs; timing out anyway leaves the stale conn and
+		 * the next connect fails as before, which is no worse than the
+		 * unconditional behavior this replaces. */
+		k_sem_reset(&disconn_sem);
+		if (bt_conn_disconnect(active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN) == 0) {
+			(void)k_sem_take(&disconn_sem, K_MSEC(2000));
+		}
 	}
 
 	handle_cache.valid = false;

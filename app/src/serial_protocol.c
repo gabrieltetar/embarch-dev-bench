@@ -84,31 +84,12 @@ static int pc_read_str(const uint8_t *in, size_t in_len, size_t *pos, char *out,
 	return 0;
 }
 
-static size_t pc_write_f32(float value, uint8_t *out)
-{
-	uint8_t bytes[4];
-
-	memcpy(bytes, &value, 4);
-	memcpy(out, bytes, 4);
-	return 4;
-}
-
-static int pc_read_f32(const uint8_t *in, size_t in_len, size_t *pos, float *out)
-{
-	if (*pos + 4 > in_len) {
-		return -1;
-	}
-	memcpy(out, in + *pos, 4);
-	*pos += 4;
-	return 0;
-}
-
-/* Reads (and discards) a length-prefixed sequence of `elem_size`-byte fixed
- * elements -- postcard's `Vec<T,N>`/`&str`/`String` encoding for any `T`
- * with a compile-time-known size (`elem_size = 1` covers a `String`'s raw
- * UTF-8 bytes, `elem_size = 16` covers `Vec<Uuid,4>`'s fixed 16-byte
- * elements). Used where this firmware doesn't need the field's contents but
- * must still walk past it correctly to decode whatever comes next. */
+/* `pc_write_f32`/`pc_read_f32` were here, for the retired `Sample`-carrying
+ * stream messages (embarch-study-designer schema v8, that doc's §3 decision
+ * 39). Removed with them: the wire now carries arrival-stamped bytes, and
+ * this firmware assigns no meaning -- and no numeric type -- to a stream
+ * payload at all.
+ */
 static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, size_t elem_size)
 {
 	uint64_t len;
@@ -214,6 +195,79 @@ static size_t cobs_decode(const uint8_t *input, size_t length, uint8_t *output, 
 
 /* ---- DevBenchMessage encode/decode ---------------------------------------- */
 
+/* One `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, §4.3b) as
+ * bare postcard bytes, appended at `*pos`. Mirrors that type's field order
+ * exactly: the two Option<Uuid>s are postcard's 0/1 discriminant followed,
+ * when present, by the UUID's 16 raw bytes -- the same unprefixed
+ * fixed-array encoding DataExchange's own UUIDs already use.
+ *
+ * At schema v8 these bytes are a stream record's payload rather than a
+ * message body of their own (design.md §3 decision 39), which is why this is
+ * a function instead of an inlined `encode_body` case. */
+static int encode_transcript_entry_at(const struct dbm_gatt_transcript_entry *e, uint8_t *out,
+				       size_t out_cap, size_t *pos)
+{
+	uint8_t varint_buf[10];
+
+#define WRITE_VARINT(value)                                                                       \
+	do {                                                                                       \
+		size_t n = pc_write_varint((uint64_t)(value), varint_buf);                        \
+		if (*pos + n > out_cap) {                                                         \
+			return -1;                                                                \
+		}                                                                                  \
+		memcpy(out + *pos, varint_buf, n);                                                \
+		*pos += n;                                                                        \
+	} while (0)
+
+	WRITE_VARINT(e->rx_utc_ms);
+	WRITE_VARINT(e->direction);
+	WRITE_VARINT(e->kind);
+
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = e->has_service_uuid ? 1 : 0;
+	if (e->has_service_uuid) {
+		if (*pos + 16 > out_cap) {
+			return -1;
+		}
+		memcpy(out + *pos, e->service_uuid, 16);
+		*pos += 16;
+	}
+
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = e->has_characteristic_uuid ? 1 : 0;
+	if (e->has_characteristic_uuid) {
+		if (*pos + 16 > out_cap) {
+			return -1;
+		}
+		memcpy(out + *pos, e->characteristic_uuid, 16);
+		*pos += 16;
+	}
+
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = e->att_status; /* u8: raw byte, not varint */
+
+	return pc_write_bytes(e->payload, e->payload_len, out, out_cap, pos);
+
+#undef WRITE_VARINT
+}
+
+int dbm_encode_transcript_entry(const struct dbm_gatt_transcript_entry *entry, uint8_t *out,
+				 size_t out_cap)
+{
+	size_t pos = 0;
+
+	if (encode_transcript_entry_at(entry, out, out_cap, &pos) != 0) {
+		return -1;
+	}
+	return (int)pos;
+}
+
 static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap,
 			size_t *pos)
 {
@@ -244,25 +298,46 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		out[(*pos)++] = msg->hello_ack.compatible ? 1 : 0;
 		return pc_write_bytes((const uint8_t *)msg->hello_ack.firmware_version,
 				       strlen(msg->hello_ack.firmware_version), out, out_cap, pos);
-	case DBM_TAG_STREAM_START:
-		WRITE_VARINT(msg->stream_start.step_index);
-		WRITE_VARINT(msg->stream_start.channel);
-		return 0;
-	case DBM_TAG_STREAM_CHUNK:
-		WRITE_VARINT(msg->stream_chunk.rx_utc_ms);
-		if (*pos + 4 > out_cap) {
-			return -1;
-		}
-		*pos += pc_write_f32(msg->stream_chunk.value, out + *pos);
-		WRITE_VARINT(msg->stream_chunk.unit);
+	case DBM_TAG_STREAM_OPEN:
 		if (*pos + 1 > out_cap) {
 			return -1;
 		}
-		out[(*pos)++] = msg->stream_chunk.channel_id; /* u8: raw byte, not varint */
+		out[(*pos)++] = msg->stream_open.id; /* u8: raw byte, not varint */
 		return 0;
-	case DBM_TAG_STREAM_END:
-		WRITE_VARINT(msg->stream_end.step_index);
-		WRITE_VARINT(msg->stream_end.channel);
+	case DBM_TAG_STREAM_CHUNK_BATCH: {
+		/* embarch-study-designer schema v8, that doc's §3 decision 39.
+		 * Arrival-stamped bytes, never decoded values -- this firmware
+		 * assigns no meaning to a record's payload at all; the tap's
+		 * declared `StreamEncoding` does that, host-side. */
+		const struct dbm_stream_chunk_batch *batch = &msg->stream_chunk_batch;
+
+		if (batch->records_len > DBM_MAX_STREAM_RECORDS_PER_BATCH) {
+			return -1; /* would read past records[]'s own bound */
+		}
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = batch->id; /* u8: raw byte, not varint */
+		WRITE_VARINT(batch->records_len);
+		for (uint32_t i = 0; i < batch->records_len; i++) {
+			const struct dbm_stream_record *rec = &batch->records[i];
+
+			if (rec->bytes_len > DBM_MAX_STREAM_CHUNK_BYTES) {
+				return -1;
+			}
+			WRITE_VARINT(rec->rx_utc_ms);
+			if (pc_write_bytes(rec->bytes, rec->bytes_len, out, out_cap, pos) != 0) {
+				return -1;
+			}
+		}
+		return 0;
+	}
+	case DBM_TAG_STREAM_CLOSE:
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = msg->stream_close.id; /* u8: raw byte, not varint */
+		WRITE_VARINT(msg->stream_close.dropped);
 		return 0;
 	case DBM_TAG_LOG_LINE:
 		return pc_write_bytes((const uint8_t *)msg->log_line.text,
@@ -316,6 +391,18 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 					*pos += 6;
 					WRITE_VARINT(step->action.connect.target_address_kind);
 				}
+				/* target_name: Option<String> -- schema v7's trailing
+				 * field on this variant (design.md §3 decision 43). */
+				if (*pos + 1 > out_cap) {
+					return -1;
+				}
+				out[(*pos)++] = step->action.connect.has_target_name ? 1 : 0;
+				if (step->action.connect.has_target_name &&
+				    pc_write_bytes((const uint8_t *)step->action.connect.target_name,
+						    strlen(step->action.connect.target_name), out,
+						    out_cap, pos) != 0) {
+					return -1;
+				}
 				break;
 
 			case DBM_ACTION_DATA_EXCHANGE: {
@@ -349,6 +436,8 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
+			case DBM_ACTION_GATT_MONITOR_START:
+			case DBM_ACTION_GATT_MONITOR_STOP:
 				break; /* field-less */
 
 			default:
@@ -364,6 +453,9 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 				return -1;
 			}
 			out[(*pos)++] = step->continue_on_fail ? 1 : 0;
+			/* Step::delay_before_ms -- schema v6's trailing field
+			 * (embarch-study-designer/design.md §3 decision 42). */
+			WRITE_VARINT(step->delay_before_ms);
 		}
 		WRITE_VARINT(msg->study_start.steps_crc);
 		return 0;
@@ -457,6 +549,14 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		}
 		return 0;
 	}
+	case DBM_TAG_GATT_TRANSCRIPT_RECORD: {
+		/* Retired as a message at schema v8 (see `enum dbm_tag`), still
+		 * sent by main.c until Phase B rewires it onto a stream tap. The
+		 * entry half is `encode_transcript_entry_at` above, which is the
+		 * part that carries forward. */
+		WRITE_VARINT(msg->gatt_transcript.step_index);
+		return encode_transcript_entry_at(&msg->gatt_transcript.entry, out, out_cap, pos);
+	}
 	case DBM_TAG_STUDY_DONE:
 		if (*pos + 1 > out_cap) {
 			return -1;
@@ -476,10 +576,14 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
 	 * DBM_MAX_STEPS_PER_STUDY (StudyStart's own worst case), too large for
 	 * a small embedded call stack, especially with dbm_decode_frame's own
 	 * same-size scratch buffer potentially live in a caller's frame at the
-	 * same time (e.g. main.c's send_message). Safe because this firmware's
-	 * serial link is driven from a single thread, one message at a time
-	 * (main.c's own RX loop) -- same posture as receive_message's static
-	 * rx_buf in main.c. */
+	 * same time (e.g. main.c's send_message_locked). Safe because every
+	 * caller holds main.c's link_tx_mutex -- which, as of design.md §3
+	 * decision 36, is what serializes this static, not the old
+	 * single-threaded-link assumption: the transcript TX thread is a
+	 * second sender, and it has to keep draining while the dispatch loop
+	 * is blocked inside a long ble_bridge_execute(). Same posture as
+	 * receive_message's static rx_buf in main.c, which stays
+	 * single-reader. */
 	static uint8_t raw[DBM_MAX_RAW_LEN];
 	size_t raw_len = 0;
 
@@ -533,43 +637,14 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		msg->hello_ack.compatible = raw[pos++] != 0;
 		return pc_read_str(raw, raw_len, &pos, msg->hello_ack.firmware_version,
 				    sizeof(msg->hello_ack.firmware_version));
-	case DBM_TAG_STREAM_START:
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_start.step_index = (uint32_t)tmp;
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_start.channel = (enum dbm_stream_channel)tmp;
-		return 0;
-	case DBM_TAG_STREAM_CHUNK:
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_chunk.rx_utc_ms = tmp;
-		if (pc_read_f32(raw, raw_len, &pos, &msg->stream_chunk.value) != 0) {
-			return -1;
-		}
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_chunk.unit = (enum dbm_unit)tmp;
-		if (pos >= raw_len) {
-			return -1;
-		}
-		msg->stream_chunk.channel_id = raw[pos++]; /* u8: raw byte, not varint */
-		return 0;
-	case DBM_TAG_STREAM_END:
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_end.step_index = (uint32_t)tmp;
-		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0) {
-			return -1;
-		}
-		msg->stream_end.channel = (enum dbm_stream_channel)tmp;
-		return 0;
+	/* No decode arm for DBM_TAG_STREAM_OPEN/STREAM_CHUNK_BATCH/
+	 * STREAM_CLOSE: dev-bench only ever *sends* those three, and Core is
+	 * the only reader. A C-side round trip would prove this encoder
+	 * self-consistent while saying nothing about whether Rust agrees --
+	 * which is the only thing that matters, and is what the literal-frame
+	 * pinning in app/tests/serial_protocol covers instead. Their frames
+	 * therefore decode here as an unknown tag, deliberately, exactly as
+	 * DBM_TAG_GATT_TRANSCRIPT_RECORD's always has. */
 	case DBM_TAG_LOG_LINE:
 		return pc_read_str(raw, raw_len, &pos, msg->log_line.text,
 				    sizeof(msg->log_line.text));
@@ -671,6 +746,27 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 					memset(step->action.connect.target_address, 0, 6);
 					step->action.connect.target_address_kind = 0;
 				}
+
+				/* target_name: Option<String> -- schema v7 (design.md §3
+				 * decision 43). Read unconditionally: the Hello/HelloAck
+				 * schema-version handshake has already refused any peer
+				 * that wouldn't have sent it. */
+				if (pos >= raw_len) {
+					return -1;
+				}
+				bool has_target_name = raw[pos++] != 0;
+
+				if (has_target_name) {
+					if (pc_read_str(raw, raw_len, &pos,
+							 step->action.connect.target_name,
+							 sizeof(step->action.connect.target_name)) !=
+					    0) {
+						return -1;
+					}
+				} else {
+					step->action.connect.target_name[0] = '\0';
+				}
+				step->action.connect.has_target_name = has_target_name;
 				break;
 			}
 
@@ -742,6 +838,8 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
+			case DBM_ACTION_GATT_MONITOR_START:
+			case DBM_ACTION_GATT_MONITOR_STOP:
 				break; /* field-less */
 
 			default:
@@ -783,6 +881,19 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				return -1;
 			}
 			step->continue_on_fail = raw[pos++] != 0;
+
+			/* Step::delay_before_ms -- schema v6's trailing field
+			 * (embarch-study-designer/design.md §3 decision 42). Reading it
+			 * is unconditional: the Hello/HelloAck schema-version handshake
+			 * has already refused any peer that wouldn't have sent it, so a
+			 * missing varint here is a genuine truncated frame, not an old
+			 * sender to be tolerated. */
+			uint64_t delay_before_ms;
+
+			if (pc_read_varint(raw, raw_len, &pos, &delay_before_ms) != 0) {
+				return -1;
+			}
+			step->delay_before_ms = (uint32_t)delay_before_ms;
 
 			decoded++;
 		}

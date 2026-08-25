@@ -66,6 +66,22 @@
  * acquisition window, nothing dropped" validation isn't manufactured into
  * an overflow case by an artificially small dev-bench-side cap. */
 #define DBM_MAX_GATT_ACTIVITY_RECORDS 32
+/* Largest transcript-entry payload this firmware ever *produces* (design.md
+ * §3 decision 36) -- one ATT MTU's worth of notification, not the crate's
+ * full MAX_PAYLOAD_LEN. See `struct dbm_gatt_transcript_entry`'s own comment
+ * for why the two deliberately differ. Sized to hold a full 247-byte ATT_MTU
+ * notification (247 - 3 bytes of ATT header), the value app/prj.conf
+ * configures CONFIG_BT_L2CAP_TX_MTU/CONFIG_BT_BUF_ACL_RX_SIZE for. */
+#define DBM_MAX_TRANSCRIPT_PAYLOAD_LEN 244
+/* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES /
+ * MAX_STREAM_RECORDS_PER_BATCH (schema v8, that doc's §3 decision 39, §4.8).
+ * Deliberately *smaller* than the crate's own 512/4 for the same reason
+ * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is smaller than DBM_MAX_PAYLOAD_LEN: this
+ * firmware never produces a record larger than one ATT MTU's worth of
+ * notification, and sending fewer bytes than the receiving type can hold is
+ * always wire-legal -- the reverse is not. */
+#define DBM_MAX_STREAM_CHUNK_BYTES 256
+#define DBM_MAX_STREAM_RECORDS_PER_BATCH 4
 
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
  *
@@ -97,33 +113,115 @@
 #define DBM_MAX_STEP_RESULT_LEN                                                                  \
 	(24 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN +                  \
 	 DBM_MAX_GATT_SERVICES_LEN + DBM_MAX_GATT_ACTIVITY_LEN)
+/* A transcript record is tiny next to either of the two above -- a fixed
+ * header plus one bounded payload -- so it never moves DBM_MAX_RAW_LEN.
+ * Stated as its own constant anyway so the encoder has something real to
+ * bounds-check against rather than borrowing an unrelated message's bound. */
+#define DBM_MAX_TRANSCRIPT_RECORD_LEN (64 + DBM_MAX_TRANSCRIPT_PAYLOAD_LEN)
 #define DBM_MAX_RAW_LEN (DBM_MAX_STUDY_START_LEN > DBM_MAX_STEP_RESULT_LEN ? DBM_MAX_STUDY_START_LEN \
 										  : DBM_MAX_STEP_RESULT_LEN)
 /* COBS worst case adds one overhead byte per 254 payload bytes, plus a leading code byte
  * and a trailing 0x00 delimiter. */
 #define DBM_MAX_FRAME_LEN (DBM_MAX_RAW_LEN + (DBM_MAX_RAW_LEN / 254) + 2)
 
-/* Append-only (embarch-study-designer/design.md §3 decision 10) — matches
- * `DevBenchMessage`'s variant order exactly; postcard encodes this as the
- * enum's varint discriminant, so the order here must never change.
- * DBM_TAG_STREAM_CHUNK_BATCH = 9 (`StreamChunkBatch`) is deliberately not
- * implemented yet — not needed until real power/waveform sampling exists. */
+/* Matches `DevBenchMessage`'s variant order exactly; postcard encodes this
+ * as the enum's varint discriminant, so the order here must never drift from
+ * the crate's.
+ *
+ * **Tags 2/3/4 changed meaning at schema v8** (embarch-study-designer/
+ * design.md §3 decision 39): the old StreamStart/StreamChunk/StreamEnd trio
+ * was retired outright and the generic StreamOpen/StreamChunkBatch/
+ * StreamClose trio took their slots. Decision 10's append-only rule is about
+ * additions to a shipped protocol; the `Hello`/`HelloAck` version handshake
+ * refusing a v7 peer is what makes reusing the slots safe, and no firmware
+ * carrying the old shapes was ever flashed. Nothing else moved: Hello,
+ * HelloAck, LogLine, StudyStart, StepResult and StudyDone all keep the
+ * discriminants they have always had. */
 enum dbm_tag {
 	DBM_TAG_HELLO = 0,
 	DBM_TAG_HELLO_ACK = 1,
-	DBM_TAG_STREAM_START = 2,
-	DBM_TAG_STREAM_CHUNK = 3,
-	DBM_TAG_STREAM_END = 4,
+	DBM_TAG_STREAM_OPEN = 2,
+	DBM_TAG_STREAM_CHUNK_BATCH = 3,
+	DBM_TAG_STREAM_CLOSE = 4,
 	DBM_TAG_LOG_LINE = 5,
 	DBM_TAG_STUDY_START = 6,
 	DBM_TAG_STEP_RESULT = 7,
 	DBM_TAG_STUDY_DONE = 8,
-	/* DBM_TAG_STREAM_CHUNK_BATCH = 9, -- not implemented, see above */
+	/* `GattTranscriptRecord`, tag 10 -- **retired by schema v8**
+	 * (embarch-study-designer/design.md §3 decision 39). The transcript
+	 * itself survives untouched: its entry type, its both-directions
+	 * coverage, its uncapped streaming and its `gatt.csv` columns are all
+	 * unchanged, and an entry now rides as the byte payload of a
+	 * DBM_TAG_STREAM_CHUNK_BATCH record on a tap declared
+	 * `StreamEncoding::GattTranscript`.
+	 *
+	 * The tag and its encoder are still here, and main.c still sends it,
+	 * because rewiring that send needs the tap `id` from
+	 * `StudyStart.streams` -- which this firmware does not decode yet.
+	 * That is Milestone 7 Phase B's work (embarch-doc's
+	 * embarch-outpost/milestone-1.md §3), deliberately not started here.
+	 * Until it lands, this firmware emits a message the v8 Rust decoder
+	 * has no variant for. It has never been flashed, which is what makes
+	 * that survivable rather than an outage.
+	 *
+	 * `dbm_encode_transcript_entry` below is the piece that carries
+	 * forward: it emits exactly the entry bytes a stream record's payload
+	 * holds, and is what the cross-language pinning now covers. */
+	DBM_TAG_GATT_TRANSCRIPT_RECORD = 10,
 };
 
-enum dbm_stream_channel {
-	DBM_CHANNEL_POWER = 0,
-	DBM_CHANNEL_SENSOR_WAVEFORM = 1,
+/* Mirrors `GattDirection` (embarch-study-designer src/gatt.rs). Append-only,
+ * same wire-compatibility rule as `dbm_tag`. */
+enum dbm_gatt_direction {
+	DBM_GATT_DIR_OUT = 0,
+	DBM_GATT_DIR_IN = 1,
+	DBM_GATT_DIR_LOCAL = 2,
+};
+
+/* Mirrors `GattEventKind` (embarch-study-designer src/gatt.rs). Append-only. */
+enum dbm_gatt_event_kind {
+	DBM_GATT_EVT_CONNECTED = 0,
+	DBM_GATT_EVT_DISCONNECTED = 1,
+	DBM_GATT_EVT_DISCOVERY_STARTED = 2,
+	DBM_GATT_EVT_SERVICE_DISCOVERED = 3,
+	DBM_GATT_EVT_CHARACTERISTIC_DISCOVERED = 4,
+	DBM_GATT_EVT_SUBSCRIBED = 5,
+	DBM_GATT_EVT_UNSUBSCRIBED = 6,
+	DBM_GATT_EVT_WRITE_REQUEST = 7,
+	DBM_GATT_EVT_WRITE_RESPONSE = 8,
+	DBM_GATT_EVT_READ_REQUEST = 9,
+	DBM_GATT_EVT_READ_RESPONSE = 10,
+	DBM_GATT_EVT_NOTIFICATION = 11,
+	DBM_GATT_EVT_INDICATION = 12,
+	DBM_GATT_EVT_ERROR = 13,
+};
+
+/* Mirrors `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, §4.3b).
+ *
+ * `payload` is sized by DBM_MAX_TRANSCRIPT_PAYLOAD_LEN rather than
+ * DBM_MAX_PAYLOAD_LEN: the Rust type accepts up to MAX_PAYLOAD_LEN, but this
+ * firmware never *produces* an entry larger than one ATT MTU's worth of
+ * notification, and a transcript entry lives in a queue with several slots
+ * (main.c), where DBM_MAX_PAYLOAD_LEN per slot would cost real RAM this
+ * board has already overflowed once (design.md §3 decision 27's own SRAM
+ * finding). Sending fewer bytes than the receiving type can hold is always
+ * wire-legal; the reverse is not. */
+struct dbm_gatt_transcript_entry {
+	uint64_t rx_utc_ms;
+	uint8_t direction; /* enum dbm_gatt_direction */
+	uint8_t kind;      /* enum dbm_gatt_event_kind */
+	bool has_service_uuid;
+	uint8_t service_uuid[16];
+	bool has_characteristic_uuid;
+	uint8_t characteristic_uuid[16];
+	uint8_t att_status;
+	uint16_t payload_len;
+	uint8_t payload[DBM_MAX_TRANSCRIPT_PAYLOAD_LEN];
+};
+
+struct dbm_gatt_transcript_record {
+	uint32_t step_index;
+	struct dbm_gatt_transcript_entry entry;
 };
 
 /* Mirrors embarch-study-designer's `Unit` (src/sample.rs). Append-only, same
@@ -149,18 +247,38 @@ struct dbm_hello_ack {
 	char firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN + 1];
 };
 
-struct dbm_stream_start_end {
-	uint32_t step_index;
-	enum dbm_stream_channel channel;
+/* Mirrors `DevBenchMessage::StreamOpen`/`StreamClose` (embarch-study-designer
+ * src/protocol.rs, schema v8). `id` is the tap's own index in
+ * `Study.streams` -- the wire handle that replaced the old
+ * `step_index` + `channel` pair. When a tap opens is a property of its
+ * declared `StreamScope`, not of the wire, which is why neither carries a
+ * step index any more. */
+struct dbm_stream_open {
+	uint8_t id;
 };
 
-/* Mirrors embarch-study-designer's `Sample` (src/sample.rs); gained `unit`/`channel_id`
- * in schema v3 (design.md §3 decision 27). */
-struct dbm_sample {
+struct dbm_stream_close {
+	uint8_t id;
+	/* How many records the producer lost. Carried on close so a stream
+	 * that dropped data says so, rather than presenting a shorter,
+	 * plausible capture as complete. */
+	uint32_t dropped;
+};
+
+/* Mirrors `StreamRecord` (embarch-study-designer src/streams.rs, §4.8): one
+ * arrival-stamped run of bytes, **never a decoded value**. What the bytes
+ * mean is declared once by the tap's `StreamEncoding` and resolved
+ * host-side; nothing in this firmware interprets them. */
+struct dbm_stream_record {
 	uint64_t rx_utc_ms;
-	float value;
-	enum dbm_unit unit;
-	uint8_t channel_id;
+	uint8_t bytes[DBM_MAX_STREAM_CHUNK_BYTES];
+	uint32_t bytes_len;
+};
+
+struct dbm_stream_chunk_batch {
+	uint8_t id;
+	struct dbm_stream_record records[DBM_MAX_STREAM_RECORDS_PER_BATCH];
+	uint32_t records_len;
 };
 
 struct dbm_log_line {
@@ -178,6 +296,11 @@ enum dbm_action_tag {
 	DBM_ACTION_DATA_EXCHANGE = 2,
 	DBM_ACTION_GATT_DISCOVER = 3,
 	DBM_ACTION_GATT_MONITOR_ALL = 4,
+	/* design.md §3 decision 36 -- a capture window that outlives its own
+	 * step, so a stimulus write and a capture can finally overlap. Both
+	 * field-less, same as GattDiscover/GattMonitorAll. */
+	DBM_ACTION_GATT_MONITOR_START = 5,
+	DBM_ACTION_GATT_MONITOR_STOP = 6,
 };
 
 /* Mirrors the FFI-side EssdBleAdvertiseAction shape 1:1 -- see study_ffi.h. */
@@ -196,6 +319,13 @@ struct dbm_ble_connect_action {
 	bool has_target_address;
 	uint8_t target_address_kind; /* 0 = Public, 1 = Random (mirrors BleAddressKind) */
 	uint8_t target_address[6];
+	/* Advertised local name to connect to (embarch-study-designer/design.md
+	 * §3 decision 43, schema v7). Encoded last in the BleConnect variant, so
+	 * decoded last here. `has_target_name == false` means no name filter --
+	 * connect to whichever connectable peripheral advertises first, the
+	 * pre-v7 behavior. */
+	bool has_target_name;
+	char target_name[DBM_MAX_LOCAL_NAME_LEN + 1]; /* NUL-terminated */
 };
 
 /* Mirrors `GattOperation` (src/study.rs). `payload`/`payload_len` are valid
@@ -234,6 +364,13 @@ struct dbm_step {
 	char name[DBM_MAX_NAME_LEN + 1];
 	uint32_t timeout_ms;
 	bool continue_on_fail;
+	/* How long to wait before starting this step's action
+	 * (embarch-study-designer/design.md §3 decision 42, schema v6). Encoded
+	 * last in `Step`, so it is read last here too -- see the crate's own
+	 * `Step::delay_before_ms` doc comment for why it was appended rather
+	 * than inserted. Distinct from `timeout_ms`, which still bounds only
+	 * the action itself. */
+	uint32_t delay_before_ms;
 	uint8_t action_tag; /* enum dbm_action_tag */
 	union {
 		struct dbm_ble_advertise_action advertise;
@@ -329,15 +466,30 @@ struct dev_bench_message {
 	union {
 		struct dbm_hello hello;
 		struct dbm_hello_ack hello_ack;
-		struct dbm_stream_start_end stream_start;
-		struct dbm_sample stream_chunk;
-		struct dbm_stream_start_end stream_end;
+		struct dbm_stream_open stream_open;
+		struct dbm_stream_chunk_batch stream_chunk_batch;
+		struct dbm_stream_close stream_close;
 		struct dbm_log_line log_line;
 		struct dbm_study_start study_start;
 		struct dbm_step_result step_result;
 		struct dbm_study_done study_done;
+		struct dbm_gatt_transcript_record gatt_transcript;
 	};
 };
+
+/* Encodes one `GattTranscriptEntry` (embarch-study-designer src/gatt.rs,
+ * §4.3b) as bare postcard bytes -- no message tag, no COBS framing, no
+ * step index. Writes at most `out_cap` bytes to `out` and returns the length
+ * written, or a negative value if it wouldn't fit.
+ *
+ * Split out at schema v8 (design.md §3 decision 39): these are exactly the
+ * bytes a `StreamChunkBatch` record's payload carries on a tap declared
+ * `StreamEncoding::GattTranscript`, which is what the transcript became once
+ * its own message class was retired. Exposed (rather than left static)
+ * because it is the half of the retired encoder that survives, and because
+ * the cross-language wire pinning asserts against it directly. */
+int dbm_encode_transcript_entry(const struct dbm_gatt_transcript_entry *entry, uint8_t *out,
+				 size_t out_cap);
 
 /* Encodes `msg` as postcard bytes wrapped in a COBS frame, including the
  * trailing 0x00 delimiter. Returns the frame length (> 0) on success, or a

@@ -16,6 +16,16 @@
 static ble_stream_sample_handler stream_handler;
 static void *stream_user_data;
 
+/* Same posture for the GATT transcript (design.md §3 decision 36): stored so
+ * the setter behaves identically on both sides of the decision-16 split, never
+ * invoked, because a canned Pass observed no GATT traffic to transcribe.
+ * Emitting invented entries here would let a native_sim run produce a
+ * transcript indistinguishable from a real capture -- exactly the failure this
+ * stub's "no captured_data either" rule already guards against. */
+static ble_transcript_sink transcript_sink;
+static ble_log_sink log_sink;
+static void *transcript_user_data;
+
 int ble_bridge_init(void)
 {
 	return 0;
@@ -37,8 +47,29 @@ void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user
 	stream_user_data = user_data;
 }
 
+void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data)
+{
+	log_sink = sink;
+	(void)user_data;
+	(void)log_sink;
+}
+
+void ble_bridge_set_transcript_sink(ble_transcript_sink sink, void *user_data)
+{
+	transcript_sink = sink;
+	transcript_user_data = user_data;
+}
+
+bool ble_bridge_monitor_window_open(void)
+{
+	/* No window is ever opened here, so main.c never has one to close. */
+	return false;
+}
+
 void ble_bridge_reset(void)
 {
 	(void)stream_handler;
 	(void)stream_user_data;
+	(void)transcript_sink;
+	(void)transcript_user_data;
 }
