@@ -82,6 +82,13 @@
  * always wire-legal -- the reverse is not. */
 #define DBM_MAX_STREAM_CHUNK_BYTES 256
 #define DBM_MAX_STREAM_RECORDS_PER_BATCH 4
+/* Mirrors embarch-study-designer's limits::MAX_STREAMS_PER_STUDY (schema
+ * v9). At its full value rather than shrunk, unlike DBM_MAX_STEPS_PER_STUDY:
+ * nothing is stored per tap here yet -- this bounds how many the decoder is
+ * willing to *walk* while locating the span `streams_crc` covers -- so
+ * mirroring the crate's real ceiling costs no RAM at all, and refusing a tap
+ * count Core considers legal would be this firmware inventing a limit. */
+#define DBM_MAX_STREAMS_PER_STUDY 8
 
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
  *
@@ -392,6 +399,23 @@ struct dbm_study_start {
 	 * step's action wasn't BleAdvertise -- see dbm_decode_frame's own doc
 	 * comment for why CRC can't be computed in that case. */
 	bool steps_crc_valid;
+	/* How many `StreamTap`s the decoder walked past (schema v9, design.md
+	 * §3 decision 39 and its 2026-08-25 amendment). The taps themselves are
+	 * **not stored**: this firmware doesn't open them yet, and walking them
+	 * is what locates the span `streams_crc` covers -- the same walk-and-
+	 * discard this decoder already does for `BleAdvertise::service_uuids`.
+	 * Opening taps for real is Milestone 7 Phase B item 3's, and that is
+	 * when this grows a `streams[]` array. */
+	uint32_t streams_len;
+	uint32_t streams_crc;
+	/* Not part of the wire format, same as `steps_crc_valid` above:
+	 * whether the walked `streams` span recomputes to `streams_crc`.
+	 * Checked **independently** of `steps_crc_valid`, which is why decision
+	 * 39's amendment chose a sibling seal over a widened one -- a mismatch
+	 * says which half of a `Study` is corrupt. Also `false` when decoding
+	 * stopped early on an unsupported action, for the same reason
+	 * `steps_crc_valid` is. */
+	bool streams_crc_valid;
 	/* Set when a step's Action isn't BleAdvertise (decision 21's initial
 	 * scope) -- decode still returns 0 (a well-formed StudyStart arrived),
 	 * but the caller must not dispatch it. */
@@ -434,16 +458,14 @@ struct dbm_step_result_payload {
 	bool has_captured_data;
 	uint8_t captured_data[DBM_MAX_PAYLOAD_LEN];
 	uint32_t captured_data_len;
-	/* power_samples_ref/waveform_ref: this firmware never sets these
-	 * (decision 21's scope has no power/waveform capture yet) -- always
-	 * encoded as None (0x00) on the wire; decode skips over a Some if one
-	 * were ever received (a length-prefixed string), no C-side field to
-	 * hold it. */
+	/* `power_samples_ref`/`waveform_ref` were described here as two
+	 * permanently-None wire fields. They are **retired** from `StepResult`
+	 * by design.md §3 decision 39 (schema v8) and the two bytes this file
+	 * kept writing for them are gone at v9 -- see serial_protocol.c's
+	 * StepResult encoder for how they outlived the fields. */
 	/* gatt_services/gatt_activity (design.md §3 decisions 31/32): populated
-	 * by GattDiscover (services only) and GattMonitorAll (both). Unlike
-	 * power_samples_ref/waveform_ref above, this firmware does set these --
-	 * encode_body/decode_body both handle a real Some, not just a
-	 * permanent None. */
+	 * by GattDiscover (services only) and GattMonitorAll (both);
+	 * encode_body/decode_body both handle a real Some. */
 	bool has_gatt_services;
 	struct dbm_gatt_service_info gatt_services[DBM_MAX_DISCOVERED_SERVICES];
 	uint32_t gatt_services_len;

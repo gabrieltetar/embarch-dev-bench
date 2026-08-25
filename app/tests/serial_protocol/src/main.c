@@ -238,15 +238,15 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 	/* The real steps_crc embarch-study-designer's own steps_crc() computes
 	 * for this exact single-step content (name "advertise",
 	 * BleAdvertise{local_name: Some("embarch-dev-bench"), service_uuids: [],
-	 * adv_interval_ms: 100}, timeout_ms 5000, power_sample: None,
-	 * continue_on_fail: false, delay_before_ms: 0) -- confirmed against the
-	 * real crate, not guessed, so this test actually proves this file's
-	 * CRC-32 matches that crate's, not just that this file agrees with
-	 * itself. Changed with schema v6 (Step gained delay_before_ms, which
-	 * every step's encoding now feeds into the digest); the crate-side
-	 * counterpart that keeps this honest is
+	 * adv_interval_ms: 100}, timeout_ms 5000, continue_on_fail: false,
+	 * delay_before_ms: 0) -- confirmed against the real crate, not guessed,
+	 * so this test actually proves this file's CRC-32 matches that crate's,
+	 * not just that this file agrees with itself. Changed with schema v6
+	 * (Step gained delay_before_ms) and again with v9 (Step *lost*
+	 * power_sample), since every step's encoding feeds the digest; the
+	 * crate-side counterpart that keeps this honest is
 	 * embarch-study-designer/tests/firmware_test_vectors.rs. */
-	study_start_msg.study_start.steps_crc = 0xE83F21EC;
+	study_start_msg.study_start.steps_crc = 0x889FAF61;
 
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_equal(study_start_decoded.tag, DBM_TAG_STUDY_START, "wrong tag");
@@ -263,14 +263,27 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 			   "embarch-dev-bench", "local_name mismatch");
 	zassert_equal(study_start_decoded.study_start.steps[0].action.advertise.adv_interval_ms, 100,
 		      "adv_interval_ms mismatch");
-	zassert_equal(study_start_decoded.study_start.steps_crc, 0xE83F21EC, "steps_crc mismatch");
+	zassert_equal(study_start_decoded.study_start.steps_crc, 0x889FAF61, "steps_crc mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
+	/* Schema v9's sibling seal (design.md §3 decision 39's 2026-08-25
+	 * amendment). This encoder writes no taps, so the seal here is the CRC
+	 * of nothing, which really is 0 -- see the encoder's own comment. What
+	 * this asserts is only that the two seals are *independent*: an empty
+	 * tap list validates while `steps` carries real content. The walker and
+	 * the CRC over a non-empty span are covered by
+	 * test_decodes_cores_study_start_with_real_taps below. */
+	zassert_equal(study_start_decoded.study_start.streams_len, 0, "streams_len mismatch");
+	zassert_true(study_start_decoded.study_start.streams_crc_valid,
+		     "streams_crc_valid should be true for an empty tap list");
 
-	/* Flipping a bit must be caught. */
+	/* Flipping a bit must be caught -- and must not disturb the other
+	 * seal's verdict, which is the whole reason there are two. */
 	study_start_msg.study_start.steps_crc ^= 1;
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_false(study_start_decoded.study_start.steps_crc_valid,
 		      "corrupted steps_crc should not validate");
+	zassert_true(study_start_decoded.study_start.streams_crc_valid,
+		     "a corrupted steps_crc must not implicate streams_crc");
 }
 
 ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
@@ -297,7 +310,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 	/* Real steps_crc for this exact two-step content, confirmed against
 	 * embarch-study-designer's own steps_crc() -- see the one-step test's
 	 * comment above. */
-	study_start_msg.study_start.steps_crc = 0x91923654;
+	study_start_msg.study_start.steps_crc = 0xC36612CC;
 
 	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
 	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
@@ -371,7 +384,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_delay_before_ms)
  * four-step study, produced by
  * embarch-study-designer/tests/firmware_test_vectors.rs's
  * dump_study_start_wire_bytes -- run that with --nocapture to regenerate
- * after any wire change (last regenerated for schema v8). This is the *payload*, pre-COBS, which is what
+ * after any wire change (last regenerated for schema v9). This is the *payload*, pre-COBS, which is what
  * dbm_decode_frame takes.
  */
 static const uint8_t core_study_start_frame[] = {
@@ -379,23 +392,26 @@ static const uint8_t core_study_start_frame[] = {
 	 * -- the first byte of the payload, not part of the COBS framing. */
 	0x06, 0x04, 0x07, 0x63, 0x6f, 0x6e, 0x6e, 0x65, 0x63, 0x74, 0x01, 0x00, 0x00, 0x01,
 	0x0f, 0x45, 0x69, 0x67, 0x68, 0x74, 0x20, 0x53, 0x6c, 0x65, 0x65, 0x70, 0x20, 0x53,
-	0x31, 0x31, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x6f, 0x70, 0x65, 0x6e, 0x2d,
-	0x63, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x05, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x00,
-	0x09, 0x73, 0x74, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x02, 0x6e, 0x40, 0x00,
-	0x01, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x6e,
-	0x40, 0x00, 0x02, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca,
-	0x9e, 0x01, 0x10, 0x6b, 0x65, 0x72, 0x6e, 0x65, 0x6c, 0x20, 0x76, 0x65, 0x72, 0x73,
-	0x69, 0x6f, 0x6e, 0x0d, 0x0a, 0x88, 0x27, 0x00, 0x00, 0xe8, 0x07, 0x0d, 0x63, 0x6c,
-	0x6f, 0x73, 0x65, 0x2d, 0x63, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x06, 0x88, 0x27,
-	0x00, 0x00, 0xc0, 0x3e, 0xeb, 0x8d, 0xf5, 0xe2, 0x06,
-	/* Schema v8's trailing `streams` field on StudyStart
-	 * (embarch-study-designer/design.md §3 decision 39): an empty
-	 * `Vec<StreamTap, _>`, i.e. one zero-length varint. Appended after
-	 * `steps_crc` rather than inserted, on purpose -- exactly the
-	 * append-don't-insert discipline decision 42 used -- so this decoder,
-	 * which does not read taps yet (Milestone 7 Phase B's work), sees only
-	 * one unconsumed trailing byte rather than a re-shuffled sequence. */
-	0x00,
+	0x31, 0x31, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x0c, 0x6f, 0x70, 0x65, 0x6e, 0x2d, 0x63,
+	0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x05, 0xa0, 0x9c, 0x01, 0x00, 0x00, 0x09, 0x73,
+	0x74, 0x69, 0x6d, 0x75, 0x6c, 0x61, 0x74, 0x65, 0x02, 0x6e, 0x40, 0x00, 0x01, 0xb5,
+	0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x6e, 0x40, 0x00,
+	0x02, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x01,
+	0x10, 0x6b, 0x65, 0x72, 0x6e, 0x65, 0x6c, 0x20, 0x76, 0x65, 0x72, 0x73, 0x69, 0x6f,
+	0x6e, 0x0d, 0x0a, 0x88, 0x27, 0x00, 0xe8, 0x07, 0x0d, 0x63, 0x6c, 0x6f, 0x73, 0x65,
+	0x2d, 0x63, 0x61, 0x70, 0x74, 0x75, 0x72, 0x65, 0x06, 0x88, 0x27, 0x00, 0xc0, 0x3e,
+	0xe6, 0xb6, 0xe2, 0x95, 0x05,
+	/* Schema v9's two trailing fields on StudyStart: `streams` -- an empty
+	 * `Vec<StreamTap, _>`, one zero-length varint -- followed by
+	 * `streams_crc` (design.md §3 decision 39's 2026-08-25 amendment).
+	 *
+	 * `streams_crc` is 0 here, and that is the *correct* value rather than
+	 * an unset one: CRC-32/ISO-HDLC over zero bytes is 0, because its init
+	 * and xorout are both 0xFFFFFFFF. A test whose only tap list is empty
+	 * would therefore pass against a decoder that never computed the CRC at
+	 * all -- which is why `core_study_start_with_taps_frame` below exists
+	 * and carries three real taps. */
+	0x00, 0x00,
 };
 
 /* An independent COBS encoder, deliberately not serial_protocol.c's own
@@ -484,6 +500,138 @@ ZTEST(serial_protocol, test_decodes_cores_real_study_start_bytes)
 	zassert_str_equal(ss->steps[3].name, "close-capture", "step 3 name");
 	zassert_equal(ss->steps[3].action_tag, DBM_ACTION_GATT_MONITOR_STOP, "step 3 action");
 	zassert_equal(ss->steps[3].delay_before_ms, 8000, "step 3 delay");
+}
+
+/* The same shape as core_study_start_frame above, but carrying three real
+ * stream taps -- because an empty `Vec<StreamTap>` proves nothing about
+ * either half of schema v9's `streams_crc` check. CRC-32 over zero bytes is
+ * genuinely 0, so a decoder that skipped the walk and the digest entirely
+ * would pass every empty-tap test in this file.
+ *
+ * These bytes cannot come from this file's own encoder either: dev-bench
+ * holds no taps, so `dbm_encode_frame` can only ever write an empty list.
+ * They are produced by embarch-study-designer/tests/firmware_test_vectors.rs's
+ * dump_study_start_with_taps_wire_bytes -- run that with --nocapture to
+ * regenerate after any `StreamTap` change.
+ *
+ * The three taps deliberately span the variants whose *widths* differ, so a
+ * walker that reads any one of them at the wrong size shifts where the
+ * `streams` span ends and fails the CRC rather than passing plausibly:
+ *
+ *   - "waveform": a GattNotify source (two raw 16-byte UUIDs, no length
+ *     prefix) + a Samples encoding (two enum varints and a raw u8
+ *     channel_id) + a Steps scope (two varints).
+ *   - "outpost": a Signal source (a length-prefixed name) + an OutpostTrace
+ *     encoding (a five-byte varint manifest_crc) + a WholeStudy scope (no
+ *     fields).
+ *   - "power": a PowerFrontEnd source (a varint) + a Raw encoding (no
+ *     fields) + a Steps scope.
+ */
+static const uint8_t core_study_start_with_taps_frame[] = {
+	/* tag, then one BleAdvertise step, then steps_crc = 0x889FAF61 -- the
+	 * same single step the one-step round-trip test above pins. */
+	0x06, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73, 0x65, 0x00, 0x01,
+	0x11, 0x65, 0x6d, 0x62, 0x61, 0x72, 0x63, 0x68, 0x2d, 0x64, 0x65, 0x76, 0x2d, 0x62,
+	0x65, 0x6e, 0x63, 0x68, 0x00, 0x64, 0x88, 0x27, 0x00, 0x00, 0xe1, 0xde, 0xfe, 0xc4,
+	0x08,
+	/* streams: 3 taps, then streams_crc = 0x7A66C565. */
+	0x03, 0x00, 0x08, 0x77, 0x61, 0x76, 0x65, 0x66, 0x6f, 0x72, 0x6d, 0x00, 0x6e, 0x40,
+	0x00, 0x01, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e,
+	0x6e, 0x40, 0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc,
+	0xca, 0x9e, 0x02, 0x02, 0x03, 0x07, 0x01, 0x00, 0x00, 0x01, 0x07, 0x6f, 0x75, 0x74,
+	0x70, 0x6f, 0x73, 0x74, 0x04, 0x0d, 0x6f, 0x75, 0x74, 0x70, 0x6f, 0x73, 0x74, 0x2d,
+	0x74, 0x72, 0x61, 0x63, 0x65, 0x04, 0xef, 0xfd, 0xb6, 0xf5, 0x0d, 0x00, 0x02, 0x05,
+	0x70, 0x6f, 0x77, 0x65, 0x72, 0x01, 0xe8, 0x07, 0x00, 0x01, 0x00, 0x00, 0xe5, 0x8a,
+	0x9b, 0xd3, 0x07,
+};
+
+ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+
+	size_t framed_len = test_cobs_encode(core_study_start_with_taps_frame,
+					     sizeof(core_study_start_with_taps_frame), framed);
+
+	zassert_true(framed_len > 0, "COBS encode of Core's payload failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode a StudyStart carrying real stream taps");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(ss->steps_len, 1, "steps_len mismatch");
+	zassert_true(ss->steps_crc_valid, "steps_crc should still validate");
+	zassert_equal(ss->streams_len, 3, "streams_len mismatch");
+	zassert_equal(ss->streams_crc, 0x7A66C565, "streams_crc mismatch");
+	zassert_true(ss->streams_crc_valid,
+		     "streams_crc computed over the crate's own tap bytes must validate");
+}
+
+ZTEST(serial_protocol, test_a_corrupted_streams_crc_is_caught_without_implicating_steps)
+{
+	uint8_t payload[sizeof(core_study_start_with_taps_frame)];
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+
+	memcpy(payload, core_study_start_with_taps_frame, sizeof(payload));
+	/* Flip a bit inside the first tap's *name*, which is inside the span
+	 * streams_crc covers but outside the span steps_crc does. */
+	payload[46] ^= 0x01;
+
+	size_t framed_len = test_cobs_encode(payload, sizeof(payload), framed);
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "a corrupted tap name should still decode structurally");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_false(ss->streams_crc_valid, "corrupted streams must not validate");
+	zassert_true(ss->steps_crc_valid,
+		     "a corrupted tap must not implicate steps_crc -- saying which half is "
+		     "corrupt is why there are two seals rather than one widened one");
+}
+
+/* `StepResult`'s wire bytes, pinned across both languages for the first time
+ * at schema v9. It was never covered before: decision 36's both-languages
+ * rule applied to *new* records, and this one predates it -- so when
+ * decision 39 (v8) retired `power_samples_ref`/`waveform_ref` from
+ * `StepResult`, this file's encoder kept writing two `Option` bytes for them
+ * and nothing noticed. Both suites stayed green because each agreed with
+ * itself, which is the exact blind spot the pairing exists to close.
+ *
+ * embarch-study-designer pins the identical pre-COBS body in
+ * `step_result_matches_dev_bench_firmwares_own_hand_written_encoding`.
+ */
+/* `static`, not a stack local: dev_bench_message's union embeds a full
+ * StudyStart, the same reason study_start_msg above is static. */
+static struct dev_bench_message pinned_step_result_msg;
+
+ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
+{
+	static const uint8_t expected[] = {
+		0x0d, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73,
+		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x01, 0x00,
+	};
+	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
+
+	memset(&pinned_step_result_msg, 0, sizeof(pinned_step_result_msg));
+	pinned_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	pinned_step_result_msg.step_result.step_index = 1;
+	strcpy(r->step_name, "advertise");
+	r->outcome.tag = 0; /* Pass */
+	r->has_captured_data = true;
+	r->captured_data[0] = 0xde;
+	r->captured_data[1] = 0xad;
+	r->captured_data[2] = 0xbe;
+	r->captured_data[3] = 0xef;
+	r->captured_data_len = 4;
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&pinned_step_result_msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
 /* design.md §3 decisions 31/32: every Action kind this crate defines must

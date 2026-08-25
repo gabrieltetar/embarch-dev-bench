@@ -106,6 +106,118 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 	return 0;
 }
 
+/* Walks one postcard-encoded `StreamTap` (embarch-study-designer
+ * src/streams.rs, design.md §4.8), advancing *pos past it without storing
+ * anything. Returns 0 on success, -1 on a malformed or unrecognized shape.
+ *
+ * This firmware does not consume taps yet -- Phase B item 3 is where it
+ * opens them for real -- but it has to *walk* them to know where the
+ * `streams` span ends, which is what `streams_crc` is computed over. Walking
+ * and discarding is the same thing this decoder already does for
+ * `BleAdvertise::service_uuids`.
+ *
+ * An unknown variant tag is a hard error rather than a skip: postcard
+ * carries no field names and no per-variant length, so a tag this decoder
+ * predates leaves everything after it unwalkable. The Hello/HelloAck
+ * schema-version handshake is what makes that acceptable -- a peer that
+ * would send one has already been refused.
+ */
+static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
+{
+	uint64_t tag;
+	uint64_t scratch;
+
+	/* id: u8 -- a raw byte, not a varint (same as StreamOpen's own id). */
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	(*pos)++;
+
+	/* name: heapless::String -- length-prefixed bytes. */
+	if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+		return -1;
+	}
+
+	/* source: StreamSource */
+	if (pc_read_varint(raw, raw_len, pos, &tag) != 0) {
+		return -1;
+	}
+	switch (tag) {
+	case 0: /* GattNotify { service_uuid, characteristic_uuid } */
+		if (*pos + 32 > raw_len) {
+			return -1;
+		}
+		*pos += 32;
+		break;
+	case 1: /* PowerFrontEnd { sample_hz } */
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1;
+		}
+		break;
+	case 2: /* GattTranscript */
+	case 3: /* DevBenchLog */
+		break;
+	case 4: /* Signal { name } */
+		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+			return -1;
+		}
+		break;
+	default:
+		return -1;
+	}
+
+	/* encoding: StreamEncoding */
+	if (pc_read_varint(raw, raw_len, pos, &tag) != 0) {
+		return -1;
+	}
+	switch (tag) {
+	case 0: /* Raw */
+	case 1: /* Text */
+	case 3: /* GattTranscript */
+		break;
+	case 2: /* Samples { layout, unit, channel_id } */
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1; /* layout: SampleLayout */
+		}
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1; /* unit: Unit */
+		}
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		(*pos)++; /* channel_id: u8 */
+		break;
+	case 4: /* OutpostTrace { manifest_crc } */
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1;
+		}
+		break;
+	default:
+		return -1;
+	}
+
+	/* scope: StreamScope */
+	if (pc_read_varint(raw, raw_len, pos, &tag) != 0) {
+		return -1;
+	}
+	switch (tag) {
+	case 0: /* WholeStudy */
+		break;
+	case 1: /* Steps { from, to } */
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1;
+		}
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
+			return -1;
+		}
+		break;
+	default:
+		return -1;
+	}
+
+	return 0;
+}
+
 /* CRC-32 (ISO-HDLC / the common "CRC-32" used by zip/gzip/PNG/Ethernet;
  * poly 0xEDB88320 reflected, init/xorout 0xFFFFFFFF) -- matches the `crc`
  * crate's `CRC_32_ISO_HDLC` embarch-study-designer's `steps_crc()` (src/crc.rs)
@@ -445,10 +557,15 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			}
 
 			WRITE_VARINT(step->timeout_ms);
-			if (*pos + 1 > out_cap) {
-				return -1;
-			}
-			out[(*pos)++] = 0; /* power_sample: Option<PowerSampleWindow>, always None */
+			/* `Step::power_sample` was encoded here as a permanent
+			 * `None` byte and is **retired** at schema v9
+			 * (embarch-study-designer/design.md §3 decision 39's
+			 * 2026-08-25 amendment): a `StreamSource::PowerFrontEnd`
+			 * tap is the only way to author a power capture now.
+			 * Nothing ever read the field -- this encoder wrote None
+			 * unconditionally, the decoder below read and discarded
+			 * it, and the one host-side authoring path always emitted
+			 * None. */
 			if (*pos + 1 > out_cap) {
 				return -1;
 			}
@@ -458,6 +575,20 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			WRITE_VARINT(step->delay_before_ms);
 		}
 		WRITE_VARINT(msg->study_start.steps_crc);
+		/* `streams` + `streams_crc` (schema v9, design.md §3 decision 39
+		 * and its 2026-08-25 amendment). This firmware never *sends* a
+		 * StudyStart -- Core does -- so this encoder exists only for the
+		 * round-trip tests, and it has no taps of its own to write: an
+		 * empty `Vec<StreamTap>` and, correspondingly, the CRC of nothing.
+		 *
+		 * That 0 is not a placeholder. CRC-32/ISO-HDLC over zero bytes is
+		 * genuinely 0 (init and xorout both 0xFFFFFFFF, which cancel), so
+		 * the decoder's own check below passes on these bytes for the
+		 * right reason rather than by exemption. Unlike the two
+		 * `power_samples_ref`/`waveform_ref` bytes this file used to
+		 * write, these fields really do exist on the Rust type. */
+		WRITE_VARINT(0); /* streams: Vec<StreamTap>, empty */
+		WRITE_VARINT(0); /* streams_crc: CRC-32 of nothing */
 		return 0;
 	case DBM_TAG_STEP_RESULT: {
 		const struct dbm_step_result_payload *r = &msg->step_result.result;
@@ -481,17 +612,24 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		    pc_write_bytes(r->captured_data, r->captured_data_len, out, out_cap, pos) != 0) {
 			return -1;
 		}
-		/* power_samples_ref/waveform_ref: Option<String>, always None
-		 * (this firmware has no power/waveform capture yet, decision 21). */
-		if (*pos + 2 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = 0;
-		out[(*pos)++] = 0;
-
-		/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
-		 * unlike power_samples_ref/waveform_ref above, this firmware does
-		 * populate these for real. */
+		/* `power_samples_ref`/`waveform_ref` were encoded here as two
+		 * permanent `None` bytes. They are **retired** from `StepResult`
+		 * by design.md §3 decision 39 (schema v8) -- a capture belongs to
+		 * the study's declared taps, reported once as
+		 * `StudyResult.streams`, not to one step -- and this file kept
+		 * writing them anyway. Removed at v9, alongside `power_sample`:
+		 * two bytes Rust does not expect, on the one message this
+		 * firmware sends most.
+		 *
+		 * Found by walking this encoder against the Rust type while
+		 * implementing v9, not by a test: nothing pinned `StepResult`'s
+		 * bytes across the two languages, because it was not a *new*
+		 * record when decision 36's both-languages rule came in. The v9
+		 * pass adds that pin (app/tests/serial_protocol) so the gap
+		 * cannot reopen.
+		 *
+		 * gatt_services/gatt_activity (design.md §3 decisions 31/32) --
+		 * unlike those two, this firmware populates these for real. */
 		if (*pos + 1 > out_cap) {
 			return -1;
 		}
@@ -865,18 +1003,10 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			}
 			step->timeout_ms = (uint32_t)timeout_ms;
 
-			/* power_sample: Option<PowerSampleWindow> -- not stored. */
-			if (pos >= raw_len) {
-				return -1;
-			}
-			if (raw[pos++] != 0) {
-				uint64_t sample_rate_hz;
-
-				if (pc_read_varint(raw, raw_len, &pos, &sample_rate_hz) != 0) {
-					return -1;
-				}
-			}
-
+			/* `power_sample` was read-and-discarded here and is
+			 * **retired** at schema v9 (design.md §3 decision 39's
+			 * 2026-08-25 amendment). `continue_on_fail` now follows
+			 * `timeout_ms` directly. */
 			if (pos >= raw_len) {
 				return -1;
 			}
@@ -903,6 +1033,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 
 		if (unsupported) {
 			ss->steps_crc_valid = false;
+			ss->streams_crc_valid = false;
 			return 0;
 		}
 
@@ -915,6 +1046,49 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		ss->steps_crc = (uint32_t)steps_crc;
 		ss->steps_crc_valid =
 			dbm_crc32(raw + steps_start_pos, steps_end_pos - steps_start_pos) == ss->steps_crc;
+
+		/* streams + streams_crc -- schema v9 (design.md §3 decision 39's
+		 * 2026-08-25 amendment). A **sibling** seal, checked independently
+		 * of steps_crc above, which is the whole point of there being two:
+		 * a mismatch says which half is corrupt.
+		 *
+		 * Both spans are contiguous and each CRC immediately follows the
+		 * one it covers, which is exactly why this is a second CRC rather
+		 * than a widened one -- steps_crc sits *between* steps and
+		 * streams, so one CRC over both would mean digesting two
+		 * non-contiguous spans here, or reshuffling StudyStart's fields.
+		 *
+		 * Like steps_crc, the digest covers the concatenated element
+		 * encodings and **not** the vector's own length prefix, matching
+		 * `streams_crc()`'s one-tap-at-a-time digest in src/crc.rs. */
+		uint64_t streams_len;
+
+		if (pc_read_varint(raw, raw_len, &pos, &streams_len) != 0) {
+			return -1;
+		}
+		if (streams_len > DBM_MAX_STREAMS_PER_STUDY) {
+			return -1;
+		}
+
+		size_t streams_start_pos = pos;
+
+		for (uint32_t i = 0; i < streams_len; i++) {
+			if (pc_skip_stream_tap(raw, raw_len, &pos) != 0) {
+				return -1;
+			}
+		}
+		ss->streams_len = (uint32_t)streams_len;
+
+		size_t streams_end_pos = pos;
+		uint64_t streams_crc;
+
+		if (pc_read_varint(raw, raw_len, &pos, &streams_crc) != 0) {
+			return -1;
+		}
+		ss->streams_crc = (uint32_t)streams_crc;
+		ss->streams_crc_valid =
+			dbm_crc32(raw + streams_start_pos, streams_end_pos - streams_start_pos) ==
+			ss->streams_crc;
 		return 0;
 	}
 	case DBM_TAG_STEP_RESULT: {
@@ -970,18 +1144,10 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			sr->result.captured_data_len = (uint32_t)captured_len;
 		}
 
-		/* power_samples_ref/waveform_ref: Option<String> -- this firmware
-		 * always encodes None, but decode must still be able to skip a Some
-		 * if one were ever received (see struct dbm_step_result_payload's
-		 * own doc comment). */
-		for (int i = 0; i < 2; i++) {
-			if (pos >= raw_len) {
-				return -1;
-			}
-			if (raw[pos++] != 0 && pc_skip_len_prefixed(raw, raw_len, &pos, 1) != 0) {
-				return -1;
-			}
-		}
+		/* `power_samples_ref`/`waveform_ref` were skipped here; both are
+		 * retired from `StepResult` (design.md §3 decision 39) and the
+		 * skip is removed at v9 -- see this file's encoder for the full
+		 * account of why it outlived the fields. */
 
 		/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
 		 * this firmware only ever encodes these (see encode_body), but
