@@ -13,12 +13,23 @@
 
 #include <string.h>
 
-/* Mirrors embarch-study-designer's STUDY_DESIGNER_SCHEMA_VERSION by hand, since
- * native_sim never links the real staticlib (this file's own header comment) --
- * bump alongside that crate's own constant (currently 4, src/schema_version.rs --
- * bumped 3 -> 4 for design.md §3 decisions 31/32's GattDiscover/GattMonitorAll)
- * whenever it changes. */
-#define STUDY_FFI_STUB_SCHEMA_VERSION 4
+/* Mirrors embarch-study-designer's DEV_BENCH_WIRE_SCHEMA_VERSION by hand,
+ * since native_sim never links the real staticlib (this file's own header
+ * comment) -- bump alongside that crate's own constant whenever it changes.
+ *
+ * The **wire** constant specifically, as of that crate's 2026-08-25 split of
+ * one schema version into two (design.md §3 decision 12's amendment): this
+ * number is what a `HelloAck` reports, and a host-side-only reshape must not
+ * move what firmware claims about itself. The host constant has no business
+ * being mirrored here at all -- dev-bench is not a party to that hop.
+ *
+ * Found stale at v4 while implementing v9, four bumps behind: nothing
+ * compares this stub's answer against the crate, because by construction
+ * native_sim links no crate to compare it to. That is a real gap in what the
+ * `native_sim` suite can prove and it is unchanged by fixing the number --
+ * only a build that links the real staticlib exercises `essd_schema_version`
+ * (study_ffi_real.c) for real. */
+#define STUDY_FFI_STUB_SCHEMA_VERSION 9
 
 uint32_t study_ffi_schema_version(void)
 {

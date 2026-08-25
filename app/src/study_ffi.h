@@ -16,7 +16,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* embarch-study-designer's STUDY_DESIGNER_SCHEMA_VERSION, for this firmware's
+/* embarch-study-designer's DEV_BENCH_WIRE_SCHEMA_VERSION, for this firmware's
  * HelloAck (embarch-study-designer/design.md §3 decision 12). */
 uint32_t study_ffi_schema_version(void);
 

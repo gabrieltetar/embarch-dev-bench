@@ -612,6 +612,21 @@ static void dispatch_study(const struct dbm_study_start *study)
 		send_study_done(false);
 		return;
 	}
+	/* The sibling seal over `streams` (embarch-study-designer/design.md §3
+	 * decision 39's 2026-08-25 amendment). Checked separately and reported
+	 * separately, which is the point of there being two: the log line names
+	 * which half of the Study arrived corrupt.
+	 *
+	 * Aborting on it, rather than only computing it, even though this
+	 * firmware does not open taps yet: a Study whose tap declarations are
+	 * corrupt would otherwise run to completion and produce results with
+	 * captures silently missing or wrong, which is the exact failure this
+	 * suite keeps arriving at from other directions. */
+	if (!study->streams_crc_valid) {
+		send_log_line("StudyStart streams_crc mismatch; aborting without running any step");
+		send_study_done(false);
+		return;
+	}
 
 	bool completed = true;
 
