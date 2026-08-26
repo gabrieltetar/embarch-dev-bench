@@ -46,6 +46,7 @@ ZTEST(serial_protocol, test_hello_ack_round_trip)
 	msg.hello_ack.schema_version = 2;
 	msg.hello_ack.compatible = true;
 	strcpy(msg.hello_ack.firmware_version, "nrf54l15dk-g1a2b3c");
+	strcpy(msg.hello_ack.hardware_id, "aaaaaaaabbbbbbbb");
 
 	struct dev_bench_message decoded;
 
@@ -55,6 +56,66 @@ ZTEST(serial_protocol, test_hello_ack_round_trip)
 	zassert_true(decoded.hello_ack.compatible, "compatible mismatch");
 	zassert_str_equal(decoded.hello_ack.firmware_version, "nrf54l15dk-g1a2b3c",
 			   "firmware_version mismatch");
+	zassert_str_equal(decoded.hello_ack.hardware_id, "aaaaaaaabbbbbbbb",
+			   "hardware_id mismatch");
+}
+
+/* A build with no hwinfo driver reports an empty hardware_id (main.c's
+ * read_hardware_id). That has to survive the wire as a zero-length string
+ * rather than as an absent field -- an absent field leaves nothing after it
+ * walkable, and Core's own comparison is what decides an empty ID is
+ * unusable, not the encoder dropping it. */
+ZTEST(serial_protocol, test_hello_ack_with_no_hardware_id_round_trips)
+{
+	struct dev_bench_message msg = {.tag = DBM_TAG_HELLO_ACK};
+
+	msg.hello_ack.schema_version = 10;
+	msg.hello_ack.compatible = true;
+	strcpy(msg.hello_ack.firmware_version, "native_sim-g1a2b3c");
+	msg.hello_ack.hardware_id[0] = '\0';
+
+	struct dev_bench_message decoded;
+
+	zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+	zassert_str_equal(decoded.hello_ack.firmware_version, "native_sim-g1a2b3c",
+			   "firmware_version must still decode past an empty hardware_id");
+	zassert_equal(decoded.hello_ack.hardware_id[0], '\0', "hardware_id should be empty");
+}
+
+/* `HelloAck`'s wire bytes, pinned across both languages for the first time at
+ * schema v10 (embarch-study-designer/design.md §3 decision 47). Like
+ * `StepResult` below, this frame predates decision 36's both-languages rule
+ * and so was never covered -- and `StepResult`'s own history is the argument
+ * for pinning it now: this file's encoder wrote two stale `Option` bytes for
+ * a whole schema version while both suites stayed green, because each agreed
+ * with itself.
+ *
+ * embarch-study-designer pins the identical pre-COBS body in
+ * `hello_ack_matches_dev_bench_firmwares_own_hand_written_encoding`.
+ */
+ZTEST(serial_protocol, test_hello_ack_encodes_to_the_pinned_wire_bytes)
+{
+	/* body: 0x01 tag, 0x0a schema_version (varint), 0x01 compatible,
+	 * 0x07 + "g1a2b3c", 0x10 + "aaaaaaaabbbbbbbb". No zero bytes, so COBS
+	 * is one leading code byte (len + 1) plus the data plus the
+	 * delimiter. */
+	static const uint8_t expected[] = {
+		0x1d, 0x01, 0x0a, 0x01, 0x07, 0x67, 0x31, 0x61, 0x32, 0x62, 0x33, 0x63,
+		0x10, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x61, 0x62, 0x62, 0x62,
+		0x62, 0x62, 0x62, 0x62, 0x62, 0x00,
+	};
+	struct dev_bench_message msg = {.tag = DBM_TAG_HELLO_ACK};
+
+	msg.hello_ack.schema_version = 10;
+	msg.hello_ack.compatible = true;
+	strcpy(msg.hello_ack.firmware_version, "g1a2b3c");
+	strcpy(msg.hello_ack.hardware_id, "aaaaaaaabbbbbbbb");
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
 /* ---- Stream taps (embarch-study-designer schema v8, that doc's §3

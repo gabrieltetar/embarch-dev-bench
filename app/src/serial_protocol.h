@@ -24,6 +24,10 @@
  * decision 8's west-module wiring lets this firmware pull the constants directly from
  * that crate. */
 #define DBM_MAX_FIRMWARE_VERSION_LEN 32
+/* limits::MAX_HARDWARE_ID_LEN — this board's own factory-unique chip ID,
+ * hex-encoded (embarch-study-designer/design.md §3 decision 47,
+ * embarch-core/design.md §3 decision 35). */
+#define DBM_MAX_HARDWARE_ID_LEN 32
 #define DBM_MAX_LOG_LINE_LEN 128
 #define DBM_MAX_LOCAL_NAME_LEN 26
 #define DBM_MAX_NAME_LEN 32
@@ -252,6 +256,16 @@ struct dbm_hello_ack {
 	bool compatible;
 	/* NUL-terminated; wire form has no NUL, `+1` is this struct's own headroom. */
 	char firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN + 1];
+	/* This board's own chip ID, hex-encoded lowercase (schema v10,
+	 * embarch-study-designer/design.md §3 decision 47). Core compares it
+	 * against the identity its JTAG probe just read, which is the only
+	 * thing that ties the runtime serial link and the JTAG connection to
+	 * the same silicon -- since the port migration they are physically
+	 * separate USB devices.
+	 *
+	 * Empty string when this build has no `hwinfo` driver: a bench that
+	 * cannot answer says nothing rather than sending something. */
+	char hardware_id[DBM_MAX_HARDWARE_ID_LEN + 1];
 };
 
 /* Mirrors `DevBenchMessage::StreamOpen`/`StreamClose` (embarch-study-designer

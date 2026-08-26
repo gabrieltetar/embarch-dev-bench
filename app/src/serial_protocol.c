@@ -408,8 +408,17 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			return -1;
 		}
 		out[(*pos)++] = msg->hello_ack.compatible ? 1 : 0;
-		return pc_write_bytes((const uint8_t *)msg->hello_ack.firmware_version,
-				       strlen(msg->hello_ack.firmware_version), out, out_cap, pos);
+		if (pc_write_bytes((const uint8_t *)msg->hello_ack.firmware_version,
+				   strlen(msg->hello_ack.firmware_version), out, out_cap,
+				   pos) != 0) {
+			return -1;
+		}
+		/* schema v10 (embarch-study-designer/design.md §3 decision 47).
+		 * An empty hardware_id still writes its length prefix -- an
+		 * absent field and a zero-length one are different bytes, and
+		 * only the latter leaves the frame walkable. */
+		return pc_write_bytes((const uint8_t *)msg->hello_ack.hardware_id,
+				       strlen(msg->hello_ack.hardware_id), out, out_cap, pos);
 	case DBM_TAG_STREAM_OPEN:
 		if (*pos + 1 > out_cap) {
 			return -1;
@@ -773,8 +782,17 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		msg->hello_ack.compatible = raw[pos++] != 0;
-		return pc_read_str(raw, raw_len, &pos, msg->hello_ack.firmware_version,
-				    sizeof(msg->hello_ack.firmware_version));
+		if (pc_read_str(raw, raw_len, &pos, msg->hello_ack.firmware_version,
+				 sizeof(msg->hello_ack.firmware_version)) != 0) {
+			return -1;
+		}
+		/* schema v10 (embarch-study-designer/design.md §3 decision 47).
+		 * dev-bench never receives a HelloAck in service -- this arm
+		 * exists so the round-trip tests can walk what the encoder above
+		 * wrote, which is precisely what caught the stale-Option drift
+		 * in StepResult. */
+		return pc_read_str(raw, raw_len, &pos, msg->hello_ack.hardware_id,
+				    sizeof(msg->hello_ack.hardware_id));
 	/* No decode arm for DBM_TAG_STREAM_OPEN/STREAM_CHUNK_BATCH/
 	 * STREAM_CLOSE: dev-bench only ever *sends* those three, and Core is
 	 * the only reader. A C-side round trip would prove this encoder
