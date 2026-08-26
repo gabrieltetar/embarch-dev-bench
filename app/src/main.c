@@ -9,10 +9,12 @@
  * for workspaces/nordic, native_sim's host-stdio-backed UART for
  * workspaces/native_sim. Using the same chosen node on both boards means this
  * file needs no per-workspace UART wiring. Zephyr's own console/log/shell
- * output must NOT also be routed to this device (each workspace's prj.conf
- * disables that) — sharing the wire with raw log text would corrupt COBS
+ * output must NOT also be routed to this device (prj.conf disables every
+ * backend that would) — sharing the wire with raw log text would corrupt COBS
  * framing (decision 7); dev-bench's own log output travels as a `LogLine`
- * DevBenchMessage instead.
+ * DevBenchMessage instead, and since decision 38 that includes the whole
+ * `CONFIG_LOG` subsystem's output, forwarded by dev_bench_log.c through the
+ * sink this file installs at handshake.
  */
 #include <string.h>
 
@@ -26,9 +28,19 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/ring_buffer.h>
 
+#include <zephyr/logging/log.h>
+
 #include "ble_bridge.h"
+#include "dev_bench_log.h"
 #include "serial_protocol.h"
 #include "study_ffi.h"
+
+/* This application's own log module (decision 38). Pinned at INF rather than
+ * inheriting CONFIG_LOG_DEFAULT_LEVEL, which prj.conf holds at WRN so that
+ * Zephyr's own subsystems stay quiet on a link they share with the protocol
+ * -- this firmware's own statements about what it is doing are the ones worth
+ * having on by default. */
+LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_INF);
 
 #ifndef APP_FIRMWARE_VERSION
 #define APP_FIRMWARE_VERSION "dev-bench-unknown"
@@ -287,17 +299,43 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 K_THREAD_DEFINE(transcript_tx_tid, 2048, transcript_tx_thread, NULL, NULL, NULL,
 		K_PRIO_PREEMPT(7), 0, 0);
 
-static void send_log_line(const char *text)
+/* `skip_lock` exists for exactly one caller: the log backend's fatal-error
+ * path (dev_bench_log.h), which runs in the faulting context where
+ * k_mutex_lock is illegal. Everything else locks. */
+static void send_log_line_ex(const char *text, bool skip_lock)
 {
 	struct dev_bench_message *msg = &tx_scratch;
 
-	k_mutex_lock(&link_tx_mutex, K_FOREVER);
+	if (!skip_lock) {
+		k_mutex_lock(&link_tx_mutex, K_FOREVER);
+	}
 	memset(msg, 0, sizeof(*msg));
 	msg->tag = DBM_TAG_LOG_LINE;
 	strncpy(msg->log_line.text, text, DBM_MAX_LOG_LINE_LEN);
 	msg->log_line.text[DBM_MAX_LOG_LINE_LEN] = '\0';
 	send_message_locked(msg);
-	k_mutex_unlock(&link_tx_mutex);
+	if (!skip_lock) {
+		k_mutex_unlock(&link_tx_mutex);
+	}
+}
+
+static void send_log_line(const char *text)
+{
+	send_log_line_ex(text, false);
+}
+
+/* dev_bench_log.h's sink: every `CONFIG_LOG` record this firmware or any
+ * Zephyr subsystem produces, already formatted and length-bounded, out on the
+ * same `LogLine` channel decision 7 established for hand-written diagnostics.
+ * Deliberately the same channel and not a new message variant -- it costs no
+ * wire schema version, and Core has to store both kinds in the same place
+ * anyway (embarch-core/design.md §3 decision 37).
+ *
+ * Runs on the log processing thread (deferred mode), except on the fatal path
+ * where it runs in the faulting context and `panic` is true. */
+static void log_backend_sink(const char *line, bool panic)
+{
+	send_log_line_ex(line, panic);
 }
 
 /* ---- stream tap open/close (design.md §3 decision 29(a)) ---------------- */
@@ -602,7 +640,13 @@ static int link_rx_byte(uint8_t *byte)
  * (embarch-study-designer/design.md §3 decision 10). */
 static int receive_message(struct dev_bench_message *out)
 {
-	static uint8_t rx_buf[DBM_MAX_FRAME_LEN];
+	/* DBM_MAX_INBOUND_FRAME_LEN, not DBM_MAX_FRAME_LEN: Core sends dev-bench
+	 * only `Hello` and `StudyStart`, and sizing this for StepResult's much
+	 * larger bound cost ~10 KB of SRAM for a frame that cannot arrive. See
+	 * serial_protocol.h's own comment on that constant for the full
+	 * reasoning and for what pays attention to it. The overflow branch below
+	 * is what makes the narrower bound safe rather than merely smaller. */
+	static uint8_t rx_buf[DBM_MAX_INBOUND_FRAME_LEN];
 	size_t rx_len = 0;
 	uint32_t reported_overruns = 0;
 
@@ -640,7 +684,16 @@ static int receive_message(struct dev_bench_message *out)
 		if (rx_len < sizeof(rx_buf)) {
 			rx_buf[rx_len++] = byte;
 		} else {
-			rx_len = 0; /* overflow: drop and resync on the next delimiter */
+			/* Drop and resync on the next delimiter, as before -- but say
+			 * so now that there is somewhere to say it (decision 38).
+			 * Silence here is how "Core sent something this firmware
+			 * cannot receive" would look exactly like "the link is
+			 * quiet", and this branch is the one thing standing between
+			 * DBM_MAX_INBOUND_FRAME_LEN being a sound bound and being a
+			 * buffer overrun. */
+			LOG_WRN("inbound frame exceeded %zu bytes; dropped and resyncing",
+				sizeof(rx_buf));
+			rx_len = 0;
 		}
 	}
 }
@@ -662,6 +715,40 @@ static int receive_message(struct dev_bench_message *out)
  * that cannot answer says nothing; inventing a plausible ID here would defeat
  * the entire check, and Core's side is where "no ID" gets its meaning.
  */
+/* Uptime at handshake, plus the reset cause when `hwinfo` can name one — see
+ * handle_hello's own comment for what this is for. */
+static void send_reset_diagnostics(void)
+{
+	char line[DBM_MAX_LOG_LINE_LEN + 1];
+	int64_t uptime_ms = k_uptime_get();
+
+#ifdef CONFIG_HWINFO
+	uint32_t cause = 0;
+	int err = hwinfo_get_reset_cause(&cause);
+
+	if (err == 0) {
+		snprintk(line, sizeof(line),
+			 "uptime %lld ms at handshake, reset cause 0x%08x", (long long)uptime_ms,
+			 (unsigned int)cause);
+		/* Cleared so the *next* handshake's cause describes the next
+		 * reset rather than accumulating every cause since power-on,
+		 * which is what the driver's own flags do if nobody clears
+		 * them. A driver that does not support clearing is not an
+		 * error worth reporting -- the uptime is the load-bearing
+		 * half. */
+		(void)hwinfo_clear_reset_cause();
+	} else {
+		snprintk(line, sizeof(line),
+			 "uptime %lld ms at handshake, reset cause unavailable (%d)",
+			 (long long)uptime_ms, err);
+	}
+#else
+	snprintk(line, sizeof(line), "uptime %lld ms at handshake, no hwinfo driver",
+		 (long long)uptime_ms);
+#endif
+	send_log_line(line);
+}
+
 static void read_hardware_id(char *out, size_t out_cap)
 {
 	out[0] = '\0';
@@ -711,6 +798,37 @@ static bool handle_hello(const struct dbm_hello *hello)
 
 	send_message_locked(ack);
 	k_mutex_unlock(&link_tx_mutex);
+
+	/* Deliberately here -- after `HelloAck` is on the wire, before anything
+	 * else. Core's handshake tolerates a `LogLine` arriving ahead of the ack
+	 * (embarch-core/design.md §3 decision 37) so a bench that has already
+	 * handshaked once and is logging live cannot break a later handshake,
+	 * but on a freshly booted bench the ack still comes first. Installing
+	 * the sink flushes whatever the boot backlog holds, so the *first* thing
+	 * Core learns after the ack is how this bench came up -- which is the
+	 * gap the uptime/reset-cause line below was a stand-in for. */
+	dev_bench_log_set_sink(log_backend_sink);
+
+	/* **Why this uptime/reset-cause line exists.** A study failed on
+	 * 2026-08-26 with Core reporting a one-byte `00` frame — an empty COBS
+	 * frame, which is not something any encoder here can produce. The
+	 * candidate explanations were "dev-bench sent a malformed message" and
+	 * "dev-bench died mid-study and the line went to garbage", and nothing
+	 * observable distinguished them: this firmware runs with
+	 * CONFIG_BOOT_BANNER=n and CONFIG_LOG=n (decision 7), so a reboot is
+	 * completely silent from Core's side and the next `Hello` looks
+	 * identical to one on a bench that never faltered.
+	 *
+	 * An uptime measured in *milliseconds* at handshake time is the whole
+	 * tell: Core sends `Hello` when it opens the port, so a bench that has
+	 * been sitting there reports seconds-to-minutes and a bench that just
+	 * rebooted reports a few hundred milliseconds. The reset cause names
+	 * *why* when the driver knows.
+	 *
+	 * A `LogLine` rather than a `HelloAck` field on purpose: this is a
+	 * diagnostic, not something Core acts on, and it costs no wire version
+	 * (§3 decision 7 already routes dev-bench's log output here). */
+	send_reset_diagnostics();
 
 	if (!compatible) {
 		send_log_line("schema version mismatch, not awaiting a StudyStart");
@@ -980,7 +1098,18 @@ static void dispatch_study(const struct dbm_study_start *study)
 
 int main(void)
 {
+	/* The first record of a boot, and (until Core's `Hello` arrives) held in
+	 * dev_bench_log.c's backlog rather than written to a wire nobody has
+	 * open yet. This is what makes "did this bench reboot mid-study" a
+	 * question the debug file can answer -- see handle_hello's own comment on
+	 * the 2026-08-26 study that prompted it, and note CONFIG_BOOT_BANNER
+	 * stays off (prj.conf) so the banner's raw printk can never reach this
+	 * link ahead of the logging subsystem. */
+	LOG_INF("dev-bench up: fw %s, wire schema v%u", APP_FIRMWARE_VERSION,
+		(unsigned int)study_ffi_schema_version());
+
 	if (ble_bridge_init() != 0) {
+		LOG_ERR("ble_bridge_init failed; this bench cannot run a study");
 		return -1;
 	}
 

@@ -141,6 +141,38 @@
  * and a trailing 0x00 delimiter. */
 #define DBM_MAX_FRAME_LEN (DBM_MAX_RAW_LEN + (DBM_MAX_RAW_LEN / 254) + 2)
 
+/* Largest frame this firmware can ever *receive*, as opposed to the largest it
+ * can handle at all (DBM_MAX_FRAME_LEN above).
+ *
+ * The two are wildly different, and that difference is worth ~10 KB of SRAM on
+ * a board that has none to spare. DBM_MAX_RAW_LEN is StepResult's bound --
+ * 19808 bytes, dominated by `gatt_activity` -- and StepResult is a message
+ * dev-bench only ever *sends*. Core sends dev-bench exactly two messages:
+ * `Hello` (a dozen bytes) and `StudyStart`. So an RX staging buffer sized to
+ * DBM_MAX_FRAME_LEN is sized for a frame that cannot arrive.
+ *
+ * Found while making CONFIG_LOG fit on the ESP32-C5 (design.md §3 decision
+ * 38): that board's `sram0_0_seg` was at 98.5% before the logging subsystem
+ * asked for ~11 KB of it, ~5 KB of which is Espressif's linker script forcing
+ * log_core/log_output/log_msg/cbprintf into IRAM and therefore not negotiable.
+ * main.c's `receive_message` was holding 19887 bytes for a 9415-byte worst
+ * case, which is where the room came from.
+ *
+ * Deliberately scoped to the *application's* RX buffer, not to
+ * dbm_decode_frame's own staging buffer, which stays at DBM_MAX_RAW_LEN: the
+ * decoder is a general one (this suite's round-trip tests decode StepResults
+ * through it precisely to prove encode and decode agree), and narrowing it
+ * would trade a real test for RAM. `+ streams + margin` because
+ * DBM_MAX_STUDY_START_LEN's own formula predates StudyStart carrying
+ * `streams`/`streams_crc` (design.md §3 decision 29(a)) and covers them only
+ * out of its per-step rounding slack -- counted explicitly here rather than
+ * left to that slack, since this bound now has RAM riding on it.
+ */
+#define DBM_MAX_INBOUND_RAW_LEN \
+	(DBM_MAX_STUDY_START_LEN + (DBM_MAX_STREAMS_PER_STUDY * 16) + 16)
+#define DBM_MAX_INBOUND_FRAME_LEN \
+	(DBM_MAX_INBOUND_RAW_LEN + (DBM_MAX_INBOUND_RAW_LEN / 254) + 2)
+
 /* Matches `DevBenchMessage`'s variant order exactly; postcard encodes this
  * as the enum's varint discriminant, so the order here must never drift from
  * the crate's.
