@@ -18,6 +18,10 @@
 #include "dev_bench_log.h"
 #include "serial_protocol.h"
 
+/* src/app_module.c -- a module registered under DEV_BENCH_LOG_APP_MODULE. */
+void app_module_emit_inf(void);
+void app_module_emit_dbg(void);
+
 LOG_MODULE_REGISTER(dbm_log_test, LOG_LEVEL_INF);
 
 #define CAPTURE_DEPTH 32
@@ -63,6 +67,12 @@ static void before(void *fixture)
 	drain();
 	dev_bench_log_set_sink(NULL);
 	capture_reset();
+
+	/* Every test starts fully audible, so a test that is not *about*
+	 * filtering cannot be affected by it — and so a test that changes the
+	 * level cannot silently set up the next one (design.md §3 decision 39).
+	 * The filtering tests below each set the level they mean to exercise. */
+	dev_bench_log_set_level(DBM_LOG_LEVEL_DBG);
 }
 
 ZTEST_SUITE(dev_bench_log, NULL, NULL, before, NULL, NULL);
@@ -184,4 +194,98 @@ ZTEST(dev_bench_log, test_control_bytes_are_replaced_rather_than_forwarded)
 
 	zassert_equal(captured_len, 1, "expected one line, got %u", captured_len);
 	zassert_not_null(strstr(captured[0], "a.b"), "got '%s'", captured[0]);
+}
+
+/* ---- per-study verbosity (design.md §3 decision 39) -------------------- */
+
+ZTEST(dev_bench_log, test_the_idle_level_is_quiet_but_never_silent)
+{
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	LOG_INF("chatty subsystem");
+	LOG_WRN("something worth knowing");
+	drain();
+
+	/* This is what "quiet" has to mean for the default to be defensible: an
+	 * ordinary module's info line is dropped, and its warning is not. */
+	zassert_equal(captured_len, 1, "expected only the warning, got %u lines", captured_len);
+	zassert_not_null(strstr(captured[0], "something worth knowing"), "got '%s'",
+			 captured[0]);
+}
+
+ZTEST(dev_bench_log, test_the_app_module_keeps_info_at_the_idle_level)
+{
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	app_module_emit_inf();
+	drain();
+
+	/* The floor dev_bench_log.h argues for: the bench going quiet must not
+	 * mean the bench stopping saying what it is doing, or the boot record
+	 * and handshake diagnostics decision 38 exists for would vanish the
+	 * moment a study asked for less. */
+	zassert_equal(captured_len, 1,
+		      "the app's own module must keep INF while others are held at WRN "
+		      "(got %u lines)",
+		      captured_len);
+	zassert_not_null(strstr(captured[0], "app module speaking"), "got '%s'", captured[0]);
+}
+
+ZTEST(dev_bench_log, test_a_study_can_ask_for_info_and_get_it)
+{
+	uint8_t reached = dev_bench_log_set_level(DBM_LOG_LEVEL_INF);
+
+	zassert_equal(reached, DBM_LOG_LEVEL_INF,
+		      "this build compiles in DBG, so INF must be reachable (got %u)",
+		      (unsigned int)reached);
+
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	LOG_INF("now audible");
+	drain();
+
+	zassert_equal(captured_len, 1, "expected the info line, got %u", captured_len);
+	zassert_not_null(strstr(captured[0], "now audible"), "got '%s'", captured[0]);
+}
+
+ZTEST(dev_bench_log, test_off_is_taken_literally_including_the_app_module)
+{
+	uint8_t reached = dev_bench_log_set_level(DBM_LOG_LEVEL_OFF);
+
+	zassert_equal(reached, DBM_LOG_LEVEL_OFF, "Off must be reachable (got %u)",
+		      (unsigned int)reached);
+
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	LOG_ERR("an error nobody will hear");
+	app_module_emit_inf();
+	drain();
+
+	/* Off is the one setting that overrides the app-module floor. A study
+	 * that asks for a completely clear link gets one -- and gives up the
+	 * fatal-error dump to get it, which is why it is not the default. */
+	zassert_equal(captured_len, 0, "Off must silence everything, got %u lines",
+		      captured_len);
+}
+
+ZTEST(dev_bench_log, test_set_level_reports_the_level_it_actually_reached)
+{
+	/* Every source in this build compiles at DBG, so every request is
+	 * honoured exactly. The value of the return is the case where that
+	 * isn't true -- a build compiled at INF asked for DBG -- which cannot be
+	 * constructed here without a second build, so what this pins is that the
+	 * app-module floor does not leak into the answer: a request for WRN must
+	 * report WRN, not the INF the app module was held at. */
+	zassert_equal(dev_bench_log_set_level(DBM_LOG_LEVEL_DBG), DBM_LOG_LEVEL_DBG,
+		      "DBG request");
+	zassert_equal(dev_bench_log_set_level(DBM_LOG_LEVEL_WRN), DBM_LOG_LEVEL_WRN,
+		      "a WRN request must not report back the app module's INF floor");
+	zassert_equal(dev_bench_log_set_level(DBM_LOG_LEVEL_ERR), DBM_LOG_LEVEL_ERR,
+		      "ERR request");
 }

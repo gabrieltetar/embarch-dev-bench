@@ -64,4 +64,43 @@ void dev_bench_log_set_sink(dev_bench_log_sink_fn sink);
  * dropped since the last flush, not since boot. */
 uint32_t dev_bench_log_backlog_dropped(void);
 
+/* ---- per-study verbosity (design.md §3 decision 39) -------------------- */
+
+/* The level in force whenever no study is running: at boot, between studies,
+ * and after a `Hello`. Warn-and-above, so the link is quiet while the bench is
+ * idle and an error still cannot pass unnoticed.
+ *
+ * Decision 38 achieved this with CONFIG_LOG_DEFAULT_LEVEL, i.e. by *compiling
+ * out* everything above it -- which made the choice once, for every study,
+ * whoever last edited prj.conf. Decision 39 compiles everything in and filters
+ * at runtime instead, so a single study can ask for more (see
+ * `struct dbm_study_start.dev_bench_log_level`) without a reflash.
+ */
+#define DEV_BENCH_LOG_BOOT_LEVEL 2 /* DBM_LOG_LEVEL_WRN */
+
+/* The module name main.c registers with LOG_MODULE_REGISTER.
+ *
+ * dev_bench_log.c holds this one module at INF even while a study asks for
+ * less, because "the BT host should be quiet" is not the same request as "this
+ * firmware should stop saying what it is doing" -- the boot record and the
+ * handshake diagnostics are the whole reason decision 38 exists. The one
+ * exception is an explicit `Off`, which means silent and is taken literally.
+ *
+ * Matched by string rather than by a shared source id because Zephyr exposes
+ * no way to ask for another translation unit's log source id.
+ */
+#define DEV_BENCH_LOG_APP_MODULE "dev_bench"
+
+/* Applies `level` (a DBM_LOG_LEVEL_* value, which is also the Zephyr severity
+ * number -- see serial_protocol.h) to every log source, subject to the
+ * DEV_BENCH_LOG_APP_MODULE rule above.
+ *
+ * Returns the highest level actually reached. Zephyr's `log_filter_set` clamps
+ * a request to what the build compiled in, so a returned value *below* `level`
+ * means this firmware was built without that verbosity — reported rather than
+ * silently accepted, since "I asked for debug and got warnings" is exactly the
+ * kind of thing that otherwise reads as the feature not working.
+ */
+uint8_t dev_bench_log_set_level(uint8_t level);
+
 #endif /* EMBARCH_DEV_BENCH_LOG_H_ */

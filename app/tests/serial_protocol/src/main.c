@@ -445,7 +445,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_delay_before_ms)
  * four-step study, produced by
  * embarch-study-designer/tests/firmware_test_vectors.rs's
  * dump_study_start_wire_bytes -- run that with --nocapture to regenerate
- * after any wire change (last regenerated for schema v9). This is the *payload*, pre-COBS, which is what
+ * after any wire change (last regenerated for schema v13). This is the *payload*, pre-COBS, which is what
  * dbm_decode_frame takes.
  */
 static const uint8_t core_study_start_frame[] = {
@@ -473,6 +473,12 @@ static const uint8_t core_study_start_frame[] = {
 	 * all -- which is why `core_study_start_with_taps_frame` below exists
 	 * and carries three real taps. */
 	0x00, 0x00,
+	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
+	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * the vector generator picks a value the C struct would not contain by
+	 * accident, so an off-by-one in walking the streams_crc that precedes
+	 * it cannot pass. */
+	0x04,
 };
 
 /* An independent COBS encoder, deliberately not serial_protocol.c's own
@@ -561,6 +567,16 @@ ZTEST(serial_protocol, test_decodes_cores_real_study_start_bytes)
 	zassert_str_equal(ss->steps[3].name, "close-capture", "step 3 name");
 	zassert_equal(ss->steps[3].action_tag, DBM_ACTION_GATT_MONITOR_STOP, "step 3 action");
 	zassert_equal(ss->steps[3].delay_before_ms, 8000, "step 3 delay");
+
+	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	 * decoded from bytes this firmware did not produce. The generator picks
+	 * `Debug` rather than the `Warn` default precisely so a decoder that
+	 * ignored this trailing byte -- which would still decode the frame and
+	 * still pass every other assertion here -- fails this one. */
+	zassert_equal(ss->dev_bench_log_level, DBM_LOG_LEVEL_DBG,
+		      "dev_bench_log_level mismatch (got %u)",
+		      (unsigned int)ss->dev_bench_log_level);
+
 }
 
 /* The same shape as core_study_start_frame above, but carrying three real
@@ -604,6 +620,12 @@ static const uint8_t core_study_start_with_taps_frame[] = {
 	0x70, 0x6f, 0x73, 0x74, 0x04, 0x0d, 0x6f, 0x75, 0x74, 0x70, 0x6f, 0x73, 0x74, 0x2d,
 	0x74, 0x72, 0x61, 0x63, 0x65, 0x04, 0x00, 0x02, 0x05, 0x70, 0x6f, 0x77, 0x65, 0x72,
 	0x01, 0xe8, 0x07, 0x00, 0x01, 0x00, 0x00, 0xd2, 0xab, 0xc6, 0x8e, 0x09,
+	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
+	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * the vector generator picks a value the C struct would not contain by
+	 * accident, so an off-by-one in walking the streams_crc that precedes
+	 * it cannot pass. */
+	0x04,
 };
 
 ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
@@ -652,6 +674,16 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 	zassert_true(dbm_stream_tap_is_ours(&ss->streams[0]), "a GattNotify tap is dev-bench's");
 	zassert_false(dbm_stream_tap_is_ours(&ss->streams[1]), "a Signal tap is Core's");
 	zassert_true(dbm_stream_tap_is_ours(&ss->streams[2]), "a PowerFrontEnd tap is dev-bench's");
+
+	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	 * decoded from bytes this firmware did not produce. The generator picks
+	 * `Debug` rather than the `Warn` default precisely so a decoder that
+	 * ignored this trailing byte -- which would still decode the frame and
+	 * still pass every other assertion here -- fails this one. */
+	zassert_equal(ss->dev_bench_log_level, DBM_LOG_LEVEL_DBG,
+		      "dev_bench_log_level mismatch (got %u)",
+		      (unsigned int)ss->dev_bench_log_level);
+
 }
 
 ZTEST(serial_protocol, test_stream_scope_covers_the_inclusive_range_it_declares)
@@ -1280,6 +1312,12 @@ static const uint8_t core_study_start_with_security_frame[] = {
 	0x00,
 	/* steps_crc = 0xB0025B12, then an empty `streams` + its CRC of nothing. */
 	0x92, 0xb6, 0x89, 0x80, 0x0b, 0x00, 0x00,
+	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
+	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * the vector generator picks a value the C struct would not contain by
+	 * accident, so an off-by-one in walking the streams_crc that precedes
+	 * it cannot pass. */
+	0x04,
 };
 
 ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
@@ -1309,4 +1347,14 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
 	zassert_str_equal(ss->steps[2].name, "drop-bond", "step 2 name");
 	zassert_equal(ss->steps[2].action_tag, DBM_ACTION_BLE_UNBOND, "step 2 action");
 	zassert_equal(ss->steps[2].timeout_ms, 5000, "step 2 timeout");
+
+	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	 * decoded from bytes this firmware did not produce. The generator picks
+	 * `Debug` rather than the `Warn` default precisely so a decoder that
+	 * ignored this trailing byte -- which would still decode the frame and
+	 * still pass every other assertion here -- fails this one. */
+	zassert_equal(ss->dev_bench_log_level, DBM_LOG_LEVEL_DBG,
+		      "dev_bench_log_level mismatch (got %u)",
+		      (unsigned int)ss->dev_bench_log_level);
+
 }

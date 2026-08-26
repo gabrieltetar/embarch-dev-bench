@@ -173,6 +173,20 @@
 #define DBM_MAX_INBOUND_FRAME_LEN \
 	(DBM_MAX_INBOUND_RAW_LEN + (DBM_MAX_INBOUND_RAW_LEN / 254) + 2)
 
+/* Mirrors embarch-study-designer's `DevBenchLogLevel` (src/study.rs) -- these
+ * are that enum's postcard discriminants, which are also deliberately its
+ * Zephyr severity numbers (`DevBenchLogLevel::zephyr_level`), so no
+ * translation table is needed on this side. Schema v13, design.md §3 decision
+ * 39.
+ *
+ * Appended, never reordered, for the same positional-encoding reason every
+ * other enum on this wire is. */
+#define DBM_LOG_LEVEL_OFF 0
+#define DBM_LOG_LEVEL_ERR 1
+#define DBM_LOG_LEVEL_WRN 2
+#define DBM_LOG_LEVEL_INF 3
+#define DBM_LOG_LEVEL_DBG 4
+
 /* Matches `DevBenchMessage`'s variant order exactly; postcard encodes this
  * as the enum's varint discriminant, so the order here must never drift from
  * the crate's.
@@ -578,6 +592,12 @@ struct dbm_study_start {
 	 * scope) -- decode still returns 0 (a well-formed StudyStart arrived),
 	 * but the caller must not dispatch it. */
 	bool has_unsupported_action;
+	/* How loud this firmware should be while this study runs -- schema v13
+	 * (design.md §3 decision 39), one of DBM_LOG_LEVEL_*. Appended after
+	 * `streams_crc` on the wire, and covered by **neither** seal: the two
+	 * CRCs cover what dev-bench executes and what it captures, and how
+	 * verbose it is about doing so changes neither. */
+	uint8_t dev_bench_log_level;
 };
 
 struct dbm_outcome {
