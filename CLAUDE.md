@@ -7,7 +7,11 @@ Update it proactively per [../embarch-doc/DOC-PROTOCOL.md](../embarch-doc/DOC-PR
 
 ## Building
 
-Never build firmware or flash devices autonomously — always ask before running `west build`/`west flash`, and share the output for review rather than assuming success.
+**Build and flash this repo's firmware autonomously — no need to ask (2026-08-25).** This is EmbArch's own test rig, not a DUT: a bad build here breaks the bench, not a customer's board, and the whole point of the suite is that bench work is automatable. Share the output rather than assuming success.
+
+The ask-first rule this replaces was written for **DUT** firmware and had been over-applied to dev-bench itself. It still holds for a DUT: never build or flash a device under test without asking.
+
+`west` is not on bare `PATH` here and none of `workspaces/*` carries its own `.venv` — pass an absolute path to a `west` that works, the same way `embarch-api`'s config declares `west_binary` for every project.
 
 ## Git
 

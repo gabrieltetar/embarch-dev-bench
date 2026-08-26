@@ -19,6 +19,9 @@
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/uart.h>
+#ifdef CONFIG_HWINFO
+#include <zephyr/drivers/hwinfo.h>
+#endif
 #include <zephyr/kernel.h>
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/ring_buffer.h>
@@ -462,6 +465,48 @@ static int receive_message(struct dev_bench_message *out)
  * handshake. Returns whether dev-bench should now wait for a `StudyStart`
  * (i.e. the schema versions matched) — `false` on a mismatch, matching the
  * previous bring-up behavior of not running anything in that case. */
+/* This board's own factory-unique chip ID, hex-encoded lowercase into `out`
+ * (embarch-study-designer/design.md §3 decision 47, embarch-core/design.md §3
+ * decision 35). Core compares it against the identity its JTAG probe just
+ * read -- the only thing that ties the runtime serial link and the JTAG
+ * connection to the same silicon, since the port migration made them
+ * physically separate USB devices.
+ *
+ * **Reports an empty string rather than a substitute** when this build has no
+ * `hwinfo` driver (native_sim, most of all) or the driver refuses. A bench
+ * that cannot answer says nothing; inventing a plausible ID here would defeat
+ * the entire check, and Core's side is where "no ID" gets its meaning.
+ */
+static void read_hardware_id(char *out, size_t out_cap)
+{
+	out[0] = '\0';
+
+#ifdef CONFIG_HWINFO
+	uint8_t id[DBM_MAX_HARDWARE_ID_LEN / 2];
+	ssize_t len = hwinfo_get_device_id(id, sizeof(id));
+
+	if (len <= 0) {
+		return;
+	}
+	/* Truncate rather than overflow, and keep it even-length so the hex is
+	 * always whole bytes. `out_cap` is DBM_MAX_HARDWARE_ID_LEN + 1, and
+	 * `id` is sized so this cannot actually bite -- belt and braces around
+	 * a driver returning more than asked for. */
+	if ((size_t)len * 2 >= out_cap) {
+		len = (ssize_t)((out_cap - 1) / 2);
+	}
+	static const char hex[] = "0123456789abcdef";
+
+	for (ssize_t i = 0; i < len; i++) {
+		out[i * 2] = hex[(id[i] >> 4) & 0x0f];
+		out[i * 2 + 1] = hex[id[i] & 0x0f];
+	}
+	out[len * 2] = '\0';
+#else
+	(void)out_cap;
+#endif
+}
+
 static bool handle_hello(const struct dbm_hello *hello)
 {
 	ble_bridge_reset();
@@ -476,6 +521,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 	ack->hello_ack.compatible = (hello->schema_version == our_schema);
 	strncpy(ack->hello_ack.firmware_version, APP_FIRMWARE_VERSION, DBM_MAX_FIRMWARE_VERSION_LEN);
 	ack->hello_ack.firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN] = '\0';
+	read_hardware_id(ack->hello_ack.hardware_id, sizeof(ack->hello_ack.hardware_id));
 	bool compatible = ack->hello_ack.compatible;
 
 	send_message_locked(ack);
