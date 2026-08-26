@@ -91,6 +91,26 @@ uint32_t dev_bench_log_backlog_dropped(void);
  */
 #define DEV_BENCH_LOG_APP_MODULE "dev_bench"
 
+/* Zephyr's kernel log module, and the ceiling this backend holds it at no
+ * matter what a study asks for.
+ *
+ * **This is a feedback loop, not a noise preference, and it was found by
+ * running a study at `Debug` on real hardware.** Forwarding a line takes
+ * main.c's `link_tx_mutex` and writes the UART; the kernel logs
+ * `z_impl_k_mutex_unlock` at DBG; that record is forwarded, which takes the
+ * mutex again. The capture came back as an unbroken alternation of
+ * `<dbg> os: z_impl_k_mutex_unlock` and `<wrn> log: 5 log record(s) dropped`
+ * — the act of logging was generating the log, and the deferred buffer
+ * overflowed continuously. `k_sleep`'s own `z_tick_sleep` feeds the same loop
+ * from the dispatch loop's idle path.
+ *
+ * Capping `os` breaks it at the source. Nothing is lost that a study wanted:
+ * these records are Zephyr's internal kernel tracing, not the bench's account
+ * of the DUT, and a study asking for `Debug` is asking about the radio.
+ */
+#define DEV_BENCH_LOG_KERNEL_MODULE "os"
+#define DEV_BENCH_LOG_KERNEL_CEILING 2 /* DBM_LOG_LEVEL_WRN */
+
 /* Applies `level` (a DBM_LOG_LEVEL_* value, which is also the Zephyr severity
  * number -- see serial_protocol.h) to every log source, subject to the
  * DEV_BENCH_LOG_APP_MODULE rule above.

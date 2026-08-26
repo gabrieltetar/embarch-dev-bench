@@ -12,7 +12,10 @@
 
 #include "dev_bench_log.h"
 
-LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_INF);
+/* DBG, matching main.c: registered at INF, this file's own LOG_DBG would be
+ * compiled out and the floor test's debug half would pass without testing
+ * anything -- which is exactly what happened in main.c until hardware said so. */
+LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_DBG);
 
 void app_module_emit_inf(void)
 {

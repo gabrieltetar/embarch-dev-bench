@@ -35,12 +35,21 @@
 #include "serial_protocol.h"
 #include "study_ffi.h"
 
-/* This application's own log module (decision 38). Pinned at INF rather than
- * inheriting CONFIG_LOG_DEFAULT_LEVEL, which prj.conf holds at WRN so that
- * Zephyr's own subsystems stay quiet on a link they share with the protocol
- * -- this firmware's own statements about what it is doing are the ones worth
- * having on by default. */
-LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_INF);
+/* This application's own log module.
+ *
+ * **Registered at DBG, not INF, and the difference is not cosmetic.** A
+ * module's `LOG_MODULE_REGISTER` level is a *compile-time* ceiling: Zephyr's
+ * runtime filtering can only reduce below it, never raise above it. Decision
+ * 38 registered this at INF, which quietly compiled every LOG_DBG in this file
+ * out of existence -- so a study asking for `Debug` under decision 39 got the
+ * bench's own step-by-step account of nothing at all. Found by running exactly
+ * that study on hardware and seeing no lines.
+ *
+ * Everything is compiled in; what a run actually forwards is decided at
+ * runtime by the study's level, with dev_bench_log.c holding this module at no
+ * less than INF so the boot record and handshake diagnostics survive an idle
+ * bench (dev_bench_log.h). */
+LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_DBG);
 
 #ifndef APP_FIRMWARE_VERSION
 #define APP_FIRMWARE_VERSION "dev-bench-unknown"
@@ -1036,6 +1045,14 @@ static void dispatch_study(const struct dbm_study_start *study)
 	for (uint32_t i = 0; i < study->steps_len; i++) {
 		const struct dbm_step *step = &study->steps[i];
 		struct action action = step_to_action(step);
+
+		/* At DBG rather than INF: a study that asked for `Debug` is asking
+		 * to follow the run step by step, and one that did not should not
+		 * pay a `LogLine` per step for it (decision 39). This is also the
+		 * bench's own answer to "where did it get to" for a study that
+		 * stops producing `StepResult`s -- the last line in the debug file
+		 * names the step that was executing. */
+		LOG_DBG("step %u '%s': dispatching", (unsigned int)i, step->name);
 
 		/* Stamped before the step runs, so every transcript entry it
 		 * produces -- including notifications arriving inside a capture

@@ -12,6 +12,8 @@
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log_core.h>
 #include <zephyr/logging/log_ctrl.h>
 #include <zephyr/ztest.h>
 
@@ -25,6 +27,9 @@ void app_module_emit_dbg(void);
 LOG_MODULE_REGISTER(dbm_log_test, LOG_LEVEL_INF);
 
 #define CAPTURE_DEPTH 32
+
+/* Something to lock and unlock so the kernel emits its own DBG records. */
+static K_MUTEX_DEFINE(kernel_noise_mutex);
 
 static char captured[CAPTURE_DEPTH][DBM_MAX_LOG_LINE_LEN + 1];
 static uint32_t captured_len;
@@ -288,4 +293,125 @@ ZTEST(dev_bench_log, test_set_level_reports_the_level_it_actually_reached)
 		      "a WRN request must not report back the app module's INF floor");
 	zassert_equal(dev_bench_log_set_level(DBM_LOG_LEVEL_ERR), DBM_LOG_LEVEL_ERR,
 		      "ERR request");
+}
+
+/* Reproduces the defect that was found live rather than in this suite
+ * (design.md §3 decision 39): between log-init and main()'s first statement,
+ * every source sits at the *compiled* level -- now DBG -- because nothing has
+ * called log_filter_set yet. The boot backlog therefore filled with
+ * `<dbg> os: z_tick_sleep` records that pushed the boot record decision 38
+ * exists for straight out of an 8-slot ring.
+ *
+ * Reproduced here by putting the two filters deliberately out of step: this
+ * backend at the idle level, Zephyr's own runtime filter wide open. Every test
+ * above sets both together through dev_bench_log_set_level, which is exactly
+ * why none of them caught it. */
+static void open_zephyr_filter_wide(void)
+{
+	for (uint32_t src = 0; src < log_src_cnt_get(Z_LOG_LOCAL_DOMAIN_ID); src++) {
+		log_filter_set(NULL, Z_LOG_LOCAL_DOMAIN_ID, (int16_t)src, DBM_LOG_LEVEL_DBG);
+	}
+}
+
+ZTEST(dev_bench_log, test_the_backend_filters_even_when_zephyrs_own_filter_does_not)
+{
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+	open_zephyr_filter_wide();
+
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	LOG_DBG("boot-time noise");
+	LOG_INF("boot-time chatter");
+	drain();
+
+	zassert_equal(captured_len, 0,
+		      "the backend must forward nothing above its own level, whatever "
+		      "Zephyr's filter allows (got %u lines)",
+		      captured_len);
+}
+
+ZTEST(dev_bench_log, test_the_app_module_floor_holds_before_any_filter_is_applied)
+{
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+	open_zephyr_filter_wide();
+
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	app_module_emit_dbg();
+	app_module_emit_inf();
+	drain();
+
+	/* The floor is INF, not DBG: the app's own debug records are noise on
+	 * this link too. What must survive is the boot record. */
+	zassert_equal(captured_len, 1, "expected only the app's INF line, got %u",
+		      captured_len);
+	zassert_not_null(strstr(captured[0], "app module speaking"), "got '%s'", captured[0]);
+}
+
+ZTEST(dev_bench_log, test_a_raw_printk_is_treated_as_informational_not_as_level_zero)
+{
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	/* CONFIG_LOG_PRINTK is off in this test build (prj.conf), so route one
+	 * the same way the subsystem does: a record at
+	 * LOG_LEVEL_INTERNAL_RAW_STRING, which is LOG_LEVEL_NONE == 0. Taken
+	 * literally, 0 outranks every level and would sail through the idle
+	 * filter -- which is precisely what Espressif's boot-time printk output
+	 * did on real hardware, filling the boot backlog. */
+	Z_LOG_PRINTK(0, "espressif says hello at boot%s\n", "");
+	drain();
+
+	zassert_equal(captured_len, 0,
+		      "a raw printk must be filtered as INF, not pass as level 0 "
+		      "(got %u lines)",
+		      captured_len);
+
+	dev_bench_log_set_level(DBM_LOG_LEVEL_INF);
+	capture_reset();
+	Z_LOG_PRINTK(0, "espressif says hello at boot%s\n", "");
+	drain();
+
+	zassert_equal(captured_len, 1,
+		      "...and a study that asks for Info must still receive it (got %u)",
+		      captured_len);
+	zassert_not_null(strstr(captured[0], "espressif says hello"), "got '%s'",
+			 captured[0]);
+}
+
+ZTEST(dev_bench_log, test_the_kernel_module_is_capped_even_when_a_study_asks_for_debug)
+{
+	uint8_t reached = dev_bench_log_set_level(DBM_LOG_LEVEL_DBG);
+
+	zassert_equal(reached, DBM_LOG_LEVEL_DBG, "the request itself still reports DBG");
+
+	/* `dev_bench_log_set_level` caps `os` in Zephyr's own filter too, so
+	 * without this the records are never *created* and this test would pass
+	 * on a backend that had no ceiling at all — verified by mutation, which
+	 * is how the first version of this test was caught being useless. Opening
+	 * the filter wide leaves the backend's own check as the only thing that
+	 * can stop them, which is what is on trial here. */
+	open_zephyr_filter_wide();
+
+	dev_bench_log_set_sink(capture_sink);
+	capture_reset();
+
+	/* A kernel DBG record, emitted the way the kernel emits them: through
+	 * the `os` module. Forwarding one of these is what made logging generate
+	 * logging on real hardware -- `k_mutex_unlock` inside the sink logged a
+	 * record, which was forwarded, which unlocked the mutex again. */
+	k_mutex_lock(&kernel_noise_mutex, K_FOREVER);
+	k_mutex_unlock(&kernel_noise_mutex);
+	k_sleep(K_MSEC(1));
+	drain();
+
+	for (uint32_t i = 0; i < captured_len; i++) {
+		zassert_true(strncmp(captured[i], "<dbg> os:", 9) != 0,
+			     "a kernel debug record must never be forwarded, whatever the "
+			     "study asked for; got '%s'",
+			     captured[i]);
+	}
 }
