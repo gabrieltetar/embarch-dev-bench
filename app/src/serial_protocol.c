@@ -106,15 +106,16 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 	return 0;
 }
 
-/* Walks one postcard-encoded `StreamTap` (embarch-study-designer
- * src/streams.rs, design.md §4.8), advancing *pos past it without storing
- * anything. Returns 0 on success, -1 on a malformed or unrecognized shape.
+/* Reads one postcard-encoded `StreamTap` (embarch-study-designer
+ * src/streams.rs, design.md §4.8), advancing *pos past it and filling `out`
+ * with the part this node acts on. Returns 0 on success, -1 on a malformed
+ * or unrecognized shape.
  *
- * This firmware does not consume taps yet -- Phase B item 3 is where it
- * opens them for real -- but it has to *walk* them to know where the
- * `streams` span ends, which is what `streams_crc` is computed over. Walking
- * and discarding is the same thing this decoder already does for
- * `BleAdvertise::service_uuids`.
+ * Every field is walked, because postcard carries no per-field length and
+ * `scope` cannot be reached without parsing `name`, `source` and `encoding`
+ * first. Only `id`, the source tag and the scope are **kept** -- see `struct
+ * dbm_stream_tap` for why an encoding stored here would be this firmware
+ * holding the one kind of knowledge decision 39 took away from it.
  *
  * An unknown variant tag is a hard error rather than a skip: postcard
  * carries no field names and no per-variant length, so a tag this decoder
@@ -122,7 +123,8 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
  * schema-version handshake is what makes that acceptable -- a peer that
  * would send one has already been refused.
  */
-static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
+static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
+			      struct dbm_stream_tap *out)
 {
 	uint64_t tag;
 	uint64_t scratch;
@@ -131,6 +133,7 @@ static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
 	if (*pos >= raw_len) {
 		return -1;
 	}
+	out->id = raw[*pos];
 	(*pos)++;
 
 	/* name: heapless::String -- length-prefixed bytes. */
@@ -142,6 +145,7 @@ static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
 	if (pc_read_varint(raw, raw_len, pos, &tag) != 0) {
 		return -1;
 	}
+	out->source_tag = (uint8_t)tag;
 	switch (tag) {
 	case 0: /* GattNotify { service_uuid, characteristic_uuid } */
 		if (*pos + 32 > raw_len) {
@@ -200,6 +204,9 @@ static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
 	if (pc_read_varint(raw, raw_len, pos, &tag) != 0) {
 		return -1;
 	}
+	out->scope_tag = (uint8_t)tag;
+	out->scope_from = 0;
+	out->scope_to = 0;
 	switch (tag) {
 	case 0: /* WholeStudy */
 		break;
@@ -207,9 +214,11 @@ static int pc_skip_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos)
 		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
 			return -1;
 		}
+		out->scope_from = (uint32_t)scratch;
 		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
 			return -1;
 		}
+		out->scope_to = (uint32_t)scratch;
 		break;
 	default:
 		return -1;
@@ -696,14 +705,6 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		}
 		return 0;
 	}
-	case DBM_TAG_GATT_TRANSCRIPT_RECORD: {
-		/* Retired as a message at schema v8 (see `enum dbm_tag`), still
-		 * sent by main.c until Phase B rewires it onto a stream tap. The
-		 * entry half is `encode_transcript_entry_at` above, which is the
-		 * part that carries forward. */
-		WRITE_VARINT(msg->gatt_transcript.step_index);
-		return encode_transcript_entry_at(&msg->gatt_transcript.entry, out, out_cap, pos);
-	}
 	case DBM_TAG_STUDY_DONE:
 		if (*pos + 1 > out_cap) {
 			return -1;
@@ -799,8 +800,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 	 * self-consistent while saying nothing about whether Rust agrees --
 	 * which is the only thing that matters, and is what the literal-frame
 	 * pinning in app/tests/serial_protocol covers instead. Their frames
-	 * therefore decode here as an unknown tag, deliberately, exactly as
-	 * DBM_TAG_GATT_TRANSCRIPT_RECORD's always has. */
+	 * therefore decode here as an unknown tag, deliberately. */
 	case DBM_TAG_LOG_LINE:
 		return pc_read_str(raw, raw_len, &pos, msg->log_line.text,
 				    sizeof(msg->log_line.text));
@@ -1091,7 +1091,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		size_t streams_start_pos = pos;
 
 		for (uint32_t i = 0; i < streams_len; i++) {
-			if (pc_skip_stream_tap(raw, raw_len, &pos) != 0) {
+			if (pc_read_stream_tap(raw, raw_len, &pos, &ss->streams[i]) != 0) {
 				return -1;
 			}
 		}

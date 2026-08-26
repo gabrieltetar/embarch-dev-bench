@@ -106,6 +106,39 @@ struct transcript_item {
 
 K_MSGQ_DEFINE(transcript_q, sizeof(struct transcript_item), TRANSCRIPT_QUEUE_DEPTH, 4);
 
+/* ---- declared stream taps (schema v9, design.md §3 decision 29(a)) ------
+ *
+ * Copied out of the decoded `StudyStart` at dispatch, rather than read
+ * through a pointer into the rx message buffer: that buffer is reused by the
+ * next frame, and the transcript TX thread reads this concurrently with the
+ * dispatch loop.
+ */
+static struct dbm_stream_tap study_taps[DBM_MAX_STREAMS_PER_STUDY];
+static uint32_t study_taps_len;
+
+/* Which taps are open right now, by index into `study_taps`. Only the
+ * dispatch loop writes this; the transcript sink reads
+ * `transcript_tap_open`, which is a single bool it can sample without
+ * walking the array. */
+static bool tap_open[DBM_MAX_STREAMS_PER_STUDY];
+
+/* The tap a `StreamSource::GattTranscript` was declared on, as an index into
+ * `study_taps`, or -1 when this study declared none.
+ *
+ * **-1 is the ordinary case, not an error**: a study that never asked for a
+ * transcript does not get one. That is decision 39's model -- capture is
+ * declared, not implicit -- and it is a real behaviour change from the
+ * retired tag-10 path, which sent every entry unconditionally whether or not
+ * anything upstream wanted it. */
+static int transcript_tap_index = -1;
+
+/* Sampled by the transcript sink in BT RX context: whether the transcript
+ * tap is declared *and* currently open. A plain bool read is atomic on both
+ * supported targets, and a stale sample costs one entry at a window edge --
+ * far cheaper than taking a lock in that callback, which ble_bridge.h's
+ * contract forbids anyway. */
+static volatile bool transcript_tap_open;
+
 /* Bumped by dispatch_study so each entry is stamped with the step that was
  * running when it happened. Read from the BLE callback context; a plain
  * uint32_t write/read is atomic on both supported targets, and a torn value
@@ -137,6 +170,14 @@ static void log_sink_cb(const char *line, void *user_data)
 static void transcript_sink_cb(const struct ble_transcript_entry *entry, void *user_data)
 {
 	ARG_UNUSED(user_data);
+
+	/* No declared transcript tap, or its window isn't open: the study
+	 * didn't ask for this. Dropping here rather than at send time keeps
+	 * the queue for entries that have somewhere to go, and is not counted
+	 * as a drop -- nothing was lost that anyone asked to capture. */
+	if (!transcript_tap_open) {
+		return;
+	}
 
 	struct transcript_item item;
 
@@ -174,22 +215,69 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 
 		struct dev_bench_message *msg = &tx_scratch;
 
+		/* Re-checked here rather than trusted from queue time: the
+		 * window can close while an entry is still queued, and a
+		 * record sent on a closed tap is one Core keeps but warns
+		 * about. Dropping it at the edge is the honest read -- the
+		 * entry arrived outside the capture the study declared. */
+		int tap_index = transcript_tap_index;
+
+		if (tap_index < 0 || !tap_open[tap_index]) {
+			k_mutex_unlock(&link_tx_mutex);
+			continue;
+		}
+
+		/* One entry, encoded to bare postcard bytes, carried as the
+		 * payload of a single-record StreamChunkBatch on the declared
+		 * transcript tap (design.md §3 decision 29(a)). The entry's
+		 * own `rx_utc_ms` and the record's are the same value from
+		 * the same clock -- kept both places so the transcript row
+		 * shape decision 36 pinned stays byte-for-byte what it was.
+		 *
+		 * `step_index` is deliberately *not* carried any more. The
+		 * generic record has no field for one, and Core takes the
+		 * column from whichever step it has open when the record
+		 * arrives -- which is what decision 36 defined that column to
+		 * mean in the first place, and what the retired tag-10 path
+		 * had been getting off-by-one at every step boundary. */
+		struct dbm_gatt_transcript_entry entry;
+
+		memset(&entry, 0, sizeof(entry));
+		entry.rx_utc_ms = item.entry.rx_utc_ms;
+		entry.direction = item.entry.direction;
+		entry.kind = item.entry.kind;
+		entry.has_service_uuid = item.entry.has_service_uuid;
+		memcpy(entry.service_uuid, item.entry.service_uuid, 16);
+		entry.has_characteristic_uuid = item.entry.has_characteristic_uuid;
+		memcpy(entry.characteristic_uuid, item.entry.characteristic_uuid, 16);
+		entry.att_status = item.entry.att_status;
+		entry.payload_len = item.entry.payload_len;
+		memcpy(entry.payload, item.entry.payload, item.entry.payload_len);
+
 		memset(msg, 0, sizeof(*msg));
-		msg->tag = DBM_TAG_GATT_TRANSCRIPT_RECORD;
-		msg->gatt_transcript.step_index = item.step_index;
-		msg->gatt_transcript.entry.rx_utc_ms = item.entry.rx_utc_ms;
-		msg->gatt_transcript.entry.direction = item.entry.direction;
-		msg->gatt_transcript.entry.kind = item.entry.kind;
-		msg->gatt_transcript.entry.has_service_uuid = item.entry.has_service_uuid;
-		memcpy(msg->gatt_transcript.entry.service_uuid, item.entry.service_uuid, 16);
-		msg->gatt_transcript.entry.has_characteristic_uuid =
-			item.entry.has_characteristic_uuid;
-		memcpy(msg->gatt_transcript.entry.characteristic_uuid,
-		       item.entry.characteristic_uuid, 16);
-		msg->gatt_transcript.entry.att_status = item.entry.att_status;
-		msg->gatt_transcript.entry.payload_len = item.entry.payload_len;
-		memcpy(msg->gatt_transcript.entry.payload, item.entry.payload,
-		       item.entry.payload_len);
+		msg->tag = DBM_TAG_STREAM_CHUNK_BATCH;
+		msg->stream_chunk_batch.id = study_taps[tap_index].id;
+		msg->stream_chunk_batch.records_len = 1;
+
+		struct dbm_stream_record *record = &msg->stream_chunk_batch.records[0];
+
+		record->rx_utc_ms = item.entry.rx_utc_ms;
+
+		int entry_len = dbm_encode_transcript_entry(&entry, record->bytes,
+							     sizeof(record->bytes));
+
+		if (entry_len < 0) {
+			/* Cannot happen for an entry this firmware produced --
+			 * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is one ATT MTU and
+			 * DBM_MAX_STREAM_CHUNK_BYTES is larger -- but counted
+			 * rather than silently skipped, so the study's own
+			 * "NOT exhaustive" report stays true if it ever does.
+			 */
+			transcript_dropped++;
+			k_mutex_unlock(&link_tx_mutex);
+			continue;
+		}
+		record->bytes_len = (uint32_t)entry_len;
 
 		send_message_locked(msg);
 		k_mutex_unlock(&link_tx_mutex);
@@ -210,6 +298,95 @@ static void send_log_line(const char *text)
 	msg->log_line.text[DBM_MAX_LOG_LINE_LEN] = '\0';
 	send_message_locked(msg);
 	k_mutex_unlock(&link_tx_mutex);
+}
+
+/* ---- stream tap open/close (design.md §3 decision 29(a)) ---------------- */
+
+/* Sends StreamOpen/StreamClose for `study_taps[index]` and records the new
+ * state. `dropped` is only meaningful on close.
+ *
+ * Both go out under link_tx_mutex like every other sender, and both are sent
+ * from the dispatch thread only -- the transcript TX thread reads
+ * `tap_open[]` but never writes it, so there is one writer and no lock is
+ * needed to protect the array itself. */
+static void set_tap_open(uint32_t index, bool open, uint32_t dropped)
+{
+	struct dev_bench_message *msg = &tx_scratch;
+
+	k_mutex_lock(&link_tx_mutex, K_FOREVER);
+	memset(msg, 0, sizeof(*msg));
+	if (open) {
+		msg->tag = DBM_TAG_STREAM_OPEN;
+		msg->stream_open.id = study_taps[index].id;
+	} else {
+		msg->tag = DBM_TAG_STREAM_CLOSE;
+		msg->stream_close.id = study_taps[index].id;
+		msg->stream_close.dropped = dropped;
+	}
+	send_message_locked(msg);
+	k_mutex_unlock(&link_tx_mutex);
+
+	tap_open[index] = open;
+	if ((int)index == transcript_tap_index) {
+		transcript_tap_open = open;
+	}
+}
+
+/* Brings every dev-bench-mediated tap's open/closed state into line with what
+ * its declared `StreamScope` says for `step_index`, sending only the
+ * transitions.
+ *
+ * Called before each step runs, so a tap whose window starts at step N is
+ * already open when N's action begins -- and, with `step_index` one past the
+ * last step, as the way to close whatever is still open at the end.
+ *
+ * A DBM_STREAM_SRC_SIGNAL tap is skipped entirely: Core opens that one on its
+ * own carrier, and dev-bench announcing it too would put two producers on one
+ * id. */
+static void sync_taps_for_step(uint32_t step_index)
+{
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		const struct dbm_stream_tap *tap = &study_taps[i];
+
+		if (!dbm_stream_tap_is_ours(tap)) {
+			continue;
+		}
+
+		bool want_open = dbm_stream_tap_covers(tap, step_index);
+
+		if (want_open == tap_open[i]) {
+			continue;
+		}
+		/* `transcript_dropped` is this firmware's only drop counter,
+		 * and the transcript tap is the only tap it can describe --
+		 * every other tap reports 0 because nothing here produces
+		 * records for one yet. Reporting a count that isn't this
+		 * tap's would be worse than reporting none. */
+		uint32_t dropped = (!want_open && (int)i == transcript_tap_index)
+					   ? transcript_dropped
+					   : 0;
+
+		set_tap_open(i, want_open, dropped);
+	}
+}
+
+/* Copies the declared taps out of a decoded StudyStart and resets per-study
+ * tap state. Returns nothing: a study declaring no taps, or only taps this
+ * node doesn't mediate, is perfectly ordinary. */
+static void load_study_taps(const struct dbm_study_start *study)
+{
+	study_taps_len = study->streams_len;
+	transcript_tap_index = -1;
+	transcript_tap_open = false;
+	memset(tap_open, 0, sizeof(tap_open));
+
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		study_taps[i] = study->streams[i];
+		if (study_taps[i].source_tag == DBM_STREAM_SRC_GATT_TRANSCRIPT &&
+		    transcript_tap_index < 0) {
+			transcript_tap_index = (int)i;
+		}
+	}
 }
 
 static void send_study_done(bool completed)
@@ -678,6 +855,12 @@ static void dispatch_study(const struct dbm_study_start *study)
 
 	transcript_dropped = 0;
 
+	/* Taps before steps: a WholeStudy tap has to be open before the first
+	 * action runs, or the first thing it was declared to capture is the
+	 * thing it misses. */
+	load_study_taps(study);
+	sync_taps_for_step(0);
+
 	for (uint32_t i = 0; i < study->steps_len; i++) {
 		const struct dbm_step *step = &study->steps[i];
 		struct action action = step_to_action(step);
@@ -687,6 +870,12 @@ static void dispatch_study(const struct dbm_study_start *study)
 		 * window opened by an *earlier* step -- is attributed to the
 		 * step actually executing (design.md §3 decision 36). */
 		transcript_step_index = i;
+
+		/* Windows that start or end at this step, applied before the
+		 * delay rather than after it: `delay_before_ms` is authored
+		 * time inside the step, and a tap scoped to step i is open for
+		 * the whole of step i, wait included. */
+		sync_taps_for_step(i);
 
 		/* Step::delay_before_ms -- the study's authored "when"
 		 * (embarch-study-designer/design.md §3 decision 42). Deliberately
@@ -728,6 +917,14 @@ static void dispatch_study(const struct dbm_study_start *study)
 	while (k_msgq_num_used_get(&transcript_q) > 0) {
 		k_sleep(K_MSEC(5));
 	}
+
+	/* One past the last step: no scope covers it, so this closes whatever
+	 * is still open -- including a study that ended early on a failed
+	 * step. Deliberately after the drain above, so every record a tap
+	 * produced is on the wire before its own StreamClose is, and Core
+	 * never has to keep bytes that arrived after the close it already
+	 * saw. `transcript_dropped` is final by now for the same reason. */
+	sync_taps_for_step(study->steps_len);
 
 	if (transcript_dropped > 0) {
 		char note[DBM_MAX_LOG_LINE_LEN + 1];

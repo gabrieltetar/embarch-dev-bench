@@ -88,10 +88,16 @@
 #define DBM_MAX_STREAM_RECORDS_PER_BATCH 4
 /* Mirrors embarch-study-designer's limits::MAX_STREAMS_PER_STUDY (schema
  * v9). At its full value rather than shrunk, unlike DBM_MAX_STEPS_PER_STUDY:
- * nothing is stored per tap here yet -- this bounds how many the decoder is
- * willing to *walk* while locating the span `streams_crc` covers -- so
- * mirroring the crate's real ceiling costs no RAM at all, and refusing a tap
- * count Core considers legal would be this firmware inventing a limit. */
+ * refusing a tap count Core considers legal would be this firmware inventing
+ * a limit.
+ *
+ * Taps *are* stored now (Milestone 7 Phase B item 3), but `struct
+ * dbm_stream_tap` is 12 bytes rather than the ~80 a full mirror of
+ * `StreamTap` would cost -- see that struct for why storing `name` and
+ * `encoding` here would be storing host-side knowledge this firmware is
+ * specifically not supposed to hold. Eight of them is under 100 bytes, on a
+ * board whose `sram0_0_seg` has already overflowed twice during this
+ * decision's implementation (design.md §3 decisions 27, 28). */
 #define DBM_MAX_STREAMS_PER_STUDY 8
 
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
@@ -159,26 +165,23 @@ enum dbm_tag {
 	DBM_TAG_STEP_RESULT = 7,
 	DBM_TAG_STUDY_DONE = 8,
 	/* `GattTranscriptRecord`, tag 10 -- **retired by schema v8**
-	 * (embarch-study-designer/design.md §3 decision 39). The transcript
-	 * itself survives untouched: its entry type, its both-directions
+	 * (embarch-study-designer/design.md §3 decision 39) and, as of
+	 * Milestone 7 Phase B item 3, **no longer sent or encoded**. The
+	 * transcript itself is untouched: its entry type, its both-directions
 	 * coverage, its uncapped streaming and its `gatt.csv` columns are all
-	 * unchanged, and an entry now rides as the byte payload of a
-	 * DBM_TAG_STREAM_CHUNK_BATCH record on a tap declared
-	 * `StreamEncoding::GattTranscript`.
+	 * unchanged. An entry now rides as the byte payload of a
+	 * DBM_TAG_STREAM_CHUNK_BATCH record, on whichever tap the Study
+	 * declared `StreamSource::GattTranscript` for.
 	 *
-	 * The tag and its encoder are still here, and main.c still sends it,
-	 * because rewiring that send needs the tap `id` from
-	 * `StudyStart.streams` -- which this firmware does not decode yet.
-	 * That is Milestone 7 Phase B's work (embarch-doc's
-	 * embarch-outpost/milestone-1.md §3), deliberately not started here.
-	 * Until it lands, this firmware emits a message the v8 Rust decoder
-	 * has no variant for. It has never been flashed, which is what makes
-	 * that survivable rather than an outage.
+	 * The tag value is left burned rather than reused. Tags 2/3/4 were
+	 * reused when the old StreamStart/StreamChunk/StreamEnd trio retired,
+	 * and that was safe because no firmware carrying the old shapes had
+	 * ever been flashed. That is no longer the argument available here --
+	 * this firmware is being flashed -- so 10 stays spent.
 	 *
-	 * `dbm_encode_transcript_entry` below is the piece that carries
+	 * `dbm_encode_transcript_entry` below is the piece that carried
 	 * forward: it emits exactly the entry bytes a stream record's payload
-	 * holds, and is what the cross-language pinning now covers. */
-	DBM_TAG_GATT_TRANSCRIPT_RECORD = 10,
+	 * holds, and is what the cross-language pinning covers. */
 };
 
 /* Mirrors `GattDirection` (embarch-study-designer src/gatt.rs). Append-only,
@@ -228,11 +231,6 @@ struct dbm_gatt_transcript_entry {
 	uint8_t att_status;
 	uint16_t payload_len;
 	uint8_t payload[DBM_MAX_TRANSCRIPT_PAYLOAD_LEN];
-};
-
-struct dbm_gatt_transcript_record {
-	uint32_t step_index;
-	struct dbm_gatt_transcript_entry entry;
 };
 
 /* Mirrors embarch-study-designer's `Unit` (src/sample.rs). Append-only, same
@@ -301,6 +299,72 @@ struct dbm_stream_chunk_batch {
 	struct dbm_stream_record records[DBM_MAX_STREAM_RECORDS_PER_BATCH];
 	uint32_t records_len;
 };
+
+/* Mirrors `StreamSource`'s variant order (embarch-study-designer
+ * src/streams.rs). Positional, like every other tag mirror here. */
+enum dbm_stream_source_tag {
+	DBM_STREAM_SRC_GATT_NOTIFY = 0,
+	DBM_STREAM_SRC_POWER_FRONT_END = 1,
+	DBM_STREAM_SRC_GATT_TRANSCRIPT = 2,
+	DBM_STREAM_SRC_DEV_BENCH_LOG = 3,
+	DBM_STREAM_SRC_SIGNAL = 4,
+};
+
+/* Mirrors `StreamScope` (embarch-study-designer src/streams.rs). */
+enum dbm_stream_scope_tag {
+	DBM_STREAM_SCOPE_WHOLE_STUDY = 0,
+	DBM_STREAM_SCOPE_STEPS = 1,
+};
+
+/* One declared tap, as much of it as **this node acts on** -- schema v9's
+ * `StreamTap` (embarch-study-designer src/streams.rs, §4.8), deliberately
+ * not mirrored in full.
+ *
+ * `StreamTap` declares four things: where the bytes come from, how long the
+ * tap lives, how to render what arrives, and what to call the output. Only
+ * the first two are dev-bench's business. `encoding` is what a payload
+ * *means*, and decision 39's entire premise is that dev-bench stamps arrival
+ * and interprets nothing -- storing an encoding here would be storing the
+ * one thing this firmware exists not to know. `name` names a file in Core's
+ * results directory, which this node never sees.
+ *
+ * So this is 12 bytes rather than the ~80 a full mirror would cost, and the
+ * decoder still *walks* the fields it doesn't keep (it has to: postcard
+ * carries no per-field length, so skipping to `scope` means parsing `name`
+ * and `encoding` whether or not you keep them).
+ *
+ * `source_tag` is kept, though dev-bench interprets nothing, because it is
+ * not about meaning: it says which node produces the bytes. A
+ * DBM_STREAM_SRC_SIGNAL tap is Core's to open (`StreamSource::
+ * is_dev_bench_mediated`), and dev-bench must not open it or Core would see
+ * two producers on one id. */
+struct dbm_stream_tap {
+	uint8_t id;
+	uint8_t source_tag; /* enum dbm_stream_source_tag */
+	uint8_t scope_tag;  /* enum dbm_stream_scope_tag */
+	/* Both inclusive, and meaningful only for DBM_STREAM_SCOPE_STEPS. */
+	uint32_t scope_from;
+	uint32_t scope_to;
+};
+
+/* Mirrors `StreamScope::covers` (embarch-study-designer src/streams.rs) --
+ * whether this tap is open while `step_index` runs. `to` is inclusive; a
+ * single-step window is `from == to`. */
+static inline bool dbm_stream_tap_covers(const struct dbm_stream_tap *tap, uint32_t step_index)
+{
+	if (tap->scope_tag == DBM_STREAM_SCOPE_WHOLE_STUDY) {
+		return true;
+	}
+	return step_index >= tap->scope_from && step_index <= tap->scope_to;
+}
+
+/* Whether dev-bench is the node that produces this tap's bytes. Mirrors
+ * `StreamSource::is_dev_bench_mediated`: everything except a Signal tap,
+ * which Core opens on its own carrier. */
+static inline bool dbm_stream_tap_is_ours(const struct dbm_stream_tap *tap)
+{
+	return tap->source_tag != DBM_STREAM_SRC_SIGNAL;
+}
 
 struct dbm_log_line {
 	char text[DBM_MAX_LOG_LINE_LEN + 1];
@@ -413,13 +477,16 @@ struct dbm_study_start {
 	 * step's action wasn't BleAdvertise -- see dbm_decode_frame's own doc
 	 * comment for why CRC can't be computed in that case. */
 	bool steps_crc_valid;
-	/* How many `StreamTap`s the decoder walked past (schema v9, design.md
-	 * §3 decision 39 and its 2026-08-25 amendment). The taps themselves are
-	 * **not stored**: this firmware doesn't open them yet, and walking them
-	 * is what locates the span `streams_crc` covers -- the same walk-and-
-	 * discard this decoder already does for `BleAdvertise::service_uuids`.
-	 * Opening taps for real is Milestone 7 Phase B item 3's, and that is
-	 * when this grows a `streams[]` array. */
+	/* The declared `StreamTap`s (schema v9, design.md §3 decision 39 and
+	 * its 2026-08-25 amendment), as much of each as this node acts on --
+	 * see `struct dbm_stream_tap` for what is deliberately not kept.
+	 *
+	 * Stored as of Milestone 7 Phase B item 3. Before that the decoder
+	 * walked and discarded them, because walking is what locates the span
+	 * `streams_crc` covers and nothing here opened a tap; the walker that
+	 * pass added is exactly what this one needed, which is why item 0's
+	 * +654 bytes was that cost arriving early rather than waste. */
+	struct dbm_stream_tap streams[DBM_MAX_STREAMS_PER_STUDY];
 	uint32_t streams_len;
 	uint32_t streams_crc;
 	/* Not part of the wire format, same as `steps_crc_valid` above:
@@ -509,7 +576,6 @@ struct dev_bench_message {
 		struct dbm_study_start study_start;
 		struct dbm_step_result step_result;
 		struct dbm_study_done study_done;
-		struct dbm_gatt_transcript_record gatt_transcript;
 	};
 };
 
