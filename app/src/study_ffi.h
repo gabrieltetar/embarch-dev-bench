@@ -33,7 +33,7 @@ int study_ffi_decode_and_verify(const uint8_t *input, size_t input_len, bool *ou
  * CRC-mismatch and unsupported-action both fail whole, no partial write).
  *
  * NOTE: this decodes a postcard-encoded `Study` (embarch-study-designer's
- * `study::Study`: name + steps + validations + steps_crc), NOT the leaner
+ * `study::Study`: name + steps + steps_crc), NOT the leaner
  * `DevBenchMessage::StudyStart` (steps + steps_crc only) this firmware
  * actually receives over the wire (serial_protocol.h) -- those are two
  * different postcard shapes, not interchangeable byte-for-byte. main.c's

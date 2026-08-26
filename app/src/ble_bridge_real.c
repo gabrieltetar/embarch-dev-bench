@@ -1911,7 +1911,7 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 			return outcome_fail("disconnected during stream capture");
 		}
 		/* Running the window to completion is the outcome; whether any
-		 * samples arrived is Core-side post-hoc validation's question
+		 * samples arrived is a host-side question
 		 * (embarch-study-designer/design.md §3 decision 19). */
 		return outcome_pass();
 	}
