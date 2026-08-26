@@ -178,6 +178,7 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 	case 0: /* Raw */
 	case 1: /* Text */
 	case 3: /* GattTranscript */
+	case 4: /* OutpostTrace -- a unit variant as of schema v11 */
 		break;
 	case 2: /* Samples { layout, unit, channel_id } */
 		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
@@ -190,11 +191,6 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 			return -1;
 		}
 		(*pos)++; /* channel_id: u8 */
-		break;
-	case 4: /* OutpostTrace { manifest_crc } */
-		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0) {
-			return -1;
-		}
 		break;
 	default:
 		return -1;

@@ -82,6 +82,60 @@ if(NOT APP_FIRMWARE_VERSION)
 endif()
 target_compile_definitions(app PRIVATE APP_FIRMWARE_VERSION="${APP_FIRMWARE_VERSION}")
 
+# Where embarch-study-designer lives. Resolved for *every* target, not just the
+# ones that cross-compile it: the native_sim build links no crate but still has
+# to report the crate's wire schema version, and hand-mirroring that number is
+# how it went stale twice (see below).
+if(DEFINED ENV{EMBARCH_STUDY_DESIGNER_PATH})
+  set(ESSD_DIR "$ENV{EMBARCH_STUDY_DESIGNER_PATH}")
+else()
+  # CMAKE_CURRENT_SOURCE_DIR here is workspaces/<name>/app, itself a
+  # symlink to the real app/ (§2's tree). Resolve *that* symlink first, in
+  # its own get_filename_component call -- CMake's REALPATH collapses ".."
+  # textually before resolving symlinks, so appending "../../embarch-study-
+  # designer" and resolving in one call never actually follows the
+  # symlink: the ".." components cancel the still-unresolved "app" segment
+  # lexically, landing in workspaces/embarch-study-designer (which doesn't
+  # exist) instead of climbing out of the real app/'s real parent. Found
+  # standing up workspaces/espressif (embarch-dev-bench/design.md's
+  # ESP32-C5 interim decision) -- a real CMake-path-resolution bug, latent
+  # in every other workspace too, just unnoticed because plain ABSOLUTE
+  # (the original code here) happened to still be wrong in the same way
+  # nobody hit until a workspace where the surrounding symlink chain
+  # differed enough to surface it.
+  get_filename_component(ESSD_APP_REALDIR "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
+  get_filename_component(ESSD_DIR "${ESSD_APP_REALDIR}/../../embarch-study-designer" ABSOLUTE)
+endif()
+if(NOT EXISTS "${ESSD_DIR}/Cargo.toml")
+  message(FATAL_ERROR "embarch-dev-bench: embarch-study-designer not found at ${ESSD_DIR} -- set EMBARCH_STUDY_DESIGNER_PATH if it isn't a sibling of this repo.")
+endif()
+
+# The stub's `study_ffi_schema_version()` answer, read out of the crate rather
+# than mirrored by hand in C.
+#
+# It was a hand-written `#define`, and it went stale twice: found four bumps
+# behind at v4 while implementing v9, fixed to 9, and found stale again at 9
+# one bump later when decision 47 took the wire to 10. The comment written the
+# first time already said nothing compares this number against the crate --
+# which was true, and stayed true, and let the same defect recur immediately.
+# Reading it from the crate's own source is what actually closes that, and the
+# CONFIGURE_DEPENDS below is what makes an edit to that file re-run this
+# instead of leaving a stale value baked in -- the same trap APP_FIRMWARE_VERSION
+# hit above.
+if(CONFIG_ARCH_POSIX)
+  set(ESSD_SCHEMA_SRC "${ESSD_DIR}/src/schema_version.rs")
+  if(NOT EXISTS "${ESSD_SCHEMA_SRC}")
+    message(FATAL_ERROR "embarch-dev-bench: ${ESSD_SCHEMA_SRC} not found -- the native_sim build reads DEV_BENCH_WIRE_SCHEMA_VERSION from it.")
+  endif()
+  set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${ESSD_SCHEMA_SRC}")
+  file(READ "${ESSD_SCHEMA_SRC}" _essd_schema_src)
+  if(NOT _essd_schema_src MATCHES "pub const DEV_BENCH_WIRE_SCHEMA_VERSION: u32 = ([0-9]+)")
+    message(FATAL_ERROR "embarch-dev-bench: could not read DEV_BENCH_WIRE_SCHEMA_VERSION out of ${ESSD_SCHEMA_SRC}.")
+  endif()
+  target_compile_definitions(app PRIVATE STUDY_FFI_STUB_SCHEMA_VERSION=${CMAKE_MATCH_1})
+  message(STATUS "embarch-dev-bench: dev-bench wire schema version ${CMAKE_MATCH_1} (from the crate)")
+endif()
+
 # embarch-dev-bench/design.md §3 decision 8: cross-compile
 # embarch-study-designer's Rust FFI staticlib as part of `west build` itself,
 # so there's exactly one build command a developer runs. Implemented as a
@@ -96,30 +150,6 @@ target_compile_definitions(app PRIVATE APP_FIRMWARE_VERSION="${APP_FIRMWARE_VERS
 # ble_bridge_stub.c's own reasoning above -- a host-only sanity board doesn't
 # need the real decode/CRC logic to be useful.
 if(NOT CONFIG_ARCH_POSIX)
-  if(DEFINED ENV{EMBARCH_STUDY_DESIGNER_PATH})
-    set(ESSD_DIR "$ENV{EMBARCH_STUDY_DESIGNER_PATH}")
-  else()
-    # CMAKE_CURRENT_SOURCE_DIR here is workspaces/<name>/app, itself a
-    # symlink to the real app/ (§2's tree). Resolve *that* symlink first, in
-    # its own get_filename_component call -- CMake's REALPATH collapses ".."
-    # textually before resolving symlinks, so appending "../../embarch-study-
-    # designer" and resolving in one call never actually follows the
-    # symlink: the ".." components cancel the still-unresolved "app" segment
-    # lexically, landing in workspaces/embarch-study-designer (which doesn't
-    # exist) instead of climbing out of the real app/'s real parent. Found
-    # standing up workspaces/espressif (embarch-dev-bench/design.md's
-    # ESP32-C5 interim decision) -- a real CMake-path-resolution bug, latent
-    # in every other workspace too, just unnoticed because plain ABSOLUTE
-    # (the original code here) happened to still be wrong in the same way
-    # nobody hit until a workspace where the surrounding symlink chain
-    # differed enough to surface it.
-    get_filename_component(ESSD_APP_REALDIR "${CMAKE_CURRENT_SOURCE_DIR}" REALPATH)
-    get_filename_component(ESSD_DIR "${ESSD_APP_REALDIR}/../../embarch-study-designer" ABSOLUTE)
-  endif()
-  if(NOT EXISTS "${ESSD_DIR}/Cargo.toml")
-    message(FATAL_ERROR "embarch-dev-bench: embarch-study-designer not found at ${ESSD_DIR} -- set EMBARCH_STUDY_DESIGNER_PATH if it isn't a sibling of this repo.")
-  endif()
-
   # Board -> Rust target triple. nRF54L15's cpuapp core is Cortex-M33
   # (Armv8-M Mainline) -> thumbv8m.main-none-eabi. Deliberately the *soft*-float
   # variant, not -eabihf: this app's Zephyr build has no CONFIG_FPU / hard-float
