@@ -25,6 +25,83 @@
 
 static dev_bench_log_sink_fn log_sink;
 
+/* The level this backend will forward, independent of Zephyr's own runtime
+ * filter.
+ *
+ * **Why both, when `log_filter_set` already exists.** The runtime filter is
+ * the efficient half — it stops the log core allocating and formatting a
+ * record nobody wants. It cannot be the *correct* half on its own, because it
+ * is only in force from whenever something first calls it, and every source
+ * starts at the compiled-in level (now `DBG`, decision 39) from log-init until
+ * then. Found live: the boot backlog came back full of `<dbg> os: z_tick_sleep`
+ * records from early boot, which had pushed the one line that mattered — the
+ * boot record decision 38 exists for — straight out of an 8-slot ring.
+ *
+ * Checking here too costs one comparison per record and removes the ordering
+ * question entirely: this backend forwards nothing above the current level, no
+ * matter who has or hasn't called `log_filter_set` yet. */
+static uint8_t current_level = DEV_BENCH_LOG_BOOT_LEVEL;
+
+/* Whether a record at `level` from `source` should be forwarded, applying the
+ * same app-module floor `dev_bench_log_set_level` applies to the runtime
+ * filter — the two must agree, or the floor would hold only after the first
+ * study and not during the boot that needs it most. */
+static bool record_passes(uint8_t level, const void *source)
+{
+	if (current_level == DBM_LOG_LEVEL_OFF) {
+		return false;
+	}
+
+	/* A `printk` routed through the log subsystem (CONFIG_LOG_PRINTK, which
+	 * decision 38 turned on so a stray printk cannot corrupt a COBS frame)
+	 * arrives as LOG_LEVEL_INTERNAL_RAW_STRING -- which is LOG_LEVEL_NONE,
+	 * i.e. 0, i.e. *below every level*, and Zephyr's own filtering logs it
+	 * unconditionally by design.
+	 *
+	 * Taken as INF here rather than as level 0. Found live on the ESP32-C5:
+	 * Espressif's HAL announces itself over printk at boot ("I (BLE_INIT):
+	 * ble controller commit:...", "D (phy_init): ..."), and as level 0 those
+	 * lines outranked everything, sailed past the idle filter, and filled the
+	 * 8-slot boot backlog -- pushing out the boot record it exists to carry.
+	 * They are informational subsystem chatter, so they are treated as
+	 * informational: dropped at the idle level, and delivered to a study that
+	 * asks for `Info`. This does not weaken CONFIG_LOG_PRINTK's real job,
+	 * which is that such output is *framed* rather than raw on the wire. */
+	if (level == LOG_LEVEL_INTERNAL_RAW_STRING) {
+		/* Answered here and never falling through to the source lookup
+		 * below, which would be a wild dereference: for these records
+		 * Zephyr does not store a source pointer in that field at all --
+		 * it stores an `is_raw` flag, literally `(const void *)0` or
+		 * `(const void *)1` (see Z_LOG_PRINTK). Reading it as a source
+		 * would dereference address 1. A printk has no module to be the
+		 * app's anyway. */
+		return DBM_LOG_LEVEL_INF <= current_level;
+	}
+
+	const char *name = (source == NULL)
+				   ? NULL
+				   : log_source_name_get(Z_LOG_LOCAL_DOMAIN_ID,
+							  log_source_id(source));
+
+	/* The kernel's own ceiling, checked before the requested level rather
+	 * than after: this one caps *downward* whatever a study asked for, and
+	 * it is what stops logging from generating logging (dev_bench_log.h). */
+	if (name != NULL && strcmp(name, DEV_BENCH_LOG_KERNEL_MODULE) == 0) {
+		return level <= DEV_BENCH_LOG_KERNEL_CEILING;
+	}
+
+	if (level <= current_level) {
+		return true;
+	}
+	if (level > DBM_LOG_LEVEL_INF) {
+		return false;
+	}
+
+	/* At or below INF and above the current level: the app's own module is
+	 * the one source allowed through (dev_bench_log.h). */
+	return name != NULL && strcmp(name, DEV_BENCH_LOG_APP_MODULE) == 0;
+}
+
 /* Set once by the log subsystem's own panic path and never cleared: from that
  * point the system is stopping and every line takes the lock-free route. */
 static bool log_panic_mode;
@@ -152,6 +229,10 @@ static void dev_bench_log_process(const struct log_backend *const backend,
 {
 	ARG_UNUSED(backend);
 
+	if (!record_passes(log_msg_get_level(&msg->log), log_msg_get_source(&msg->log))) {
+		return;
+	}
+
 	/* LEVEL, and deliberately no TIMESTAMP: the whole line budget is
 	 * DBM_MAX_LOG_LINE_LEN (128) and log_output's timestamp costs 19 of it,
 	 * while Core stamps every line's arrival into the debug file on the same
@@ -258,6 +339,25 @@ uint32_t dev_bench_log_backlog_dropped(void)
 
 uint8_t dev_bench_log_set_level(uint8_t level)
 {
+	/* **Drain what the old level admitted before changing it.**
+	 *
+	 * Deferred logging separates when a record is *created* from when this
+	 * backend *forwards* it, and `record_passes` necessarily judges it at
+	 * forward time. The log thread wakes on a 10-record threshold or a 1
+	 * second timeout, so a short study can finish, revert to the idle level,
+	 * and only then have its own records looked at -- and dropped, under a
+	 * level that was not in force when they were made.
+	 *
+	 * That is not hypothetical: a `Debug` study whose body ran in ~50 ms
+	 * produced exactly nothing on hardware for this reason, after the same
+	 * study had been fixed twice for other causes. Flushing here means no
+	 * record ever straddles a level change, in either direction. */
+	log_flush();
+
+	/* Set first and unconditionally: this is the half that is always in
+	 * force, including on a build without runtime filtering at all. */
+	current_level = level;
+
 #ifdef CONFIG_LOG_RUNTIME_FILTERING
 	uint32_t sources = log_src_cnt_get(Z_LOG_LOCAL_DOMAIN_ID);
 	uint8_t reached = 0;
@@ -265,15 +365,24 @@ uint8_t dev_bench_log_set_level(uint8_t level)
 	for (uint32_t src = 0; src < sources; src++) {
 		uint8_t want = level;
 
+		const char *name = log_source_name_get(Z_LOG_LOCAL_DOMAIN_ID, src);
+
 		/* The app's own module keeps at least INF unless the request is
 		 * an explicit Off -- dev_bench_log.h explains why. */
-		if (level != DBM_LOG_LEVEL_OFF) {
-			const char *name = log_source_name_get(Z_LOG_LOCAL_DOMAIN_ID, src);
+		if (level != DBM_LOG_LEVEL_OFF && name != NULL &&
+		    strcmp(name, DEV_BENCH_LOG_APP_MODULE) == 0 &&
+		    want < DBM_LOG_LEVEL_INF) {
+			want = DBM_LOG_LEVEL_INF;
+		}
 
-			if (name != NULL && strcmp(name, DEV_BENCH_LOG_APP_MODULE) == 0 &&
-			    want < DBM_LOG_LEVEL_INF) {
-				want = DBM_LOG_LEVEL_INF;
-			}
+		/* ...and the kernel never goes above its ceiling. Applied to the
+		 * core filter as well as in `record_passes`, and that is the half
+		 * that matters here: this stops the record being *created*, so
+		 * the feedback loop dev_bench_log.h describes never starts rather
+		 * than being dropped one step later. */
+		if (name != NULL && strcmp(name, DEV_BENCH_LOG_KERNEL_MODULE) == 0 &&
+		    want > DEV_BENCH_LOG_KERNEL_CEILING) {
+			want = DEV_BENCH_LOG_KERNEL_CEILING;
 		}
 
 		uint32_t actual =
