@@ -37,7 +37,16 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	(void)timeout_ms;
 	/* No captured_data either: a canned Pass has no DUT bytes behind it, and
 	 * inventing some would let a native_sim run look like it exchanged real
-	 * data. */
+	 * data.
+	 *
+	 * And no `security_level` (embarch-study-designer/design.md §3 decision
+	 * 44), for exactly the
+	 * same reason and more sharply: there is no link here, so there is no
+	 * level. A stub that reported L4 would let a native_sim run produce a
+	 * StepResult indistinguishable from a real authenticated pairing --
+	 * the one claim this suite must never manufacture. `has_security_level`
+	 * stays false, which reads as "there was no connection to ask about",
+	 * which is the truth. */
 	return (struct outcome){.kind = OUTCOME_PASS};
 }
 
@@ -64,6 +73,11 @@ bool ble_bridge_monitor_window_open(void)
 {
 	/* No window is ever opened here, so main.c never has one to close. */
 	return false;
+}
+
+void ble_bridge_clear_bonds(void)
+{
+	/* No bonding table without a BT host. */
 }
 
 void ble_bridge_reset(void)

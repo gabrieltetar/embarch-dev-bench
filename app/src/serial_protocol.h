@@ -371,7 +371,8 @@ struct dbm_log_line {
 };
 
 /* Mirrors embarch-study-designer's `Action` (src/study.rs), one variant per
- * enum tag -- design.md §3 decisions 31/32 added the last two of these.
+ * enum tag -- embarch-study-designer/design.md §3 decisions 44/50 added the
+ * last two of these.
  * Append-only, same discipline as `enum dbm_tag`: the tag values below match
  * `Action`'s own declared variant order exactly, since postcard encodes an
  * enum discriminant positionally. */
@@ -386,7 +387,40 @@ enum dbm_action_tag {
 	 * field-less, same as GattDiscover/GattMonitorAll. */
 	DBM_ACTION_GATT_MONITOR_START = 5,
 	DBM_ACTION_GATT_MONITOR_STOP = 6,
+	/* embarch-study-designer/design.md §3 decisions 44/50, schema v12 --
+	 * the first Action variant since BleConnect to carry a field, and one
+	 * that carries none. Appended, never inserted: postcard encodes the
+	 * discriminant positionally, so inserting would shift both of these
+	 * and every future one. */
+	DBM_ACTION_BLE_SECURITY = 7,
+	DBM_ACTION_BLE_UNBOND = 8,
 };
+
+/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs, design.md §3
+ * decision 44). Values are postcard discriminants -- the enum's *declaration*
+ * order, which is NOT the spec's level number: L1 encodes as 0. That offset
+ * is the whole reason this mirror is spelled out rather than assumed, and
+ * `dbm_security_level_number()` below is the one place it is undone.
+ *
+ * L1 is carried because `StepResult.security_level` reports it (a link that
+ * never got encrypted is exactly the answer a study debugging a
+ * security-requiring DUT needs); no study may *request* it, and
+ * ble_bridge_real.c fails such a step rather than treating it as a no-op. */
+enum dbm_security_level {
+	DBM_SECURITY_L1 = 0,
+	DBM_SECURITY_L2 = 1,
+	DBM_SECURITY_L3 = 2,
+	DBM_SECURITY_L4 = 3,
+};
+
+/* The Bluetooth spec's own level number for a `enum dbm_security_level` --
+ * 1 for DBM_SECURITY_L1, and so on. The one place the declaration-order/
+ * level-number offset is undone, so no log line or fail_reason computes it
+ * itself. */
+static inline uint8_t dbm_security_level_number(uint8_t level)
+{
+	return (uint8_t)(level + 1);
+}
 
 /* Mirrors the FFI-side EssdBleAdvertiseAction shape 1:1 -- see study_ffi.h. */
 struct dbm_ble_advertise_action {
@@ -440,6 +474,15 @@ struct dbm_data_exchange_action {
 	struct dbm_gatt_operation operation;
 };
 
+/* Mirrors `Action::BleSecurity` (embarch-study-designer/src/study.rs,
+ * design.md §3 decision 44). One field, encoded as a varint after the action
+ * tag. `Action::BleUnbond` (that doc's decision 50) is field-less and needs no
+ * struct,
+ * same as the GattDiscover/GattMonitor* family below. */
+struct dbm_ble_set_security_action {
+	uint8_t level; /* enum dbm_security_level */
+};
+
 /* Action::GattDiscover/GattMonitorAll (design.md §3 decisions 31/32) are both
  * field-less -- no struct needed; `dbm_step.action_tag` alone identifies
  * them, matching this crate's "simplest possible FFI/wire surface" framing
@@ -461,8 +504,10 @@ struct dbm_step {
 		struct dbm_ble_advertise_action advertise;
 		struct dbm_ble_connect_action connect;
 		struct dbm_data_exchange_action data_exchange;
-		/* DBM_ACTION_GATT_DISCOVER/DBM_ACTION_GATT_MONITOR_ALL carry no
-		 * fields of their own. */
+		struct dbm_ble_set_security_action set_security;
+		/* DBM_ACTION_GATT_DISCOVER/DBM_ACTION_GATT_MONITOR_ALL/
+		 * DBM_ACTION_GATT_MONITOR_START/DBM_ACTION_GATT_MONITOR_STOP/
+		 * DBM_ACTION_BLE_UNBOND carry no fields of their own. */
 	} action;
 };
 
@@ -553,6 +598,18 @@ struct dbm_step_result_payload {
 	bool has_gatt_activity;
 	struct dbm_gatt_activity_record gatt_activity[DBM_MAX_GATT_ACTIVITY_RECORDS];
 	uint32_t gatt_activity_len;
+	/* `StepResult.security_level: Option<SecurityLevel>` -- schema v12's
+	 * trailing field (embarch-study-designer/design.md §3 decision 44).
+	 * Encoded last, after gatt_activity, so this is one appended Option
+	 * byte rather than a re-shuffle of a message this firmware sends more
+	 * than any other.
+	 *
+	 * Populated for *every* step, not only a security one: whichever level
+	 * the link happened to be at is what makes a later step's failure
+	 * legible, and `false` here means "there was no connection to ask
+	 * about", never "nobody looked". */
+	bool has_security_level;
+	uint8_t security_level; /* enum dbm_security_level */
 };
 
 struct dbm_step_result {

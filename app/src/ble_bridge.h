@@ -109,6 +109,30 @@ enum action_kind {
 	 * capture is live. */
 	ACTION_GATT_MONITOR_START,
 	ACTION_GATT_MONITOR_STOP,
+	/* embarch-study-designer/design.md §3 decisions 44/50. The first is
+	 * the only action here that carries a field and does no GATT at all;
+	 * the second is field-less and, uniquely among these, *drops the
+	 * link* as a documented consequence (Zephyr's bt_unpair disconnects a
+	 * peer whose keys it clears). */
+	ACTION_BLE_SECURITY,
+	ACTION_BLE_UNBOND,
+};
+
+/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs). Values are
+ * the wire discriminants, NOT the spec's level numbers -- BLE_SECURITY_L1 is
+ * 0. serial_protocol.h's `enum dbm_security_level` carries the same values
+ * and `dbm_security_level_number()` is where the offset is undone; this
+ * header keeps its own copy so it stays independent of the link protocol's,
+ * the same way BLE_MAX_PAYLOAD_LEN already mirrors DBM_MAX_PAYLOAD_LEN. */
+enum ble_security_level {
+	BLE_SECURITY_L1 = 0,
+	BLE_SECURITY_L2 = 1,
+	BLE_SECURITY_L3 = 2,
+	BLE_SECURITY_L4 = 3,
+};
+
+struct ble_set_security_params {
+	uint8_t level; /* enum ble_security_level */
 };
 
 struct action {
@@ -117,9 +141,10 @@ struct action {
 		struct ble_advertise_params advertise;
 		struct ble_connect_params connect;
 		struct data_exchange_params data_exchange;
+		struct ble_set_security_params set_security;
 		/* ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL/
-		 * ACTION_GATT_MONITOR_START/ACTION_GATT_MONITOR_STOP carry no
-		 * params. */
+		 * ACTION_GATT_MONITOR_START/ACTION_GATT_MONITOR_STOP/
+		 * ACTION_BLE_UNBOND carry no params. */
 	};
 };
 
@@ -188,6 +213,19 @@ struct outcome {
 	 * NULL/0 for every other action kind, including ACTION_GATT_DISCOVER. */
 	const struct ble_gatt_activity_record *gatt_activity;
 	size_t gatt_activity_count;
+
+	/* The link's BLE security level when this action finished, mirroring
+	 * `StepResult.security_level` (embarch-study-designer/src/result.rs,
+	 * embarch-study-designer/design.md §3 decision 44).
+	 *
+	 * Set for **every** action kind, not just ACTION_BLE_SECURITY:
+	 * whichever level the link was at is what makes a later step's failure
+	 * legible ("disconnected during service discovery" at L1 and the same
+	 * failure at L4 are different findings). `has_security_level == false`
+	 * means there was no connection to ask about -- never "nobody
+	 * looked". */
+	bool has_security_level;
+	uint8_t security_level; /* enum ble_security_level */
 };
 
 /* Brings up the BLE bridge (Zephyr BT host enable for _real; a no-op for
@@ -305,12 +343,34 @@ void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data);
  * (design.md §3 decision 36). */
 bool ble_bridge_monitor_window_open(void);
 
+/* Clears every bond in dev-bench's in-RAM BT bonding table
+ * (embarch-dev-bench/design.md §3 decision 37 -- **a study is the bond's
+ * lifetime**). main.c calls this at the end of every study so a second run
+ * of a study behaves like the first, which is the failure mode study-scoped
+ * bonding exists to avoid; ble_bridge_reset() below calls it too, since a
+ * Hello is a hard reset.
+ *
+ * **This drops an active link.** Zephyr's bt_unpair disconnects a peer whose
+ * keys it clears, and this waits for that disconnect rather than returning
+ * while active_conn is still populated -- the same race ble_bridge_reset()
+ * already had to fix once. No-op for _stub, which has no bonding table.
+ *
+ * Bonds were RAM-only before this and still are: CONFIG_BT_SETTINGS is
+ * deliberately not enabled, so nothing survives a reboot either way. What
+ * this adds is a *bounded* lifetime within one power cycle. */
+void ble_bridge_clear_bonds(void);
+
 /* embarch-dev-bench/design.md §3 decision 11: a fresh Hello unconditionally
- * clears dev-bench's in-RAM BT bonding table (Just Works pairing only, never
- * persisted to flash — not enabling CONFIG_BT_SETTINGS already keeps bonds
- * RAM-only; this clears them explicitly rather than letting them accumulate
- * across a session's repeated Hello handshakes). No-op for _stub, which has
- * no bonding table to clear. */
+ * clears dev-bench's in-RAM BT bonding table (never persisted to flash — not
+ * enabling CONFIG_BT_SETTINGS already keeps bonds RAM-only; this clears them
+ * explicitly rather than letting them accumulate across a session's repeated
+ * Hello handshakes). No-op for _stub, which has no bonding table to clear.
+ *
+ * Decision 11's "Just Works pairing only" half is **superseded by decision
+ * 37**: dev-bench now declares a DisplayYesNo-class IO capability and
+ * auto-confirms, so an authored ACTION_BLE_SECURITY can reach an
+ * authenticated key. Just Works is still what happens when the peer's own IO
+ * capability forces it. */
 void ble_bridge_reset(void);
 
 #endif /* EMBARCH_DEV_BENCH_BLE_BRIDGE_H_ */
