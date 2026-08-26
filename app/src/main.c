@@ -500,6 +500,14 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 		msg->step_result.result.has_gatt_activity = true;
 	}
 
+	/* `security_level` (embarch-study-designer/design.md §3 decision 44) --
+	 * the bridge stamps this for every action kind, so this is a straight
+	 * pass-through and not a per-action-kind decision. `enum
+	 * ble_security_level` and `enum dbm_security_level` carry the same
+	 * values by construction (both headers say so), so no remapping. */
+	msg->step_result.result.has_security_level = bridge_outcome->has_security_level;
+	msg->step_result.result.security_level = bridge_outcome->security_level;
+
 	send_message_locked(msg);
 	k_mutex_unlock(&link_tx_mutex);
 }
@@ -713,7 +721,8 @@ static bool handle_hello(const struct dbm_hello *hello)
 
 /* Translates one decoded `struct dbm_step`'s action into the `struct action`
  * ble_bridge.h's shared BleAdvertise/BleConnect/DataExchange/GattDiscover/
- * GattMonitorAll surface expects — a direct field-by-field mapping per kind,
+ * GattMonitorAll/GattMonitorStart/GattMonitorStop/BleSecurity/BleUnbond
+ * surface expects — a direct field-by-field mapping per kind,
  * decision 21's own original BleAdvertise-only translation extended to cover
  * decisions 31/32's two new kinds and the BleConnect/DataExchange dispatch
  * that had never actually been wired up to a real decoded `Study` before
@@ -796,6 +805,19 @@ static struct action step_to_action(const struct dbm_step *step)
 		action.kind = ACTION_GATT_MONITOR_STOP;
 		break;
 
+	case DBM_ACTION_BLE_SECURITY:
+		action.kind = ACTION_BLE_SECURITY;
+		/* Straight copy: `enum dbm_security_level` and `enum
+		 * ble_security_level` carry the same values by construction
+		 * (each header states it), and the decoder already refused any
+		 * value outside the range. */
+		action.set_security.level = step->action.set_security.level;
+		break;
+
+	case DBM_ACTION_BLE_UNBOND:
+		action.kind = ACTION_BLE_UNBOND;
+		break;
+
 	default:
 		/* Unreachable: serial_protocol.c's own decode already rejected any
 		 * action tag it doesn't recognize (has_unsupported_action) before a
@@ -808,12 +830,14 @@ static struct action step_to_action(const struct dbm_step *step)
 
 /* Real per-`Study` dispatch (embarch-dev-bench/design.md §3 decision 21) —
  * every `Action` kind embarch-study-designer defines is dispatched now
- * (decisions 31/32 close the BleAdvertise-only scope this originally
- * shipped with). `study`/`serial_protocol.c`'s own decode already rejected
+ * (decisions 31/32 closed the BleAdvertise-only scope this originally
+ * shipped with; embarch-study-designer decisions 44/50 added the security
+ * pair). `study`/`serial_protocol.c`'s own decode already rejected
  * any action kind it doesn't recognize at all (`has_unsupported_action`)
  * rather than partially decoding it, so by the time a `struct
  * dbm_study_start` reaches here every step in
- * `study->steps[0..study->steps_len)` is one of today's five known kinds.
+ * `study->steps[0..study->steps_len)` is one of today's nine known kinds
+ * (schema v12 added ACTION_BLE_SECURITY/ACTION_BLE_UNBOND).
  *
  * `steps_crc` was already verified during decode (serial_protocol.c's own
  * CRC-32 over the raw wire bytes of `steps`, independently reproducing
@@ -925,6 +949,21 @@ static void dispatch_study(const struct dbm_study_start *study)
 	 * never has to keep bytes that arrived after the close it already
 	 * saw. `transcript_dropped` is final by now for the same reason. */
 	sync_taps_for_step(study->steps_len);
+
+	/* **A study is a bond's lifetime** (embarch-dev-bench/design.md §3
+	 * decision 37). Cleared here so a second run of a study behaves like
+	 * the first -- a bench that silently pairs differently on the second
+	 * run is the failure study-scoped bonding exists to avoid, and it is
+	 * the reading the repo owner asked for by name.
+	 *
+	 * Before the transcript drain below rather than after it: clearing a
+	 * bond disconnects the peer (Zephyr's bt_unpair does), and the
+	 * disconnect produces a transcript entry that deserves to reach Core
+	 * with everything else rather than arriving after its own StreamClose.
+	 *
+	 * If "persist for a study" ever turns out to mean *across* studies,
+	 * this call is the one line that moves. */
+	ble_bridge_clear_bonds();
 
 	if (transcript_dropped > 0) {
 		char note[DBM_MAX_LOG_LINE_LEN + 1];

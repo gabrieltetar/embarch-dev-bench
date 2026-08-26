@@ -730,7 +730,13 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 {
 	static const uint8_t expected[] = {
 		0x0d, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73,
-		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x01, 0x00,
+		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x01,
+		/* Schema v12's trailing `security_level: Option<SecurityLevel>`
+		 * (embarch-study-designer/design.md §3 decision 50), None here --
+		 * one more COBS zero-run code byte. The populated case is pinned
+		 * separately below; an all-None frame would pass against an
+		 * encoder that wrote the Option byte but not the value. */
+		0x01, 0x00,
 	};
 	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
 
@@ -1129,4 +1135,178 @@ ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
 		       "step 1 action tag mismatch");
 	zassert_str_equal(decoded.study_start.steps[0].name, "open-window", "step 0 name mismatch");
 	zassert_equal(decoded.study_start.steps[1].timeout_ms, 5000, "step 1 timeout mismatch");
+}
+
+
+/* ---- schema v12: security (embarch-study-designer/design.md §3 decisions
+ * 50/51) ------------------------------------------------------------------ */
+
+/* The populated half of `StepResult.security_level`. The None case above
+ * would pass against an encoder that wrote the Option byte and forgot the
+ * value, which is a real shape of this exact bug -- decision 39's retired
+ * refs survived a whole schema version as two bytes nothing read.
+ *
+ * Pre-COBS body pinned by embarch-study-designer's
+ * dump_step_result_with_security_wire_bytes; this is that body COBS-encoded
+ * with dbm_encode_frame's own trailing delimiter, which is what the wire
+ * carries. */
+ZTEST(serial_protocol, test_step_result_with_security_level_encodes_to_the_pinned_wire_bytes)
+{
+	static const uint8_t expected[] = {
+		0x0a, 0x07, 0x01, 0x06, 0x73, 0x65, 0x63, 0x75, 0x72, 0x65,
+		0x01, 0x01, 0x01, 0x03, 0x01, 0x03, 0x00,
+	};
+	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
+
+	memset(&pinned_step_result_msg, 0, sizeof(pinned_step_result_msg));
+	pinned_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	pinned_step_result_msg.step_result.step_index = 1;
+	strcpy(r->step_name, "secure");
+	r->outcome.tag = 0; /* Pass */
+	r->has_security_level = true;
+	r->security_level = DBM_SECURITY_L4;
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&pinned_step_result_msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
+}
+
+ZTEST(serial_protocol, test_step_result_security_level_round_trips)
+{
+	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
+
+	memset(&pinned_step_result_msg, 0, sizeof(pinned_step_result_msg));
+	pinned_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	pinned_step_result_msg.step_result.step_index = 3;
+	strcpy(r->step_name, "discover");
+	r->outcome.tag = 0;
+	r->has_security_level = true;
+	r->security_level = DBM_SECURITY_L1;
+
+	zassert_equal(round_trip(&pinned_step_result_msg, &study_start_decoded), 0,
+		      "decode failed");
+	zassert_true(study_start_decoded.step_result.result.has_security_level,
+		     "has_security_level lost");
+	/* L1 specifically: it is the level no study may *request* and the one a
+	 * study debugging a security-requiring DUT most needs reported, so it
+	 * has to survive the wire like any other. */
+	zassert_equal(study_start_decoded.step_result.result.security_level, DBM_SECURITY_L1,
+		      "security_level mismatch");
+}
+
+ZTEST(serial_protocol, test_study_start_security_actions_round_trip)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 2;
+	strcpy(study_start_msg.study_start.steps[0].name, "secure");
+	study_start_msg.study_start.steps[0].timeout_ms = 10000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_BLE_SECURITY;
+	study_start_msg.study_start.steps[0].action.set_security.level = DBM_SECURITY_L4;
+	strcpy(study_start_msg.study_start.steps[1].name, "drop-bond");
+	study_start_msg.study_start.steps[1].timeout_ms = 5000;
+	study_start_msg.study_start.steps[1].action_tag = DBM_ACTION_BLE_UNBOND;
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+	zassert_equal(study_start_decoded.study_start.steps_len, 2, "steps_len mismatch");
+	zassert_false(study_start_decoded.study_start.has_unsupported_action,
+		      "both v12 actions must be recognized");
+	zassert_equal(study_start_decoded.study_start.steps[0].action_tag,
+		      DBM_ACTION_BLE_SECURITY, "step 0 action_tag");
+	zassert_equal(study_start_decoded.study_start.steps[0].action.set_security.level,
+		      DBM_SECURITY_L4, "step 0 level");
+	/* The field-less variant *after* the field-carrying one: if the level
+	 * varint were walked at the wrong width, this tag lands somewhere else
+	 * and this is what says so. */
+	zassert_equal(study_start_decoded.study_start.steps[1].action_tag, DBM_ACTION_BLE_UNBOND,
+		      "step 1 action_tag");
+	zassert_equal(study_start_decoded.study_start.steps[1].timeout_ms, 5000,
+		      "step 1 timeout -- a mis-walked level shifts everything after it");
+}
+
+ZTEST(serial_protocol, test_study_start_rejects_an_unknown_security_level)
+{
+	/* Hand-built bytes: the encoder cannot produce an out-of-range level
+	 * (`struct dbm_ble_set_security_action.level` is only ever set from a
+	 * decode that already checked it), so this frame has to be written
+	 * directly. A security step that silently became a *weaker* one is the
+	 * exact silent degradation decision 50 exists to refuse, which is why
+	 * this is a whole-frame reject rather than a per-step "unsupported". */
+	static const uint8_t body[] = {
+		0x06,                                            /* StudyStart */
+		0x01,                                            /* steps_len = 1 */
+		0x06, 0x73, 0x65, 0x63, 0x75, 0x72, 0x65,        /* name "secure" */
+		0x07,                                            /* BleSecurity */
+		0x09,                                            /* level = 9 (no such level) */
+		0x88, 0x27,                                      /* timeout_ms = 5000 */
+		0x00,                                            /* continue_on_fail */
+		0x00,                                            /* delay_before_ms */
+		0x00, 0x00, 0x00, 0x00,                          /* steps_crc (irrelevant) */
+		0x00, 0x00,                                      /* streams, streams_crc */
+	};
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(body, sizeof(body), framed);
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_not_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+			  "an unmappable security level must fail the whole decode");
+}
+
+/* Core's own bytes for a study that establishes security and then drops the
+ * bond -- decision 36's both-languages rule applied to schema v12's two new
+ * actions in the pass that adds them, rather than a version later (which is
+ * how `StepResult`'s two stale bytes survived one).
+ *
+ * Produced by embarch-study-designer/tests/firmware_test_vectors.rs's
+ * dump_study_start_with_security_wire_bytes -- run with --nocapture to
+ * regenerate. Pre-COBS payload, exactly as dbm_decode_frame's caller sees it
+ * after unframing.
+ *
+ * `BleSecurity` is the first Action variant since `BleConnect` to carry a
+ * field, so this is the frame that proves the level varint is walked at the
+ * right width by bytes this firmware did not produce. */
+static const uint8_t core_study_start_with_security_frame[] = {
+	0x06, 0x03,
+	/* step 0: "connect", BleConnect, target_name "the client S11" */
+	0x07, 0x63, 0x6f, 0x6e, 0x6e, 0x65, 0x63, 0x74, 0x01, 0x00, 0x00, 0x01, 0x0f, 0x45,
+	0x69, 0x67, 0x68, 0x74, 0x20, 0x53, 0x6c, 0x65, 0x65, 0x70, 0x20, 0x53, 0x31, 0x31,
+	0xa0, 0x9c, 0x01, 0x00, 0x00,
+	/* step 1: "secure", BleSecurity { level: L4 }, timeout 10000 */
+	0x06, 0x73, 0x65, 0x63, 0x75, 0x72, 0x65, 0x07, 0x03, 0x90, 0x4e, 0x00, 0x00,
+	/* step 2: "drop-bond", BleUnbond, timeout 5000 */
+	0x09, 0x64, 0x72, 0x6f, 0x70, 0x2d, 0x62, 0x6f, 0x6e, 0x64, 0x08, 0x88, 0x27, 0x00,
+	0x00,
+	/* steps_crc = 0xB0025B12, then an empty `streams` + its CRC of nothing. */
+	0x92, 0xb6, 0x89, 0x80, 0x0b, 0x00, 0x00,
+};
+
+ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(core_study_start_with_security_frame,
+					     sizeof(core_study_start_with_security_frame), framed);
+
+	zassert_true(framed_len > 0, "COBS encode of Core's payload failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode the bytes embarch-core actually sends");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(ss->steps_len, 3, "steps_len mismatch");
+	zassert_false(ss->has_unsupported_action, "should recognize every action");
+	/* The real point: the CRC is computed over the raw `steps` span, so a
+	 * level varint walked at the wrong width moves where that span ends
+	 * and this fails rather than passing plausibly. */
+	zassert_true(ss->steps_crc_valid,
+		     "steps_crc computed over Core's own bytes must validate");
+	zassert_equal(ss->steps[1].action_tag, DBM_ACTION_BLE_SECURITY, "step 1 action");
+	zassert_equal(ss->steps[1].action.set_security.level, DBM_SECURITY_L4, "step 1 level");
+	zassert_equal(ss->steps[1].timeout_ms, 10000, "step 1 timeout");
+	zassert_str_equal(ss->steps[2].name, "drop-bond", "step 2 name");
+	zassert_equal(ss->steps[2].action_tag, DBM_ACTION_BLE_UNBOND, "step 2 action");
+	zassert_equal(ss->steps[2].timeout_ms, 5000, "step 2 timeout");
 }

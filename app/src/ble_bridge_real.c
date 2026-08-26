@@ -15,11 +15,38 @@
  * write/subscribe params) are single static instances rather than per-call
  * allocations.
  *
- * NOT handled here, deliberately: elevating the link to an encrypted/paired
- * one. Zephyr's own ATT layer already re-runs a request at higher security
- * when a DUT answers with an authentication/encryption ATT error, and
- * decision 11's Just Works pairing needs no auth callbacks, so an explicit
- * bt_conn_set_security() call would only duplicate that.
+ * Security IS handled here, as of decision 34 -- and this paragraph used to
+ * say the opposite. It read: "NOT handled here, deliberately: elevating the
+ * link to an encrypted/paired one. Zephyr's own ATT layer already re-runs a
+ * request at higher security when a DUT answers with an authentication/
+ * encryption ATT error, and decision 11's Just Works pairing needs no auth
+ * callbacks, so an explicit bt_conn_set_security() call would only duplicate
+ * that."
+ *
+ * Both halves of that turned out to be wrong for the case that matters. The
+ * ATT-layer retry only fires for a DUT that answers with an ATT security
+ * error; a DUT that *disconnects* instead reaches no retry at all. And Just
+ * Works produces an **unauthenticated** key, which caps the link at Level 3
+ * -- so no bt_conn_set_security(BT_SECURITY_L4) against that posture could
+ * ever have succeeded, duplicate or not.
+ *
+ * What runs now (embarch-study-designer/design.md §3 decision 44,
+ * embarch-dev-bench/design.md §3 decisions 34 and 37): auth callbacks that make this
+ * bridge a DisplayYesNo-class device and auto-confirm the comparison value,
+ * so LE Secure Connections Numeric Comparison gets selected and the
+ * resulting key is authenticated. ACTION_BLE_SECURITY then asks for a
+ * level and reports the level actually reached; ACTION_BLE_UNBOND drops the
+ * bond.
+ *
+ * The IO-capability derivation this depends on was read out of this
+ * workspace's own Zephyr (subsys/bluetooth/host/smp.c's get_io_capa) rather
+ * than recalled: DisplayYesNo requires `passkey_display` **and**
+ * `passkey_confirm` both non-NULL with LE SC available, and registering only
+ * the confirm half yields NoInputNoOutput -- which the spec's own selection
+ * matrix (gen_method_sc) then resolves to Just Works, silently
+ * unauthenticated. That is why both are registered below and why
+ * `passkey_entry` deliberately is not (it would make this KeyboardDisplay,
+ * a different row of the same matrix).
  */
 #include <errno.h>
 #include <stdarg.h>
@@ -73,6 +100,10 @@ static K_SEM_DEFINE(disconn_sem, 0, 1);
 /* Signalled when a CCC write (subscribe or unsubscribe) has been answered, or
  * when the host reports the subscription dead. */
 static K_SEM_DEFINE(ccc_sem, 0, 1);
+/* Signalled by security_changed_cb -- a link's security level settling (or
+ * failing to) is its own event, distinct from the connect that preceded it
+ * and from any GATT procedure. */
+static K_SEM_DEFINE(sec_sem, 0, 1);
 
 static struct bt_conn *active_conn;
 /* The reference bt_conn_le_create() handed back, held until the connect step
@@ -92,6 +123,19 @@ static uint8_t ccc_att_err;
  * data — how a failed CCC discovery/write surfaces, since Zephyr doesn't route
  * that through the subscribe callback. */
 static bool ccc_torn_down;
+
+/* ---- security (design.md §3 decision 34) -------------------------------- */
+
+/* What security_changed_cb last reported. `sec_level` is Zephyr's own
+ * bt_security_t, not the wire enum -- the translation happens once, at the
+ * outcome boundary. */
+static bt_security_t sec_level;
+static enum bt_security_err sec_err;
+/* Set when pairing itself failed, as opposed to a security_changed that
+ * simply landed lower than asked. Distinguishing the two is what lets a
+ * fail_reason say "pairing failed" rather than only naming a level. */
+static bool pairing_failed_seen;
+static enum bt_security_err pairing_failed_reason;
 
 static bt_addr_le_t scan_target;
 static bool scan_target_set;
@@ -478,9 +522,156 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 	k_sem_give(&disconn_sem);
 }
 
+/* Reports the level the link actually settled at, whether or not that is the
+ * level anything asked for (design.md §3 decision 34). `err` non-zero means
+ * the elevation failed outright; `level` is then whatever the link kept. */
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
+				enum bt_security_err err)
+{
+	ARG_UNUSED(conn);
+
+	sec_level = level;
+	sec_err = err;
+	k_sem_give(&sec_sem);
+}
+
 static struct bt_conn_cb conn_callbacks = {
 	.connected = connected_cb,
 	.disconnected = disconnected_cb,
+	.security_changed = security_changed_cb,
+};
+
+/* ---- pairing callbacks (design.md §3 decision 34) ----------------------- */
+
+/* **Every callback below runs on Zephyr's BT RX thread, so not one of them
+ * logs.** ble_bridge.h's `ble_log_sink` contract is explicit that a log line
+ * is only ever emitted from the caller's own thread, because main.c's sink
+ * takes the link TX mutex and writes the UART -- blocking the BT RX thread on
+ * that is the same class of defect CONFIG_BT_RX_STACK_SIZE and the transcript
+ * queue already exist to avoid. So each of these records what it saw in a
+ * plain static and returns; `execute_set_security` (dispatch thread) is what
+ * turns the record into one diagnostic line.
+ *
+ * The set of non-NULL pointers here is not cosmetic -- Zephyr *derives* this
+ * device's IO capability from exactly which of them are set
+ * (subsys/bluetooth/host/smp.c's get_io_capa), and the derived capability is
+ * half of what selects the pairing method. `passkey_display` +
+ * `passkey_confirm` with LE SC available is DisplayYesNo, which against a
+ * DisplayYesNo/KeyboardDisplay peer selects Numeric Comparison -- the only
+ * auto-confirmable method the spec counts as authenticated, and therefore the
+ * only route to Level 4.
+ *
+ * Deliberately absent: `passkey_entry`. Adding it would make this
+ * KeyboardDisplay instead, a different row of gen_method_sc, and against a
+ * DisplayOnly peer that row selects Passkey Entry -- a method needing the six
+ * digits the *peer* is displaying, which an unattended bench cannot know.
+ * Failing to reach the requested level is a far better outcome than stalling
+ * on a prompt nobody can answer.
+ *
+ * `cancel` is required by Zephyr's own contract whenever any prompt callback
+ * is provided, and is the only way this bridge would learn to stop waiting. */
+
+/* Which pairing method actually ran, as observed from which callback fired --
+ * the one runtime fact that says whether the derived IO capability landed
+ * where this file intends. Reset by every ACTION_BLE_SECURITY. */
+enum pairing_observed {
+	PAIRING_OBSERVED_NONE = 0,
+	/* passkey_confirm fired: LE SC Numeric Comparison, authenticated. */
+	PAIRING_OBSERVED_NUMERIC_COMPARISON,
+	/* pairing_confirm fired: Just Works, unauthenticated -- the peer's own
+	 * IO capability forced it, which caps the link at Level 3. */
+	PAIRING_OBSERVED_JUST_WORKS,
+	/* passkey_display fired without a confirm: the peer wants Passkey
+	 * Entry against a number it expects a human to read off this device. */
+	PAIRING_OBSERVED_PASSKEY_DISPLAY,
+};
+
+static enum pairing_observed pairing_observed;
+static unsigned int pairing_passkey;
+static bool pairing_cancelled;
+static bool pairing_complete_seen;
+static bool pairing_bonded;
+
+static void auth_passkey_display_cb(struct bt_conn *conn, unsigned int passkey)
+{
+	ARG_UNUSED(conn);
+
+	/* Nothing to display to. This exists so the capability derivation lands
+	 * on DisplayYesNo; the value is kept rather than dropped, since it is
+	 * the one number a human debugging a pairing can compare against what
+	 * the other end showed. */
+	pairing_passkey = passkey;
+	if (pairing_observed == PAIRING_OBSERVED_NONE) {
+		pairing_observed = PAIRING_OBSERVED_PASSKEY_DISPLAY;
+	}
+}
+
+/* **Auto-confirm, always.** No human input, ever -- an unattended bench has
+ * nobody to ask, and the alternative is every security step timing out.
+ *
+ * This is what makes the resulting L4 "authenticated in the stack's
+ * bookkeeping, with no real man-in-the-middle protection": the MITM flag is
+ * set and the key is marked authenticated because a Numeric Comparison
+ * completed, but nothing compared the numbers. Written here as well as in the
+ * design decision so nobody reading only this file concludes otherwise. */
+static void auth_passkey_confirm_cb(struct bt_conn *conn, unsigned int passkey)
+{
+	pairing_passkey = passkey;
+	pairing_observed = PAIRING_OBSERVED_NUMERIC_COMPARISON;
+	(void)bt_conn_auth_passkey_confirm(conn);
+}
+
+/* Registered for the same auto-answer reason: with this non-NULL, Zephyr
+ * routes a Just Works pairing through it and *waits*. Leaving it NULL keeps
+ * Just Works working on its own, but then a peer whose IO capability forces
+ * Just Works and a peer needing an explicit accept would behave differently
+ * for no reason a study author could see. It does not affect the capability
+ * derivation -- get_io_capa never looks at it. */
+static void auth_pairing_confirm_cb(struct bt_conn *conn)
+{
+	pairing_observed = PAIRING_OBSERVED_JUST_WORKS;
+	(void)bt_conn_auth_pairing_confirm(conn);
+}
+
+static void auth_cancel_cb(struct bt_conn *conn)
+{
+	ARG_UNUSED(conn);
+	pairing_cancelled = true;
+}
+
+static const struct bt_conn_auth_cb auth_callbacks = {
+	.passkey_display = auth_passkey_display_cb,
+	.passkey_confirm = auth_passkey_confirm_cb,
+	.pairing_confirm = auth_pairing_confirm_cb,
+	.cancel = auth_cancel_cb,
+};
+
+static void auth_pairing_complete_cb(struct bt_conn *conn, bool bonded)
+{
+	ARG_UNUSED(conn);
+
+	pairing_complete_seen = true;
+	pairing_bonded = bonded;
+}
+
+/* Recorded rather than merely noted: a pairing that *failed* and a pairing
+ * that succeeded at a lower level than requested both end with the step
+ * failing, and they are different findings. */
+static void auth_pairing_failed_cb(struct bt_conn *conn, enum bt_security_err reason)
+{
+	ARG_UNUSED(conn);
+
+	pairing_failed_seen = true;
+	pairing_failed_reason = reason;
+	/* Wake a waiting security step immediately: bt_conn_set_security's
+	 * completion is `security_changed`, which a failed pairing may never
+	 * reach. */
+	k_sem_give(&sec_sem);
+}
+
+static struct bt_conn_auth_info_cb auth_info_callbacks = {
+	.pairing_complete = auth_pairing_complete_cb,
+	.pairing_failed = auth_pairing_failed_cb,
 };
 
 /* ---- advertising ------------------------------------------------------- */
@@ -1921,6 +2112,282 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 	}
 }
 
+/* ---- security (design.md §3 decisions 34/37) ---------------------------- */
+
+/* Translates the wire's SecurityLevel discriminant into Zephyr's own
+ * bt_security_t. Two enums with the same *order* and different *bases*, so
+ * this is a switch rather than an offset -- an offset would keep compiling
+ * the day either side grows a variant somewhere other than the end. */
+static bool to_bt_security(uint8_t level, bt_security_t *out)
+{
+	switch (level) {
+	case BLE_SECURITY_L1:
+		*out = BT_SECURITY_L1;
+		return true;
+	case BLE_SECURITY_L2:
+		*out = BT_SECURITY_L2;
+		return true;
+	case BLE_SECURITY_L3:
+		*out = BT_SECURITY_L3;
+		return true;
+	case BLE_SECURITY_L4:
+		*out = BT_SECURITY_L4;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* The inverse, for reporting. Anything Zephyr reports that this enum has no
+ * name for (BT_SECURITY_L0 on an invalid connection, or a future level) is
+ * *not* reported at all rather than reported as the nearest thing -- a
+ * `StepResult` claiming a level the link never had is worse than one saying
+ * nothing. */
+static bool from_bt_security(bt_security_t level, uint8_t *out)
+{
+	switch (level) {
+	case BT_SECURITY_L1:
+		*out = BLE_SECURITY_L1;
+		return true;
+	case BT_SECURITY_L2:
+		*out = BLE_SECURITY_L2;
+		return true;
+	case BT_SECURITY_L3:
+		*out = BLE_SECURITY_L3;
+		return true;
+	case BT_SECURITY_L4:
+		*out = BLE_SECURITY_L4;
+		return true;
+	default:
+		return false;
+	}
+}
+
+/* Note there is deliberately no wire-enum-to-level-number helper in this
+ * file: every message below prints a `bt_security_t`, whose own enumerators
+ * already *are* the spec's level numbers (BT_SECURITY_L4 == 4). Only the wire
+ * enum carries the off-by-one, and the two functions above are the only place
+ * it is crossed. */
+
+static const char *pairing_method_name(void)
+{
+	switch (pairing_observed) {
+	case PAIRING_OBSERVED_NUMERIC_COMPARISON:
+		return "LE SC Numeric Comparison (authenticated)";
+	case PAIRING_OBSERVED_JUST_WORKS:
+		return "Just Works (UNauthenticated -- the peer's IO capability forced it)";
+	case PAIRING_OBSERVED_PASSKEY_DISPLAY:
+		return "Passkey Display (the peer wants a human to read the number)";
+	default:
+		return "none (no pairing ran -- keys were already in place)";
+	}
+}
+
+/* Elevates the link to `params->level`, answering the pairing prompts itself,
+ * and **fails the step if the level actually reached is lower than asked
+ * for**.
+ *
+ * That strictness is the point. `bt_conn_set_security` returning 0 only means
+ * the request was accepted; the level the link settles at depends on the
+ * peer's IO capability and on whether pairing completed at all. A step named
+ * "establish L4" that passed at L2 would be the silent degradation this whole
+ * decision exists to refuse. A study that wants the attempt without the
+ * abort sets `Step.continue_on_fail` -- an existing knob, deliberately reused
+ * instead of adding a second one here.
+ *
+ * `timeout_ms` bounds the elevation, and `delay_before_ms` says when it
+ * starts, so a DUT enforcing its own post-connect security deadline is
+ * authorable with no new timing field.
+ *
+ * **BLE_SECURITY_L1 needs no special case**, and deliberately gets none.
+ * embarch-study-designer/design.md §3 decision 44 makes L1 the honest way
+ * for a study to say "this DUT needs no security" rather than omitting the
+ * step; a connected LE link is already at L1, so the already-at-or-above
+ * check below passes it on the first iteration without a branch of its own.
+ *
+ * **-EBUSY is not a failure, and finding that out cost a hardware run.** The
+ * first real study against the DUT failed this step with
+ * `bt_conn_set_security(L4) failed (-16)` -- and the *next* step then ran at
+ * L4. Zephyr returns -EBUSY when a security procedure is already in flight
+ * (`smp.c`'s `SMP_FLAG_PAIRING`/`SMP_FLAG_ENC_PENDING`), which is exactly
+ * what a DUT that issues its own Security Request immediately after connect
+ * produces. Failing on it reported "could not establish security" about a
+ * link that was seconds away from being secured, which is worse than useless
+ * -- it points at the wrong side. So -EBUSY means *wait for the one already
+ * running and judge what it reaches*, and only then, if it settled below what
+ * was asked, ask again on this step's own behalf. Two attempts, not a retry
+ * loop: `bt_conn_set_security` resets `conn->required_sec_level` on error, so
+ * the in-flight procedure targets whatever the peer asked for rather than
+ * this study's level, and one further request after it completes is all that
+ * is needed to close that gap. */
+static struct outcome execute_set_security(const struct ble_set_security_params *params,
+					    int64_t deadline)
+{
+	bt_security_t want;
+
+	if (active_conn == NULL) {
+		return outcome_fail("no connection to secure; connect first");
+	}
+	if (!to_bt_security(params->level, &want)) {
+		return outcome_fail("unknown security level %u", (unsigned int)params->level);
+	}
+
+	pairing_observed = PAIRING_OBSERVED_NONE;
+	pairing_passkey = 0;
+	pairing_cancelled = false;
+	pairing_complete_seen = false;
+	pairing_bonded = false;
+	pairing_failed_seen = false;
+	sec_err = BT_SECURITY_ERR_SUCCESS;
+
+	for (int attempt = 0; attempt < 2; attempt++) {
+		/* Armed **before** the level is read, not after. Reading first
+		 * and resetting second loses a security_changed that lands
+		 * between the two -- and this step's whole job is to be running
+		 * at exactly the moment one does. */
+		k_sem_reset(&sec_sem);
+
+		bt_security_t already = bt_conn_get_security(active_conn);
+
+		if (already >= want) {
+			/* Idempotent, and this covers three real cases rather
+			 * than one: a repeated step, a *bonded reconnect* where
+			 * encryption came back from the bond with no pairing to
+			 * run (and therefore no security_changed to wait for),
+			 * and a peer whose own Security Request got there first.
+			 * Waiting anyway would burn the whole timeout and then
+			 * fail a link that is already correct. */
+			bridge_log("security at L%u (asked for L%u)", (unsigned int)already,
+				   (unsigned int)want);
+			return outcome_pass();
+		}
+
+		int err = bt_conn_set_security(active_conn, want);
+		bool in_flight_was_someone_elses = false;
+
+		if (err == -EBUSY) {
+			/* A procedure is already running -- see this function's
+			 * own comment. Wait for it rather than reporting a
+			 * failure about it. */
+			in_flight_was_someone_elses = true;
+			bridge_log("security already in flight; waiting for it (asked for L%u)",
+				   (unsigned int)want);
+		} else if (err != 0) {
+			return outcome_fail("bt_conn_set_security(L%u) failed (%d)",
+					     (unsigned int)want, err);
+		}
+
+		/* Two things can end this wait: security_changed (the elevation
+		 * settled, at whatever level) or pairing_failed (it never
+		 * will). disconnected_cb gives neither, so `link_lost` is
+		 * checked on the way out -- a DUT that drops the link rather
+		 * than answering is exactly the behaviour this action was added
+		 * to make legible. */
+		if (k_sem_take(&sec_sem, remaining(deadline)) != 0) {
+			if (link_lost) {
+				return outcome_fail("disconnected while establishing security");
+			}
+			return outcome_timed_out();
+		}
+		if (link_lost) {
+			return outcome_fail("disconnected while establishing security");
+		}
+
+		bridge_log("pairing method: %s", pairing_method_name());
+		if (pairing_observed == PAIRING_OBSERVED_NUMERIC_COMPARISON ||
+		    pairing_observed == PAIRING_OBSERVED_PASSKEY_DISPLAY) {
+			bridge_log("passkey was %06u (auto-confirmed, never compared)",
+				   pairing_passkey);
+		}
+		if (pairing_complete_seen) {
+			bridge_log("pairing complete, bonded=%d", (int)pairing_bonded);
+		}
+
+		if (pairing_failed_seen) {
+			return outcome_fail("pairing failed (security err %d), link stayed at L%u",
+					     (int)pairing_failed_reason,
+					     (unsigned int)bt_conn_get_security(active_conn));
+		}
+		if (pairing_cancelled) {
+			return outcome_fail("pairing was cancelled by the stack");
+		}
+
+		/* Asked of the connection, not taken from the callback's
+		 * argument: the callback reports one transition, and what the
+		 * step must report is where the link ended up. */
+		bt_security_t reached = bt_conn_get_security(active_conn);
+
+		if (sec_err != BT_SECURITY_ERR_SUCCESS) {
+			return outcome_fail("security error %d, link at L%u", (int)sec_err,
+					     (unsigned int)reached);
+		}
+		if (reached >= want) {
+			return outcome_pass();
+		}
+		if (!in_flight_was_someone_elses) {
+			/* Our own request completed and landed short. Asking
+			 * again cannot help -- nothing about either peer's
+			 * capabilities changed -- so this is the honest stop. */
+			return outcome_fail("reached L%u, study asked for L%u",
+					     (unsigned int)reached, (unsigned int)want);
+		}
+		/* The procedure we waited on was not ours and settled below
+		 * what this study needs. Now that it is done, ask on our own
+		 * behalf -- the next iteration does exactly that. */
+	}
+
+	return outcome_fail("stuck at L%u after the in-flight procedure settled; asked for L%u",
+			     (unsigned int)bt_conn_get_security(active_conn), (unsigned int)want);
+}
+
+/* Drops the bond, inside the study (embarch-study-designer/design.md §3
+ * decision 50; this firmware's half is design.md §3 decision 37).
+ *
+ * **This disconnects.** Zephyr's bt_unpair disconnects a peer whose keys it
+ * clears -- dev-bench does not choose that, and it is right: a link whose
+ * keys just went away is not a link. So this waits for the disconnect rather
+ * than returning with `active_conn` still populated, which is precisely the
+ * race ble_bridge_reset() already had to fix once (the next BleConnect
+ * failing with "already connected to a different peer", passing on retry).
+ *
+ * Clears *every* bond rather than only the connected peer's: dev-bench holds
+ * one connection at a time (design.md §3 decision 15), so the two are the
+ * same set in practice, and "clear the table" is the thing a study author
+ * actually means by "drop the bond". */
+static struct outcome execute_unbond(void)
+{
+	bool was_connected = active_conn != NULL;
+
+	if (was_connected) {
+		k_sem_reset(&disconn_sem);
+	}
+
+	int err = bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+
+	if (err != 0) {
+		return outcome_fail("bt_unpair failed (%d)", err);
+	}
+
+	if (was_connected) {
+		/* A fixed bound, not the step's deadline: the unbond itself has
+		 * already happened by here, and a local disconnect that takes
+		 * longer than two seconds is a stuck link, not a slow one.
+		 * Timing out leaves the stale conn and the next connect fails
+		 * as it would have anyway -- no worse than not waiting. */
+		if (k_sem_take(&disconn_sem, K_MSEC(2000)) != 0) {
+			bridge_log("unbond: peer did not disconnect within 2s");
+		}
+	}
+
+	/* Handles and any cached discovery belonged to the link that just
+	 * went away. */
+	handle_cache.valid = false;
+	subscribed = false;
+
+	bridge_log("bond table cleared%s", was_connected ? " (link dropped)" : "");
+	return outcome_pass();
+}
+
 /* ---- public API -------------------------------------------------------- */
 
 int ble_bridge_init(void)
@@ -1930,7 +2397,52 @@ int ble_bridge_init(void)
 	if (err != 0) {
 		return err;
 	}
+
+	/* Registered before bt_enable, so no connection can ever exist without
+	 * them: Zephyr latches `bt_auth` into an SMP context the first time it
+	 * needs a capability, and a peer that connected and initiated pairing
+	 * before this ran would have latched NULL -- NoInputNoOutput, Just
+	 * Works, unauthenticated, with nothing in the resulting failure
+	 * pointing at registration order (design.md §3 decision 34). */
+	err = bt_conn_auth_cb_register(&auth_callbacks);
+	if (err != 0) {
+		return err;
+	}
+	err = bt_conn_auth_info_cb_register(&auth_info_callbacks);
+	if (err != 0) {
+		return err;
+	}
+
 	return bt_enable(NULL);
+}
+
+/* The action switch itself, split out of ble_bridge_execute so the
+ * security-level stamp below it runs for every kind without each arm having
+ * to remember it. */
+static struct outcome dispatch_action(const struct action *action, int64_t deadline)
+{
+	switch (action->kind) {
+	case ACTION_BLE_ADVERTISE:
+		return execute_advertise(&action->advertise);
+	case ACTION_BLE_CONNECT:
+		return execute_connect(&action->connect, deadline);
+	case ACTION_DATA_EXCHANGE:
+		return execute_data_exchange(&action->data_exchange, deadline);
+	case ACTION_GATT_DISCOVER:
+		return execute_gatt_discover(deadline);
+	case ACTION_GATT_MONITOR_ALL:
+		return execute_gatt_monitor_all(deadline);
+	case ACTION_GATT_MONITOR_START:
+		return execute_gatt_monitor_start(deadline);
+	case ACTION_GATT_MONITOR_STOP:
+		return execute_gatt_monitor_stop();
+	case ACTION_BLE_SECURITY:
+		return execute_set_security(&action->set_security, deadline);
+	case ACTION_BLE_UNBOND:
+		return execute_unbond();
+	default:
+		return outcome_fail("unknown action kind");
+	}
 }
 
 struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_ms)
@@ -1947,24 +2459,29 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	link_lost = false;
 	k_sem_reset(&notify_sem);
 
-	switch (action->kind) {
-	case ACTION_BLE_ADVERTISE:
-		return execute_advertise(&action->advertise);
-	case ACTION_BLE_CONNECT:
-		return execute_connect(&action->connect, deadline);
-	case ACTION_DATA_EXCHANGE:
-		return execute_data_exchange(&action->data_exchange, deadline);
-	case ACTION_GATT_DISCOVER:
-		return execute_gatt_discover(deadline);
-	case ACTION_GATT_MONITOR_ALL:
-		return execute_gatt_monitor_all(deadline);
-	case ACTION_GATT_MONITOR_START:
-		return execute_gatt_monitor_start(deadline);
-	case ACTION_GATT_MONITOR_STOP:
-		return execute_gatt_monitor_stop();
-	default:
-		return outcome_fail("unknown action kind");
+	struct outcome outcome = dispatch_action(action, deadline);
+
+	/* One place, for every action kind (ble_bridge.h's `struct outcome`
+	 * contract). Deliberately after the dispatch rather than inside each
+	 * arm: a per-arm stamp is a stamp somebody forgets to add to the next
+	 * arm, and the whole value of reporting this on every step is that it
+	 * is reported on every step.
+	 *
+	 * Read from the live connection at this moment, not cached: for
+	 * ACTION_BLE_SECURITY that is the level it just reached, and for
+	 * every other action it is the level the action ran *at* -- which is
+	 * what makes "disconnected during service discovery" at L1 legible as
+	 * a different finding from the same failure at L4. No connection means
+	 * nothing to report, and says so. */
+	if (active_conn != NULL) {
+		uint8_t wire_level;
+
+		if (from_bt_security(bt_conn_get_security(active_conn), &wire_level)) {
+			outcome.has_security_level = true;
+			outcome.security_level = wire_level;
+		}
 	}
+	return outcome;
 }
 
 void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data)
@@ -2043,5 +2560,30 @@ void ble_bridge_reset(void)
 	handle_cache.valid = false;
 	capture_reset();
 
-	bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+	ble_bridge_clear_bonds();
+}
+
+void ble_bridge_clear_bonds(void)
+{
+	bool was_connected = active_conn != NULL;
+
+	if (was_connected) {
+		k_sem_reset(&disconn_sem);
+	}
+
+	(void)bt_unpair(BT_ID_DEFAULT, BT_ADDR_LE_ANY);
+
+	/* Same wait, and the same reason, as execute_unbond's: bt_unpair
+	 * disconnects a peer whose keys it clears, and returning while
+	 * `active_conn` is still populated is the race a Hello's own
+	 * "hard reset" contract already got caught lying about once. Called
+	 * from ble_bridge_reset() *after* its own disconnect, where there is
+	 * usually nothing left to wait for -- and from main.c at the end of
+	 * every study, where there usually is. */
+	if (was_connected) {
+		(void)k_sem_take(&disconn_sem, K_MSEC(2000));
+	}
+
+	handle_cache.valid = false;
+	subscribed = false;
 }

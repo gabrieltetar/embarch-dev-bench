@@ -560,10 +560,18 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 				break;
 			}
 
+			case DBM_ACTION_BLE_SECURITY:
+				/* One varint, the SecurityLevel discriminant
+				 * (embarch-study-designer/design.md §3
+				 * decision 44, schema v12). */
+				WRITE_VARINT(step->action.set_security.level);
+				break;
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
 			case DBM_ACTION_GATT_MONITOR_STOP:
+			case DBM_ACTION_BLE_UNBOND:
 				break; /* field-less */
 
 			default:
@@ -698,6 +706,18 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 					return -1;
 				}
 			}
+		}
+
+		/* `security_level: Option<SecurityLevel>` -- schema v12's
+		 * trailing field (embarch-study-designer/design.md §3 decision
+		 * 50). Appended after gatt_activity, which is where the Rust
+		 * type declares it. */
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = r->has_security_level ? 1 : 0;
+		if (r->has_security_level) {
+			WRITE_VARINT(r->security_level);
 		}
 		return 0;
 	}
@@ -988,10 +1008,34 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				break;
 			}
 
+			case DBM_ACTION_BLE_SECURITY: {
+				uint64_t level;
+
+				if (pc_read_varint(raw, raw_len, &pos, &level) != 0) {
+					return -1;
+				}
+				if (level > DBM_SECURITY_L4) {
+					/* A level this firmware has no mapping
+					 * for. Unlike an unrecognized *action*
+					 * tag, the remaining bytes are still
+					 * walkable (the varint was consumed),
+					 * so this could have been a per-step
+					 * "unsupported" -- but a security step
+					 * that silently became a weaker one is
+					 * the exact silent-degradation failure
+					 * decision 44 exists to refuse, so it
+					 * is a hard decode error instead. */
+					return -1;
+				}
+				step->action.set_security.level = (uint8_t)level;
+				break;
+			}
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
 			case DBM_ACTION_GATT_MONITOR_STOP:
+			case DBM_ACTION_BLE_UNBOND:
 				break; /* field-less */
 
 			default:
@@ -1255,6 +1299,29 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				rec->payload_len = (uint32_t)payload_len;
 			}
 			sr->result.gatt_activity_len = (uint32_t)activity_len;
+		}
+
+		/* `security_level: Option<SecurityLevel>` -- schema v12's
+		 * trailing field (embarch-study-designer/design.md §3 decision
+		 * 50). Read unconditionally: the Hello/HelloAck schema-version
+		 * handshake has already refused any peer that wouldn't have
+		 * sent it. */
+		if (pos >= raw_len) {
+			return -1;
+		}
+		bool has_security_level = raw[pos++] != 0;
+
+		sr->result.has_security_level = has_security_level;
+		if (has_security_level) {
+			uint64_t level;
+
+			if (pc_read_varint(raw, raw_len, &pos, &level) != 0) {
+				return -1;
+			}
+			if (level > DBM_SECURITY_L4) {
+				return -1;
+			}
+			sr->result.security_level = (uint8_t)level;
 		}
 		return 0;
 	}
