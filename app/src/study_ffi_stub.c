@@ -47,7 +47,7 @@ int study_ffi_decode_and_verify(const uint8_t *input, size_t input_len, bool *ou
 }
 
 /* Fixed-result stub, same posture as study_ffi_decode_and_verify above: this
- * decodes a `Study` (name + steps + validations + steps_crc), a different
+ * decodes a `Study` (name + steps + steps_crc), a different
  * postcard shape than the `DevBenchMessage::StudyStart` (steps + steps_crc
  * only) this firmware actually receives over the wire -- see study_ffi.h's
  * doc comment on struct study_ffi_study. Nothing in this firmware's real
