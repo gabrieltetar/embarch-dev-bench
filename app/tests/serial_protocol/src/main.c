@@ -627,6 +627,64 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 	zassert_equal(ss->streams_crc, 0x7A66C565, "streams_crc mismatch");
 	zassert_true(ss->streams_crc_valid,
 		     "streams_crc computed over the crate's own tap bytes must validate");
+
+	/* The taps are *stored* as of Milestone 7 Phase B item 3, not just
+	 * walked past, so the fields this node acts on are pinned against the
+	 * crate's own vector rather than only the span length being checked.
+	 * This is where a reordered StreamSource/StreamScope variant would
+	 * show up as a wrong tag instead of as plausible-looking garbage. */
+	zassert_equal(ss->streams[0].id, 0, "tap 0 id");
+	zassert_equal(ss->streams[0].source_tag, DBM_STREAM_SRC_GATT_NOTIFY, "tap 0 source");
+	zassert_equal(ss->streams[0].scope_tag, DBM_STREAM_SCOPE_STEPS, "tap 0 scope");
+	zassert_equal(ss->streams[0].scope_from, 0, "tap 0 scope.from");
+	zassert_equal(ss->streams[0].scope_to, 0, "tap 0 scope.to");
+
+	zassert_equal(ss->streams[1].id, 1, "tap 1 id");
+	zassert_equal(ss->streams[1].source_tag, DBM_STREAM_SRC_SIGNAL, "tap 1 source");
+	zassert_equal(ss->streams[1].scope_tag, DBM_STREAM_SCOPE_WHOLE_STUDY, "tap 1 scope");
+
+	zassert_equal(ss->streams[2].id, 2, "tap 2 id");
+	zassert_equal(ss->streams[2].source_tag, DBM_STREAM_SRC_POWER_FRONT_END, "tap 2 source");
+	zassert_equal(ss->streams[2].scope_tag, DBM_STREAM_SCOPE_STEPS, "tap 2 scope");
+
+	/* The Signal tap is Core's to open, not this node's -- dev-bench
+	 * announcing it too would put two producers on one id. */
+	zassert_true(dbm_stream_tap_is_ours(&ss->streams[0]), "a GattNotify tap is dev-bench's");
+	zassert_false(dbm_stream_tap_is_ours(&ss->streams[1]), "a Signal tap is Core's");
+	zassert_true(dbm_stream_tap_is_ours(&ss->streams[2]), "a PowerFrontEnd tap is dev-bench's");
+}
+
+ZTEST(serial_protocol, test_stream_scope_covers_the_inclusive_range_it_declares)
+{
+	/* Mirrors embarch-study-designer's own `scope_covers_the_inclusive_
+	 * step_range_it_declares`. Both must agree or a window opens on a
+	 * different step at each end of the link. */
+	struct dbm_stream_tap whole = {.scope_tag = DBM_STREAM_SCOPE_WHOLE_STUDY};
+
+	zassert_true(dbm_stream_tap_covers(&whole, 0), "WholeStudy covers the first step");
+	zassert_true(dbm_stream_tap_covers(&whole, 0xFFFFFFFFu), "WholeStudy covers any step");
+
+	struct dbm_stream_tap window = {
+		.scope_tag = DBM_STREAM_SCOPE_STEPS,
+		.scope_from = 1,
+		.scope_to = 2,
+	};
+
+	zassert_false(dbm_stream_tap_covers(&window, 0), "before the window");
+	zassert_true(dbm_stream_tap_covers(&window, 1), "at from");
+	zassert_true(dbm_stream_tap_covers(&window, 2), "`to` is inclusive");
+	zassert_false(dbm_stream_tap_covers(&window, 3), "past the window");
+
+	/* One step past the last is what dispatch_study uses to close
+	 * everything still open at the end of a run: no scope may cover it. */
+	struct dbm_stream_tap single = {
+		.scope_tag = DBM_STREAM_SCOPE_STEPS,
+		.scope_from = 0,
+		.scope_to = 0,
+	};
+
+	zassert_true(dbm_stream_tap_covers(&single, 0), "a single-step window is from == to");
+	zassert_false(dbm_stream_tap_covers(&single, 1), "one past the last step closes it");
 }
 
 ZTEST(serial_protocol, test_a_corrupted_streams_crc_is_caught_without_implicating_steps)
