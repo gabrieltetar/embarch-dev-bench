@@ -11,4 +11,7 @@ target_include_directories(app PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../src)
 target_sources(app PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../src/dev_bench_log.c
   src/main.c
+  # Registers a log module under the app's own name, so the app-module floor
+  # (design.md §3 decision 39) is tested against a real match.
+  src/app_module.c
 )

@@ -783,6 +783,12 @@ static bool handle_hello(const struct dbm_hello *hello)
 {
 	ble_bridge_reset();
 
+	/* `Hello` is a hard reset (embarch-study-designer/design.md §3 decision
+	 * 12), and since decision 39 verbosity is study state like any other:
+	 * a study that died mid-run without reaching dispatch_study's own revert
+	 * must not leave the next one running at its level. */
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+
 	uint32_t our_schema = study_ffi_schema_version();
 	struct dev_bench_message *ack = &tx_scratch;
 
@@ -993,6 +999,30 @@ static void dispatch_study(const struct dbm_study_start *study)
 		return;
 	}
 
+	/* The study's own verbosity (decision 39), applied after the guards
+	 * above -- those three abort paths run no step and report through
+	 * `send_log_line`, which bypasses the log subsystem entirely, so they
+	 * neither need the study's level nor have anything to revert.
+	 *
+	 * Reverted just before `send_study_done` below, so the whole study body
+	 * runs at what it asked for and the bench is quiet again the moment it
+	 * ends. */
+	uint8_t want_level = study->dev_bench_log_level;
+	uint8_t reached_level = dev_bench_log_set_level(want_level);
+
+	if (reached_level != want_level) {
+		char note[DBM_MAX_LOG_LINE_LEN + 1];
+
+		/* Reported only on a mismatch, and this is the honest case to
+		 * report: the study asked for a verbosity this *build* does not
+		 * contain, so the log it gets back will be quieter than it asked
+		 * for and nothing else would say so. */
+		snprintk(note, sizeof(note),
+			 "study asked for log level %u; this build only reaches %u",
+			 (unsigned int)want_level, (unsigned int)reached_level);
+		send_log_line(note);
+	}
+
 	bool completed = true;
 
 	transcript_dropped = 0;
@@ -1093,11 +1123,26 @@ static void dispatch_study(const struct dbm_study_start *study)
 		send_log_line(note);
 	}
 
+	/* Back to idle verbosity before the study is declared over, so the next
+	 * link -- or the next study that asks for nothing -- gets a quiet bench
+	 * (decision 39). `Hello` reverts it too, for the case where a study
+	 * never reaches this line at all. */
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+
 	send_study_done(completed);
 }
 
 int main(void)
 {
+	/* Before the first record: hold every Zephyr source at the idle level
+	 * (decision 39). The runtime filter starts at whatever the build
+	 * compiled in -- now DBG for everything, so that a study *can* ask for
+	 * it -- and leaving it there would make an idle bench chattier than
+	 * decision 38's compiled-out ceiling ever was. This app's own module
+	 * stays at INF regardless, which is what lets the boot line below
+	 * through (dev_bench_log.h). */
+	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
+
 	/* The first record of a boot, and (until Core's `Hello` arrives) held in
 	 * dev_bench_log.c's backlog rather than written to a wire nobody has
 	 * open yet. This is what makes "did this bench reboot mid-study" a

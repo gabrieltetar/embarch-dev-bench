@@ -12,6 +12,7 @@
 
 #include <zephyr/logging/log_backend.h>
 #include <zephyr/logging/log_core.h>
+#include <zephyr/logging/log_ctrl.h>
 #include <zephyr/logging/log_msg.h>
 #include <zephyr/logging/log_output.h>
 
@@ -255,6 +256,49 @@ uint32_t dev_bench_log_backlog_dropped(void)
 	return dropped;
 }
 
+uint8_t dev_bench_log_set_level(uint8_t level)
+{
+#ifdef CONFIG_LOG_RUNTIME_FILTERING
+	uint32_t sources = log_src_cnt_get(Z_LOG_LOCAL_DOMAIN_ID);
+	uint8_t reached = 0;
+
+	for (uint32_t src = 0; src < sources; src++) {
+		uint8_t want = level;
+
+		/* The app's own module keeps at least INF unless the request is
+		 * an explicit Off -- dev_bench_log.h explains why. */
+		if (level != DBM_LOG_LEVEL_OFF) {
+			const char *name = log_source_name_get(Z_LOG_LOCAL_DOMAIN_ID, src);
+
+			if (name != NULL && strcmp(name, DEV_BENCH_LOG_APP_MODULE) == 0 &&
+			    want < DBM_LOG_LEVEL_INF) {
+				want = DBM_LOG_LEVEL_INF;
+			}
+		}
+
+		uint32_t actual =
+			log_filter_set(NULL, Z_LOG_LOCAL_DOMAIN_ID, (int16_t)src, want);
+
+		/* Only sources asked for the *requested* level count toward the
+		 * answer. Folding in the app module's INF floor would make a
+		 * perfectly honoured request for WRN report back as INF, i.e. as
+		 * a clamp that never happened -- which is worse than not
+		 * reporting clamps at all, because the caller acts on it. */
+		if (want == level && actual > reached) {
+			reached = (uint8_t)actual;
+		}
+	}
+	return reached;
+#else
+	/* Without runtime filtering the compiled-in level is the only level
+	 * there is, so a request cannot be honoured and must not be reported as
+	 * though it were. CONFIG_LOG_MAX_LEVEL is what the build actually
+	 * allows. */
+	ARG_UNUSED(level);
+	return (uint8_t)CONFIG_LOG_MAX_LEVEL;
+#endif
+}
+
 #else /* !CONFIG_LOG */
 
 /* A CONFIG_LOG=n build still links: there is simply nothing to forward. Kept
@@ -269,6 +313,12 @@ void dev_bench_log_set_sink(dev_bench_log_sink_fn sink)
 uint32_t dev_bench_log_backlog_dropped(void)
 {
 	return 0;
+}
+
+uint8_t dev_bench_log_set_level(uint8_t level)
+{
+	ARG_UNUSED(level);
+	return 0; /* nothing is compiled in, so nothing can be reached */
 }
 
 #endif /* CONFIG_LOG */

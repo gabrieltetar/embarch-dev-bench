@@ -611,6 +611,11 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * write, these fields really do exist on the Rust type. */
 		WRITE_VARINT(0); /* streams: Vec<StreamTap>, empty */
 		WRITE_VARINT(0); /* streams_crc: CRC-32 of nothing */
+		/* dev_bench_log_level -- schema v13 (design.md §3 decision 39).
+		 * Round-tripped from the struct rather than written as a fixed
+		 * value, which is what lets this file's own round-trip test prove
+		 * the field survives both directions. */
+		WRITE_VARINT(msg->study_start.dev_bench_log_level);
 		return 0;
 	case DBM_TAG_STEP_RESULT: {
 		const struct dbm_step_result_payload *r = &msg->step_result.result;
@@ -1147,6 +1152,24 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		ss->streams_crc_valid =
 			dbm_crc32(raw + streams_start_pos, streams_end_pos - streams_start_pos) ==
 			ss->streams_crc;
+
+		/* dev_bench_log_level -- schema v13 (design.md §3 decision 39).
+		 * Read *after* the streams_crc span above, so it is outside both
+		 * seals by construction rather than by remembering to exclude it.
+		 *
+		 * An unknown discriminant is clamped rather than rejected: a
+		 * newer Core asking for a level this build has no name for is not
+		 * a reason to refuse a study, and the handshake's own
+		 * schema_version check is what actually guards wire drift. */
+		uint64_t log_level;
+
+		if (pc_read_varint(raw, raw_len, &pos, &log_level) != 0) {
+			return -1;
+		}
+		if (log_level > DBM_LOG_LEVEL_DBG) {
+			log_level = DBM_LOG_LEVEL_DBG;
+		}
+		ss->dev_bench_log_level = (uint8_t)log_level;
 		return 0;
 	}
 	case DBM_TAG_STEP_RESULT: {
