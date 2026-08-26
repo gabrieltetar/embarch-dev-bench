@@ -13,23 +13,29 @@
 
 #include <string.h>
 
-/* Mirrors embarch-study-designer's DEV_BENCH_WIRE_SCHEMA_VERSION by hand,
- * since native_sim never links the real staticlib (this file's own header
- * comment) -- bump alongside that crate's own constant whenever it changes.
+/* embarch-study-designer's DEV_BENCH_WIRE_SCHEMA_VERSION -- the **wire**
+ * constant specifically, as of that crate's 2026-08-25 split of one schema
+ * version into two (design.md §3 decision 12's amendment). This number is what
+ * a `HelloAck` reports, and a host-side-only reshape must not move what
+ * firmware claims about itself; the host constant has no business being
+ * mirrored here at all, since dev-bench is not a party to that hop.
  *
- * The **wire** constant specifically, as of that crate's 2026-08-25 split of
- * one schema version into two (design.md §3 decision 12's amendment): this
- * number is what a `HelloAck` reports, and a host-side-only reshape must not
- * move what firmware claims about itself. The host constant has no business
- * being mirrored here at all -- dev-bench is not a party to that hop.
+ * Supplied by app/CMakeLists.txt, which reads it out of the crate's own
+ * source. It used to be a hand-written number here and it went stale twice --
+ * found four bumps behind at v4 while implementing v9, then stale again one
+ * bump later. Nothing could compare it against the crate, because by
+ * construction native_sim links no crate to compare it to, and the comment
+ * saying so did not stop the second recurrence. Reading it at configure time
+ * is what does.
  *
- * Found stale at v4 while implementing v9, four bumps behind: nothing
- * compares this stub's answer against the crate, because by construction
- * native_sim links no crate to compare it to. That is a real gap in what the
- * `native_sim` suite can prove and it is unchanged by fixing the number --
- * only a build that links the real staticlib exercises `essd_schema_version`
- * (study_ffi_real.c) for real. */
-#define STUDY_FFI_STUB_SCHEMA_VERSION 9
+ * This does NOT close the wider gap that comment named: only a build linking
+ * the real staticlib exercises `essd_schema_version` (study_ffi_real.c) for
+ * real. What it closes is the number being wrong, which was the part that
+ * actually kept happening.
+ */
+#ifndef STUDY_FFI_STUB_SCHEMA_VERSION
+#error "STUDY_FFI_STUB_SCHEMA_VERSION must come from app/CMakeLists.txt"
+#endif
 
 uint32_t study_ffi_schema_version(void)
 {
