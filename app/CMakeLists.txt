@@ -11,6 +11,11 @@ target_include_directories(app PRIVATE src)
 target_sources(app PRIVATE
   src/main.c
   src/serial_protocol.c
+  # embarch-dev-bench/design.md §3 decision 38: the Zephyr log backend that
+  # forwards CONFIG_LOG output to Core as `LogLine`s. Built for every board,
+  # including native_sim -- unlike ble_bridge/study_ffi there is no real-vs-stub
+  # split here, since the file itself compiles to no-ops under CONFIG_LOG=n.
+  src/dev_bench_log.c
 )
 
 # embarch-dev-bench/design.md §3 decision 16: ble_bridge_real.c (real Zephyr BT

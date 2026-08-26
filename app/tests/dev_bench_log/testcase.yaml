@@ -1,0 +1,4 @@
+tests:
+  embarch_dev_bench.dev_bench_log:
+    platform_allow: native_sim
+    tags: embarch_dev_bench
