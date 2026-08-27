@@ -896,6 +896,18 @@ ZTEST(serial_protocol, test_stream_scope_covers_the_inclusive_range_it_declares)
 	zassert_true(dbm_stream_tap_covers(&whole, 0), "WholeStudy covers the first step");
 	zassert_true(dbm_stream_tap_covers(&whole, 0xFFFFFFFFu), "WholeStudy covers any step");
 
+	/* And *because* it covers any step, no step index closes it. This
+	 * assertion is the reason `dispatch_study` ends a run with
+	 * `close_all_taps()` rather than with a step index past the last one:
+	 * that trick closes a `Steps` window and silently leaves every
+	 * `WholeStudy` tap open, so its `StreamClose` -- and with it the
+	 * `dropped` count Core turns into `StreamRef.truncated` -- was never
+	 * sent. Measured on the bench: a `gatt` tap widened to `WholeStudy`
+	 * reported `truncated: false` in a run whose own log line said 31
+	 * entries had been dropped. */
+	zassert_true(dbm_stream_tap_covers(&whole, 14),
+		     "one past the last step does NOT close a WholeStudy tap -- close_all_taps does");
+
 	struct dbm_stream_tap window = {
 		.scope_tag = DBM_STREAM_SCOPE_STEPS,
 		.scope_from = 1,
@@ -907,8 +919,9 @@ ZTEST(serial_protocol, test_stream_scope_covers_the_inclusive_range_it_declares)
 	zassert_true(dbm_stream_tap_covers(&window, 2), "`to` is inclusive");
 	zassert_false(dbm_stream_tap_covers(&window, 3), "past the window");
 
-	/* One step past the last is what dispatch_study uses to close
-	 * everything still open at the end of a run: no scope may cover it. */
+	/* One step past the last is what a `Steps` window's own scope stops
+	 * covering -- which is all this predicate promises. Closing everything
+	 * at the end of a run is `close_all_taps`'s job, not a step index's. */
 	struct dbm_stream_tap single = {
 		.scope_tag = DBM_STREAM_SCOPE_STEPS,
 		.scope_from = 0,
