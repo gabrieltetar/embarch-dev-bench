@@ -188,15 +188,49 @@ static void log_sink_cb(const char *line, void *user_data)
 	send_log_line(line);
 }
 
+/* Whether any open DBM_STREAM_SRC_GATT_NOTIFY tap named this entry's
+ * characteristic -- embarch-study-designer/design.md §3 decision 55.
+ *
+ * Read from the BT RX thread. `tap_open[]` is written only by the dispatch
+ * thread and `study_taps[]` only between studies, so a stale read here costs
+ * one record at a window edge, exactly like `transcript_tap_open`'s own
+ * documented race. Taking a lock in this callback is what ble_bridge.h's
+ * contract forbids. */
+static bool notify_tap_wants(const struct ble_transcript_entry *entry)
+{
+	if (!entry->has_characteristic_uuid) {
+		return false;
+	}
+	if (entry->kind != BLE_GATT_EVT_NOTIFICATION && entry->kind != BLE_GATT_EVT_INDICATION) {
+		/* A GattNotify tap is the characteristic's *data*, not the
+		 * story of the connection. Subscribed/unsubscribed/error
+		 * events are real and are kept -- in the transcript, which is
+		 * where the story belongs. Letting them into the tap's file
+		 * would put zero-length rows in the middle of a decoded
+		 * waveform. */
+		return false;
+	}
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		if (study_taps[i].source_tag != DBM_STREAM_SRC_GATT_NOTIFY || !tap_open[i]) {
+			continue;
+		}
+		if (memcmp(study_taps[i].characteristic_uuid, entry->characteristic_uuid, 16) == 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static void transcript_sink_cb(const struct ble_transcript_entry *entry, void *user_data)
 {
 	ARG_UNUSED(user_data);
 
-	/* No declared transcript tap, or its window isn't open: the study
-	 * didn't ask for this. Dropping here rather than at send time keeps
-	 * the queue for entries that have somewhere to go, and is not counted
-	 * as a drop -- nothing was lost that anyone asked to capture. */
-	if (!transcript_tap_open) {
+	/* No declared transcript tap and no GattNotify tap that named this
+	 * characteristic: the study didn't ask for this. Dropping here rather
+	 * than at send time keeps the queue for entries that have somewhere to
+	 * go, and is not counted as a drop -- nothing was lost that anyone
+	 * asked to capture. */
+	if (!transcript_tap_open && !notify_tap_wants(entry)) {
 		return;
 	}
 
@@ -242,8 +276,70 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 		 * about. Dropping it at the edge is the honest read -- the
 		 * entry arrived outside the capture the study declared. */
 		int tap_index = transcript_tap_index;
+		bool want_transcript = tap_index >= 0 && tap_open[tap_index];
 
-		if (tap_index < 0 || !tap_open[tap_index]) {
+		/* Fan-out to every open GattNotify tap that named this
+		 * characteristic (embarch-study-designer/design.md §3 decision 55). One captured
+		 * notification can legitimately land in two files: the
+		 * transcript, which is the complete story of the connection,
+		 * and the characteristic's own tap, which is its data on its
+		 * own with a declared layout to decode it. Neither is a copy of
+		 * the other and neither is optional given the other.
+		 *
+		 * Sent *before* the transcript record below purely so the loop
+		 * can reuse `msg` afterwards; order on the wire doesn't matter,
+		 * since Core stamps arrival per record and each tap's file is
+		 * written independently. */
+		if (item.entry.has_characteristic_uuid &&
+		    (item.entry.kind == BLE_GATT_EVT_NOTIFICATION ||
+		     item.entry.kind == BLE_GATT_EVT_INDICATION)) {
+			for (uint32_t i = 0; i < study_taps_len; i++) {
+				if (study_taps[i].source_tag != DBM_STREAM_SRC_GATT_NOTIFY ||
+				    !tap_open[i]) {
+					continue;
+				}
+				if (memcmp(study_taps[i].characteristic_uuid,
+					   item.entry.characteristic_uuid, 16) != 0) {
+					continue;
+				}
+				if (item.entry.payload_len > DBM_MAX_STREAM_CHUNK_BYTES) {
+					/* Cannot happen for an entry this
+					 * firmware produced (one ATT MTU is
+					 * smaller), but counted rather than
+					 * silently skipped so a truncated
+					 * capture never reads as complete. */
+					transcript_dropped++;
+					continue;
+				}
+
+				struct dev_bench_message *nmsg = &tx_scratch;
+
+				memset(nmsg, 0, sizeof(*nmsg));
+				nmsg->tag = DBM_TAG_STREAM_CHUNK_BATCH;
+				nmsg->stream_chunk_batch.id = study_taps[i].id;
+				nmsg->stream_chunk_batch.records_len = 1;
+
+				struct dbm_stream_record *nrec =
+					&nmsg->stream_chunk_batch.records[0];
+
+				nrec->rx_utc_ms = item.entry.rx_utc_ms;
+				/* **The raw ATT value, nothing around it.**
+				 * This tap's records are the characteristic's
+				 * payload bytes and only those -- no postcard
+				 * envelope, no direction, no UUID -- because
+				 * Core decodes them against the layout the
+				 * engineer declared (`StreamEncoding::Struct`),
+				 * and a layout describes the DUT's packet, not
+				 * a dev-bench record wrapping it. */
+				memcpy(nrec->bytes, item.entry.payload,
+				       item.entry.payload_len);
+				nrec->bytes_len = item.entry.payload_len;
+
+				send_message_locked(nmsg);
+			}
+		}
+
+		if (!want_transcript) {
 			k_mutex_unlock(&link_tx_mutex);
 			continue;
 		}
@@ -494,10 +590,12 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 		msg->step_result.result.has_captured_data = true;
 	}
 
-	/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
-	 * populated by GattDiscover (services only) and GattMonitorAll (both);
-	 * NULL/0 from ble_bridge_execute() for every other action kind, same
-	 * borrowed-pointer lifetime as captured_data above. */
+	/* gatt_services (design.md §3 decisions 31/32) -- populated by every
+	 * discovering action; NULL/0 from ble_bridge_execute() for every other
+	 * action kind, same borrowed-pointer lifetime as captured_data above.
+	 *
+	 * `gatt_activity` was copied here too and is retired at schema v14
+	 * (that doc's decision 54). */
 	if (bridge_outcome->gatt_services != NULL && bridge_outcome->gatt_service_count > 0) {
 		size_t count = bridge_outcome->gatt_service_count;
 
@@ -522,29 +620,6 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 		}
 		msg->step_result.result.gatt_services_len = (uint32_t)count;
 		msg->step_result.result.has_gatt_services = true;
-	}
-	if (bridge_outcome->gatt_activity != NULL && bridge_outcome->gatt_activity_count > 0) {
-		size_t count = bridge_outcome->gatt_activity_count;
-
-		if (count > DBM_MAX_GATT_ACTIVITY_RECORDS) {
-			count = DBM_MAX_GATT_ACTIVITY_RECORDS;
-		}
-		for (size_t a = 0; a < count; a++) {
-			const struct ble_gatt_activity_record *src = &bridge_outcome->gatt_activity[a];
-			struct dbm_gatt_activity_record *dst = &msg->step_result.result.gatt_activity[a];
-
-			dst->rx_utc_ms = src->rx_utc_ms;
-			dst->characteristic_index = src->characteristic_index;
-			size_t payload_len = src->payload_len;
-
-			if (payload_len > sizeof(dst->payload)) {
-				payload_len = sizeof(dst->payload);
-			}
-			memcpy(dst->payload, src->payload, payload_len);
-			dst->payload_len = (uint32_t)payload_len;
-		}
-		msg->step_result.result.gatt_activity_len = (uint32_t)count;
-		msg->step_result.result.has_gatt_activity = true;
 	}
 
 	/* `security_level` (embarch-study-designer/design.md §3 decision 44) --
@@ -950,6 +1025,35 @@ static struct action step_to_action(const struct dbm_step *step)
 	case DBM_ACTION_BLE_UNBOND:
 		action.kind = ACTION_BLE_UNBOND;
 		break;
+
+	case DBM_ACTION_GATT_MONITOR_SELECTED:
+	case DBM_ACTION_GATT_MONITOR_SELECTED_START: {
+		const struct dbm_gatt_monitor_selected_action *ms = &step->action.monitor_selected;
+		size_t count = ms->targets_len;
+
+		action.kind = (step->action_tag == DBM_ACTION_GATT_MONITOR_SELECTED)
+				      ? ACTION_GATT_MONITOR_SELECTED
+				      : ACTION_GATT_MONITOR_SELECTED_START;
+		/* Copied rather than borrowed, unlike a Write payload above:
+		 * ACTION_GATT_MONITOR_SELECTED_START's subscriptions outlive
+		 * this ble_bridge_execute() call by design, so a pointer into
+		 * `step` would dangle the moment the study moved on. The two
+		 * caps are equal by construction (both mirror
+		 * limits::MAX_MONITOR_TARGETS) and the decoder already refused
+		 * anything larger; clamped anyway rather than trusting that
+		 * across two headers. */
+		if (count > BLE_MAX_MONITOR_TARGETS) {
+			count = BLE_MAX_MONITOR_TARGETS;
+		}
+		for (size_t t = 0; t < count; t++) {
+			memcpy(action.monitor_selected.targets[t].service_uuid,
+			       ms->targets[t].service_uuid, 16);
+			memcpy(action.monitor_selected.targets[t].characteristic_uuid,
+			       ms->targets[t].characteristic_uuid, 16);
+		}
+		action.monitor_selected.targets_len = count;
+		break;
+	}
 
 	default:
 		/* Unreachable: serial_protocol.c's own decode already rejected any

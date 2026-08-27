@@ -135,6 +135,10 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 	}
 	out->id = raw[*pos];
 	(*pos)++;
+	/* Cleared rather than left as whatever the previous study's tap at
+	 * this index held: a stale UUID here would route a notification into a
+	 * tap that isn't a GattNotify one at all. */
+	memset(out->characteristic_uuid, 0, sizeof(out->characteristic_uuid));
 
 	/* name: heapless::String -- length-prefixed bytes. */
 	if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
@@ -151,6 +155,12 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 		if (*pos + 32 > raw_len) {
 			return -1;
 		}
+		/* The service UUID is walked past; the characteristic is kept,
+		 * because this node routes notifications to this tap's id and
+		 * a notification identifies itself by characteristic (design.md
+		 * §3 decision 55). Addressing, not meaning -- see `struct
+		 * dbm_stream_tap`. */
+		memcpy(out->characteristic_uuid, raw + *pos + 16, 16);
 		*pos += 32;
 		break;
 	case 1: /* PowerFrontEnd { sample_hz } */
@@ -191,6 +201,17 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 			return -1;
 		}
 		(*pos)++; /* channel_id: u8 */
+		break;
+	case 5: /* Struct { decoder } -- schema v14 */
+		/* Walked past, never kept: `decoder` indexes `Study.decoders`,
+		 * a host-only field this node never receives, and what a
+		 * payload means is exactly the knowledge decision 39 took away
+		 * from this firmware. One raw u8, not a varint -- same shape as
+		 * `Samples`' own channel_id. */
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		(*pos)++;
 		break;
 	default:
 		return -1;
@@ -567,6 +588,31 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 				WRITE_VARINT(step->action.set_security.level);
 				break;
 
+			case DBM_ACTION_GATT_MONITOR_SELECTED:
+			case DBM_ACTION_GATT_MONITOR_SELECTED_START: {
+				/* A sequence: length varint, then that many
+				 * fixed 32-byte targets, no per-element length
+				 * prefix (embarch-study-designer/design.md §3
+				 * decision 53, schema v14). */
+				const struct dbm_gatt_monitor_selected_action *ms =
+					&step->action.monitor_selected;
+
+				if (ms->targets_len > DBM_MAX_MONITOR_TARGETS) {
+					return -1;
+				}
+				WRITE_VARINT(ms->targets_len);
+				for (uint32_t t = 0; t < ms->targets_len; t++) {
+					if (*pos + 32 > out_cap) {
+						return -1;
+					}
+					memcpy(out + *pos, ms->targets[t].service_uuid, 16);
+					*pos += 16;
+					memcpy(out + *pos, ms->targets[t].characteristic_uuid, 16);
+					*pos += 16;
+				}
+				break;
+			}
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
@@ -655,8 +701,8 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * pass adds that pin (app/tests/serial_protocol) so the gap
 		 * cannot reopen.
 		 *
-		 * gatt_services/gatt_activity (design.md §3 decisions 31/32) --
-		 * unlike those two, this firmware populates these for real. */
+		 * gatt_services (design.md §3 decisions 31/32) -- unlike those
+		 * two, this firmware populates it for real. */
 		if (*pos + 1 > out_cap) {
 			return -1;
 		}
@@ -692,31 +738,19 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			}
 		}
 
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = r->has_gatt_activity ? 1 : 0;
-		if (r->has_gatt_activity) {
-			if (r->gatt_activity_len > DBM_MAX_GATT_ACTIVITY_RECORDS) {
-				return -1;
-			}
-			WRITE_VARINT(r->gatt_activity_len);
-			for (uint32_t a = 0; a < r->gatt_activity_len; a++) {
-				const struct dbm_gatt_activity_record *rec = &r->gatt_activity[a];
-
-				WRITE_VARINT(rec->rx_utc_ms);
-				WRITE_VARINT(rec->characteristic_index);
-				if (pc_write_bytes(rec->payload, rec->payload_len, out, out_cap,
-						    pos) != 0) {
-					return -1;
-				}
-			}
-		}
+		/* `gatt_activity`'s `Option` byte and its records were encoded
+		 * here. **Retired at schema v14**
+		 * (embarch-study-designer/design.md §3 decision 54): the field
+		 * is gone from the Rust `StepResult`, so writing even the `None`
+		 * byte for it would shift `security_level` by one and decode as
+		 * a security level that was never reported -- the precise
+		 * failure the `power_samples_ref`/`waveform_ref` bytes caused
+		 * for a whole schema version before v9 caught them. The v14 wire
+		 * vector pins the 21-byte frame that proves it doesn't. */
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
 		 * trailing field (embarch-study-designer/design.md §3 decision
-		 * 50). Appended after gatt_activity, which is where the Rust
-		 * type declares it. */
+		 * 50), and the last field of `StepResult` since v14. */
 		if (*pos + 1 > out_cap) {
 			return -1;
 		}
@@ -1036,6 +1070,47 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				break;
 			}
 
+			case DBM_ACTION_GATT_MONITOR_SELECTED:
+			case DBM_ACTION_GATT_MONITOR_SELECTED_START: {
+				/* schema v14 -- the first Action variants to
+				 * carry a sequence. A decoder that treated
+				 * these as field-less would read this length
+				 * varint as the next step's name length and
+				 * decode the rest of the study into nonsense
+				 * that still parses; the crate's v14 wire
+				 * vector is pinned against exactly that. */
+				uint64_t targets_len;
+
+				if (pc_read_varint(raw, raw_len, &pos, &targets_len) != 0) {
+					return -1;
+				}
+				if (targets_len > DBM_MAX_MONITOR_TARGETS) {
+					/* Core considers this legal; this
+					 * firmware cannot hold it. A hard
+					 * decode error rather than a truncated
+					 * subscription list: a study that
+					 * silently monitored a subset of what
+					 * it named is the silently-empty
+					 * capture this whole family of
+					 * decisions keeps being opened by. */
+					return -1;
+				}
+				if (pos + (size_t)targets_len * 32 > raw_len) {
+					return -1;
+				}
+				for (uint32_t t = 0; t < (uint32_t)targets_len; t++) {
+					struct dbm_gatt_target *tgt =
+						&step->action.monitor_selected.targets[t];
+
+					memcpy(tgt->service_uuid, raw + pos, 16);
+					pos += 16;
+					memcpy(tgt->characteristic_uuid, raw + pos, 16);
+					pos += 16;
+				}
+				step->action.monitor_selected.targets_len = (uint32_t)targets_len;
+				break;
+			}
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
@@ -1230,7 +1305,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		 * skip is removed at v9 -- see this file's encoder for the full
 		 * account of why it outlived the fields. */
 
-		/* gatt_services/gatt_activity (design.md §3 decisions 31/32) --
+		/* gatt_services (design.md §3 decisions 31/32) --
 		 * this firmware only ever encodes these (see encode_body), but
 		 * decode is exercised by this file's own round-trip tests too. */
 		if (pos >= raw_len) {
@@ -1281,48 +1356,9 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			sr->result.gatt_services_len = (uint32_t)services_len;
 		}
 
-		if (pos >= raw_len) {
-			return -1;
-		}
-		bool has_gatt_activity = raw[pos++] != 0;
-
-		sr->result.has_gatt_activity = has_gatt_activity;
-		if (has_gatt_activity) {
-			uint64_t activity_len;
-
-			if (pc_read_varint(raw, raw_len, &pos, &activity_len) != 0) {
-				return -1;
-			}
-			if (activity_len > DBM_MAX_GATT_ACTIVITY_RECORDS) {
-				return -1;
-			}
-			for (uint32_t a = 0; a < activity_len; a++) {
-				struct dbm_gatt_activity_record *rec = &sr->result.gatt_activity[a];
-				uint64_t tmp2;
-
-				if (pc_read_varint(raw, raw_len, &pos, &tmp2) != 0) {
-					return -1;
-				}
-				rec->rx_utc_ms = tmp2;
-				if (pc_read_varint(raw, raw_len, &pos, &tmp2) != 0) {
-					return -1;
-				}
-				rec->characteristic_index = (uint16_t)tmp2;
-
-				uint64_t payload_len;
-
-				if (pc_read_varint(raw, raw_len, &pos, &payload_len) != 0) {
-					return -1;
-				}
-				if (payload_len > sizeof(rec->payload) || pos + payload_len > raw_len) {
-					return -1;
-				}
-				memcpy(rec->payload, raw + pos, (size_t)payload_len);
-				pos += (size_t)payload_len;
-				rec->payload_len = (uint32_t)payload_len;
-			}
-			sr->result.gatt_activity_len = (uint32_t)activity_len;
-		}
+		/* `gatt_activity` was read here. Retired at schema v14
+		 * (embarch-study-designer/design.md §3 decision 54) -- see the
+		 * matching note in the encoder above. */
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
 		 * trailing field (embarch-study-designer/design.md §3 decision
