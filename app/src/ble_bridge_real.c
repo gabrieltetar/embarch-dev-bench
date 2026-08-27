@@ -116,6 +116,18 @@ static bool advertising;
 /* Set by disconnected_cb so a step waiting on a GATT response reports the lost
  * link immediately instead of sitting out its whole timeout. */
 static bool link_lost;
+/* The HCI reason byte from the disconnect that set `link_lost`, so a failure
+ * can name *why* the link went away and not only what was in flight when it
+ * did. Discarded outright (`ARG_UNUSED(reason)`) until 2026-08-27, which made
+ * every "disconnected during X" in this suite a diagnosis with its cause
+ * deleted -- a supervision timeout, a MIC failure, the peer hanging up and
+ * unacceptable connection parameters are four different findings needing four
+ * different fixes, and all four printed the same sentence
+ * (embarch-doc/embarch-decision-reversals.md row 78). Written from the BT RX
+ * thread and read from the dispatch thread, exactly like `link_lost` itself
+ * and under the same reasoning: one writer, a plain byte, and a torn read
+ * would mislabel one diagnostic rather than corrupt anything. */
+static uint8_t link_lost_reason;
 /* ATT error code from the last completed GATT procedure; 0 means success. */
 static uint8_t att_err;
 /* ATT error from the last CCC (subscribe/unsubscribe) write. */
@@ -227,6 +239,8 @@ static uint8_t monitor_subscribe_count;
 
 static ble_transcript_sink transcript_sink;
 static void *transcript_user_data;
+static ble_drop_sink drop_sink;
+static void *drop_user_data;
 
 /* True while a capture window opened by ACTION_GATT_MONITOR_START is still
  * armed -- i.e. between a GattMonitorStart and its GattMonitorStop, across
@@ -357,6 +371,73 @@ static struct outcome outcome_fail(const char *fmt, ...)
 	vsnprintk(outcome.fail_reason, sizeof(outcome.fail_reason), fmt, args);
 	va_end(args);
 	return outcome;
+}
+
+/* The handful of HCI disconnect reasons a BLE link on this bench actually
+ * ends with, named. Deliberately not the whole of Core Spec Vol 4 Part E
+ * §1.3: the point is that a reader recognises what happened, and a table of
+ * sixty mostly-BR/EDR codes on a board this tight on flash would be paying
+ * for the fifty that cannot occur here. Anything unlisted still prints its
+ * hex value, which is the part that makes the diagnosis possible at all --
+ * the name is a convenience on top, never the only thing carried.
+ *
+ * Values verified against this workspace's own
+ * `zephyr/include/zephyr/bluetooth/hci_types.h` rather than from memory. */
+static const char *hci_reason_str(uint8_t reason)
+{
+	switch (reason) {
+	case BT_HCI_ERR_AUTH_FAIL:
+		return "authentication failure";
+	case BT_HCI_ERR_PIN_OR_KEY_MISSING:
+		return "PIN or key missing";
+	case BT_HCI_ERR_CONN_TIMEOUT:
+		return "supervision timeout";
+	case BT_HCI_ERR_REMOTE_USER_TERM_CONN:
+		return "peer ended the connection";
+	case BT_HCI_ERR_REMOTE_LOW_RESOURCES:
+		return "peer out of resources";
+	case BT_HCI_ERR_REMOTE_POWER_OFF:
+		return "peer powering off";
+	case BT_HCI_ERR_LOCALHOST_TERM_CONN:
+		return "local host ended the connection";
+	case BT_HCI_ERR_UNSUPP_REMOTE_FEATURE:
+		return "unsupported remote feature";
+	case BT_HCI_ERR_INVALID_LL_PARAM:
+		return "invalid LL parameters";
+	case BT_HCI_ERR_UNSPECIFIED:
+		return "unspecified";
+	case BT_HCI_ERR_LL_RESP_TIMEOUT:
+		return "LL response timeout";
+	case BT_HCI_ERR_INSTANT_PASSED:
+		return "instant passed";
+	case BT_HCI_ERR_UNACCEPT_CONN_PARAM:
+		return "unacceptable connection parameters";
+	case BT_HCI_ERR_TERM_DUE_TO_MIC_FAIL:
+		return "MIC failure";
+	case BT_HCI_ERR_CONN_FAIL_TO_ESTAB:
+		return "connection failed to establish";
+	default:
+		return "unnamed";
+	}
+}
+
+/* Every "disconnected during X" failure, in one place, so the reason byte
+ * cannot be carried by some of them and forgotten by the rest.
+ *
+ * `during` is the phrase, not the whole sentence ("during service
+ * discovery", "while establishing security") -- the caller says what was in
+ * flight and this says why the link went away, which is the pair that makes
+ * the failure actionable. There are thirteen call sites and they all used to
+ * be a bare string literal; a helper is what stops the fourteenth from
+ * quietly being one again.
+ *
+ * `outcome.fail_reason` is 64 bytes and `vsnprintk` truncates rather than
+ * overruns, so a long `during` costs the tail of the name, never the hex
+ * value -- which is why the hex comes before the name and not after it. */
+static struct outcome outcome_disconnected(const char *during)
+{
+	return outcome_fail("disconnected %s (HCI 0x%02x, %s)", during,
+			    (unsigned int)link_lost_reason, hci_reason_str(link_lost_reason));
 }
 
 static int64_t deadline_from(uint32_t timeout_ms)
@@ -510,7 +591,7 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
-	ARG_UNUSED(reason);
+	link_lost_reason = reason;
 
 	if (active_conn == conn) {
 		bt_conn_unref(active_conn);
@@ -1279,7 +1360,7 @@ static struct outcome resolve_handles(const struct data_exchange_params *params,
 		return outcome_timed_out();
 	}
 	if (err == -ENOTCONN) {
-		return outcome_fail("disconnected during service discovery");
+		return outcome_disconnected("during service discovery");
 	}
 	if (err != 0) {
 		return outcome_fail("service discovery failed (%d)", err);
@@ -1301,7 +1382,7 @@ static struct outcome resolve_handles(const struct data_exchange_params *params,
 		return outcome_timed_out();
 	}
 	if (err == -ENOTCONN) {
-		return outcome_fail("disconnected during characteristic discovery");
+		return outcome_disconnected("during characteristic discovery");
 	}
 	if (err != 0) {
 		return outcome_fail("characteristic discovery failed (%d)", err);
@@ -1447,7 +1528,7 @@ static struct outcome run_gatt_discovery(int64_t deadline)
 		return outcome_timed_out();
 	}
 	if (link_lost) {
-		return outcome_fail("disconnected during service discovery");
+		return outcome_disconnected("during service discovery");
 	}
 
 	for (uint8_t i = 0; i < discovered_len; i++) {
@@ -1469,7 +1550,7 @@ static struct outcome run_gatt_discovery(int64_t deadline)
 			return outcome_timed_out();
 		}
 		if (link_lost) {
-			return outcome_fail("disconnected during characteristic discovery");
+			return outcome_disconnected("during characteristic discovery");
 		}
 	}
 
@@ -1767,7 +1848,7 @@ static struct outcome execute_gatt_monitor_window(
 	monitor_unsubscribe_all();
 
 	if (dropped) {
-		return outcome_fail("disconnected during GATT monitor capture");
+		return outcome_disconnected("during GATT monitor capture");
 	}
 
 	return monitor_result();
@@ -1928,7 +2009,7 @@ static struct outcome execute_read(uint16_t value_handle, int64_t deadline)
 		return outcome_timed_out();
 	}
 	if (link_lost) {
-		return outcome_fail("disconnected during read");
+		return outcome_disconnected("during read");
 	}
 	if (att_err != 0) {
 		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_ERROR, cached_service_uuid(),
@@ -1977,7 +2058,7 @@ static struct outcome execute_write(uint16_t value_handle, const uint8_t *payloa
 		return outcome_timed_out();
 	}
 	if (link_lost) {
-		return outcome_fail("disconnected during write");
+		return outcome_disconnected("during write");
 	}
 	if (att_err != 0) {
 		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_ERROR, cached_service_uuid(),
@@ -2084,7 +2165,7 @@ static struct outcome await_notification(int64_t op_deadline, int64_t step_deadl
 		return outcome_timed_out();
 	}
 	if (link_lost) {
-		return outcome_fail("disconnected while awaiting notification");
+		return outcome_disconnected("while awaiting notification");
 	}
 	return outcome_pass();
 }
@@ -2155,7 +2236,7 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 		streaming = false;
 
 		if (dropped) {
-			return outcome_fail("disconnected during stream capture");
+			return outcome_disconnected("during stream capture");
 		}
 		/* Running the window to completion is the outcome; whether any
 		 * samples arrived is a host-side question
@@ -2341,12 +2422,12 @@ static struct outcome execute_set_security(const struct ble_set_security_params 
 		 * to make legible. */
 		if (k_sem_take(&sec_sem, remaining(deadline)) != 0) {
 			if (link_lost) {
-				return outcome_fail("disconnected while establishing security");
+				return outcome_disconnected("while establishing security");
 			}
 			return outcome_timed_out();
 		}
 		if (link_lost) {
-			return outcome_fail("disconnected while establishing security");
+			return outcome_disconnected("while establishing security");
 		}
 
 		bridge_log("pairing method: %s", pairing_method_name());
@@ -2525,6 +2606,11 @@ static struct bt_gatt_discover_params protocol_ccc_discover_params[EAP_MAX_SOURC
  * protocol_subscribe_params (the same trick monitor_notify_cb uses), and this
  * turns that slot back into the index the interpreter speaks in. */
 static uint8_t protocol_subscribe_source[EAP_MAX_SOURCES_PER_PROTOCOL];
+/* The characteristic each armed subscription is for, copied at subscribe
+ * time. 96 bytes to let `protocol_notify_cb` name what a dropped
+ * notification would have carried without reaching for the manifest, which
+ * it has no pointer to and which the dispatch thread owns. */
+static uint8_t protocol_subscribe_char_uuid[EAP_MAX_SOURCES_PER_PROTOCOL][16];
 static uint8_t protocol_subscribe_count;
 /* Per-source GATT state, indexed by the manifest's own source index. */
 static uint16_t protocol_source_handle[EAP_MAX_SOURCES_PER_PROTOCOL];
@@ -2558,6 +2644,17 @@ static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe
 
 	if (k_msgq_put(&protocol_notify_q, &note, K_NO_WAIT) != 0) {
 		protocol_notifications_dropped++;
+		/* Told out loud, not just tallied for the end-of-run log line.
+		 * The interpreter feeds the transcript from its own dequeue,
+		 * so this notification will never reach `transcript_emit` --
+		 * and without this call a `GattNotify` tap on this
+		 * characteristic loses the payload while still reporting
+		 * `truncated: false`. Measured: 275 lost, 28,548 bytes
+		 * reported complete
+		 * (embarch-doc/embarch-decision-reversals.md row 73). */
+		if (drop_sink != NULL) {
+			drop_sink(protocol_subscribe_char_uuid[slot], drop_user_data);
+		}
 	}
 	return BT_GATT_ITER_CONTINUE;
 }
@@ -2687,6 +2784,8 @@ static struct outcome protocol_subscribe_sources(const struct eap_protocol_def *
 				def->sources[i].characteristic_uuid, 0, NULL, 0);
 
 		protocol_subscribe_source[protocol_subscribe_count] = i;
+		memcpy(protocol_subscribe_char_uuid[protocol_subscribe_count],
+		       def->sources[i].characteristic_uuid, 16);
 		protocol_subscribe_count++;
 	}
 	return outcome_pass();
@@ -2769,7 +2868,7 @@ static struct outcome protocol_write(const struct eap_protocol_def *def,
 		return outcome_timed_out();
 	}
 	if (link_lost) {
-		return outcome_fail("disconnected during protocol write");
+		return outcome_disconnected("during protocol write");
 	}
 	if (att_err != 0) {
 		return outcome_fail("protocol write rejected (ATT 0x%02x)", att_err);
@@ -3007,6 +3106,12 @@ void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user
 {
 	stream_handler = handler;
 	stream_user_data = user_data;
+}
+
+void ble_bridge_set_drop_sink(ble_drop_sink sink, void *user_data)
+{
+	drop_sink = sink;
+	drop_user_data = user_data;
 }
 
 void ble_bridge_set_transcript_sink(ble_transcript_sink sink, void *user_data)

@@ -79,6 +79,15 @@ void ble_bridge_set_transcript_sink(ble_transcript_sink sink, void *user_data)
 	transcript_user_data = user_data;
 }
 
+/* The stub has no radio and therefore no notification queue to overflow, so
+ * it accepts the registration and never calls it -- the same posture every
+ * other sink here takes. */
+void ble_bridge_set_drop_sink(ble_drop_sink sink, void *user_data)
+{
+	(void)sink;
+	(void)user_data;
+}
+
 bool ble_bridge_monitor_window_open(void)
 {
 	/* No window is ever opened here, so main.c never has one to close. */
