@@ -611,6 +611,39 @@ static void sync_taps_for_step(uint32_t step_index)
 	}
 }
 
+/* Closes every tap still open, each reporting its own `tap_dropped[i]`.
+ *
+ * **Not `sync_taps_for_step(steps_len)`, which is what this replaced.** That
+ * call rested on "one past the last step is covered by no scope", which is
+ * true of a `Steps` window and false of a `WholeStudy` one:
+ * `dbm_stream_tap_covers` answers `true` for `WholeStudy` at *every*
+ * `step_index`, deliberately and with a test pinning it (`covers` mirrors
+ * embarch-study-designer's `StreamScope::covers`, and a predicate over a
+ * declared scope has no business knowing where a study ends). So a
+ * `WholeStudy` tap was never closed, never sent `StreamClose`, and never
+ * delivered its `dropped` count -- leaving Core to report `truncated: false`
+ * on it no matter how much had been lost.
+ *
+ * Measured, not predicted: a drain study whose `gatt` tap was widened from
+ * `Steps { 0, 10 }` to `WholeStudy` went from `truncated: true` to
+ * `truncated: false` on the *same* bench in the next run, while dev-bench's
+ * own log line reported 31 dropped entries in the run that claimed to be
+ * complete. The three taps that mattered most to that study -- `bds-data`,
+ * `bds-status`, `gatt` -- were all `WholeStudy`, so all three of their
+ * `truncated` flags were unfalsifiable.
+ *
+ * End-of-study closing is its own concern, so it is now its own function
+ * rather than a step index chosen to fall outside every window. */
+static void close_all_taps(void)
+{
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		if (!dbm_stream_tap_is_ours(&study_taps[i]) || !tap_open[i]) {
+			continue;
+		}
+		set_tap_open(i, false, tap_dropped[i]);
+	}
+}
+
 /* Copies the declared taps out of a decoded StudyStart and resets per-study
  * tap state. Returns nothing: a study declaring no taps, or only taps this
  * node doesn't mediate, is perfectly ordinary. */
@@ -1457,13 +1490,14 @@ static void dispatch_study(const struct dbm_study_start *study)
 		k_sleep(K_MSEC(5));
 	}
 
-	/* One past the last step: no scope covers it, so this closes whatever
-	 * is still open -- including a study that ended early on a failed
-	 * step. Deliberately after the drain above, so every record a tap
-	 * produced is on the wire before its own StreamClose is, and Core
-	 * never has to keep bytes that arrived after the close it already
-	 * saw. `transcript_dropped` is final by now for the same reason. */
-	sync_taps_for_step(study->steps_len);
+	/* Closes whatever is still open -- including a study that ended early
+	 * on a failed step, and including a `WholeStudy` tap, which the step
+	 * index this used to pass never closed. Deliberately after the drain
+	 * above, so every record a tap produced is on the wire before its own
+	 * StreamClose is, and Core never has to keep bytes that arrived after
+	 * the close it already saw. `tap_dropped[]` is final by now for the
+	 * same reason. */
+	close_all_taps();
 
 	/* **A study is a bond's lifetime** (embarch-dev-bench/design.md §3
 	 * decision 37). Cleared here so a second run of a study behaves like
