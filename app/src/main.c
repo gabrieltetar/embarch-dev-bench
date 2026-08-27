@@ -921,12 +921,54 @@ static int receive_message(struct dev_bench_message *out)
  * that cannot answer says nothing; inventing a plausible ID here would defeat
  * the entire check, and Core's side is where "no ID" gets its meaning.
  */
+/* The raw `esp_reset_reason()` value, or -1 where there is no such thing.
+ *
+ * **`hwinfo`'s answer on this board is `0x00000000`, and that is its `default:`
+ * arm rather than a missing driver — found 2026-08-27.** A dev-bench that had
+ * demonstrably rebooted 46 seconds earlier reported `reset cause 0x00000000`,
+ * which reads exactly like "the driver has nothing to say". It is not:
+ * `hwinfo_esp32.c` calls `esp_reset_reason()` and switches over seven
+ * `ESP_RST_*` values, and every other one — `ESP_RST_UNKNOWN`,
+ * `ESP_RST_PWR_GLITCH`, `ESP_RST_USB`, `ESP_RST_JTAG`, `ESP_RST_EFUSE`,
+ * `ESP_RST_SDIO` — falls through to `*cause = 0` because Zephyr's `RESET_*`
+ * bitmask has no bit that can express them. So the zero means "the SoC named a
+ * cause Zephyr's enum cannot carry", which is nearly the opposite of nothing,
+ * and `ESP_RST_PWR_GLITCH` sitting in that set is directly relevant to the
+ * open question about why this bench resets (§4).
+ *
+ * Reported alongside the mapped value rather than instead of it: the mapped one
+ * is the portable number every other board answers in, and this is the one that
+ * survives the lossy hop.
+ */
+static int raw_soc_reset_reason(void)
+{
+#if defined(CONFIG_SOC_FAMILY_ESPRESSIF_ESP32)
+	/* Declared locally rather than by including <esp_system.h>: that header
+	 * is on the include path for in-tree drivers, not for application code,
+	 * and the whole of what is wanted here is one nullary function. The
+	 * return type is an enum, which this ABI passes as an int. */
+	extern int esp_reset_reason(void);
+
+	return esp_reset_reason();
+#else
+	return -1;
+#endif
+}
+
 /* Uptime at handshake, plus the reset cause when `hwinfo` can name one — see
  * handle_hello's own comment for what this is for. */
 static void send_reset_diagnostics(void)
 {
 	char line[DBM_MAX_LOG_LINE_LEN + 1];
 	int64_t uptime_ms = k_uptime_get();
+	int raw = raw_soc_reset_reason();
+	char raw_note[32];
+
+	if (raw >= 0) {
+		snprintk(raw_note, sizeof(raw_note), ", esp_reset_reason %d", raw);
+	} else {
+		raw_note[0] = '\0';
+	}
 
 #ifdef CONFIG_HWINFO
 	uint32_t cause = 0;
@@ -934,8 +976,8 @@ static void send_reset_diagnostics(void)
 
 	if (err == 0) {
 		snprintk(line, sizeof(line),
-			 "uptime %lld ms at handshake, reset cause 0x%08x", (long long)uptime_ms,
-			 (unsigned int)cause);
+			 "uptime %lld ms at handshake, reset cause 0x%08x%s",
+			 (long long)uptime_ms, (unsigned int)cause, raw_note);
 		/* Cleared so the *next* handshake's cause describes the next
 		 * reset rather than accumulating every cause since power-on,
 		 * which is what the driver's own flags do if nobody clears
@@ -945,14 +987,32 @@ static void send_reset_diagnostics(void)
 		(void)hwinfo_clear_reset_cause();
 	} else {
 		snprintk(line, sizeof(line),
-			 "uptime %lld ms at handshake, reset cause unavailable (%d)",
-			 (long long)uptime_ms, err);
+			 "uptime %lld ms at handshake, reset cause unavailable (%d)%s",
+			 (long long)uptime_ms, err, raw_note);
 	}
 #else
-	snprintk(line, sizeof(line), "uptime %lld ms at handshake, no hwinfo driver",
-		 (long long)uptime_ms);
+	snprintk(line, sizeof(line), "uptime %lld ms at handshake, no hwinfo driver%s",
+		 (long long)uptime_ms, raw_note);
 #endif
 	send_log_line(line);
+
+	/* **Decision 38's fatal-error path, deliberately provoked — the one part
+	 * of it never exercised (§4).** `log_panic()` switching to synchronous,
+	 * lock-free writing is what would carry a Zephyr crash dump to Core, and
+	 * nothing has crashed this firmware on purpose since it was written. The
+	 * open question this answers is narrow and worth an option: when
+	 * dev-bench resets mid-study, no dump arrives, and that is either
+	 * because the reset is not a Zephyr panic or because this path does not
+	 * deliver. A build that panics on command tells you which.
+	 *
+	 * After the handshake diagnostic, not before, so the run that panics is
+	 * still identifiable in `dev-bench.log` by the line above it.
+	 */
+	if (IS_ENABLED(CONFIG_EMBARCH_DEV_BENCH_PANIC_AT_HANDSHAKE)) {
+		send_log_line("about to k_panic() deliberately "
+			      "(CONFIG_EMBARCH_DEV_BENCH_PANIC_AT_HANDSHAKE)");
+		k_panic();
+	}
 }
 
 static void read_hardware_id(char *out, size_t out_cap)

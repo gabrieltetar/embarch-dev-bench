@@ -1,0 +1,34 @@
+# Application Kconfig, sourced automatically by Zephyr for the app directory.
+# Shared by every workspace under workspaces/* (each one's app/ is a symlink to
+# this directory, embarch-dev-bench/design.md §2).
+#
+# **An app Kconfig replaces Zephyr's own root, it does not extend it**, so it
+# has to `source "Kconfig.zephyr"` itself or every Zephyr symbol vanishes and
+# the build aborts on the resulting warnings. Found the hard way adding the
+# first symbol here.
+
+mainmenu "embarch-dev-bench"
+
+config EMBARCH_DEV_BENCH_PANIC_AT_HANDSHAKE
+	bool "Deliberately k_panic() right after the handshake diagnostic"
+	help
+	  A debug-only build that crashes on purpose, to exercise decision 38's
+	  fatal-error path — the one part of it that has never run (§4).
+	  log_panic() switching to synchronous, lock-free writing is what should
+	  carry a Zephyr crash dump to Core as LogLines, and nothing has
+	  deliberately crashed this firmware since it was written.
+
+	  The question it answers is specific: dev-bench resets mid-study while
+	  transmitting a long StepResult, and no crash dump ever arrives. That is
+	  either because the reset is not a Zephyr panic, or because this path
+	  does not deliver. A build that panics on command distinguishes them —
+	  a dump in dev-bench.log means the path works and the real reset is
+	  something else (brownout and a watchdog lead the alternatives); no dump
+	  means the path itself is broken and the absence of one during a real
+	  reset says nothing.
+
+	  Never enable this in a build meant to run a study: it panics at every
+	  handshake, so no study can start.
+	default n
+
+source "Kconfig.zephyr"
