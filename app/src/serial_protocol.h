@@ -99,6 +99,36 @@
  * decision's implementation (design.md §3 decisions 27, 28). */
 #define DBM_MAX_STREAMS_PER_STUDY 8
 
+/* The `.eap` protocol manifest types a `StudyStart` carries and this file
+ * decodes (embarch-study-designer/design.md §3 decisions 58-62, §4.9).
+ * Their own header, because eap_interp.c and ble_bridge also need them and
+ * neither needs the link protocol -- see eap.h for what those types drop and
+ * why, and for the per-manifest count caps.
+ *
+ * The two constants below stay here rather than moving across with them:
+ * both bound the *message*, not the grammar.
+ */
+#include "eap.h"
+
+#define DBM_MAX_PROTOCOLS_PER_STUDY 2
+/* Largest postcard-encoded `protocols` span this firmware will accept, in
+ * bytes -- a **disclosed byte-count cap**, and the only limit here that is
+ * not a mirror of a count.
+ *
+ * It exists because eap.h's count caps multiply into a wire bound nothing would
+ * ever send: at the crate's ceilings a single `ProtocolDef` can encode to
+ * ~7.4 KB, almost all of it names this firmware discards, and sizing three
+ * staging buffers for two of those would cost ~30 KB for a span whose real
+ * worked example (the BDS batch download, §4.9) is **398 bytes** including
+ * the whole rest of the StudyStart. A byte cap says the true thing -- "this
+ * bench accepts a manifest up to this big" -- where a product of eleven
+ * ceilings says a false one.
+ *
+ * 3 KB is roughly eight times the real worked protocol. A span past it is
+ * refused at decode with the limit named, the same disclosed-capacity posture
+ * DBM_MAX_STEPS_PER_STUDY takes. */
+#define DBM_MAX_PROTOCOLS_WIRE_LEN 3072
+
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
  *
  * StudyStart's per-step worst case grew once decode had to cover every
@@ -121,14 +151,27 @@
  * bound and made it this file's largest by a factor of two. Retiring it
  * (embarch-study-designer/design.md §3 decision 54) takes all of that back,
  * which is what shrinks DBM_MAX_RAW_LEN and every buffer sized from it.
+ *
+ * `+ DBM_MAX_PROTOCOLS_WIRE_LEN` at schema v15
+ * (embarch-study-designer/design.md §3 decision 58): the `protocols` span and
+ * its seal ride at the end of StudyStart, and unlike `streams` they are far
+ * too large to hide inside the per-step rounding slack. Counted as one
+ * disclosed byte cap rather than as a product of the eleven `.eap` count
+ * ceilings above -- see DBM_MAX_PROTOCOLS_WIRE_LEN for why.
  */
 #define DBM_MAX_STUDY_START_LEN \
-	(8 + (DBM_MAX_STEPS_PER_STUDY * (DBM_MAX_PAYLOAD_LEN + 64)) + 8)
+	(8 + (DBM_MAX_STEPS_PER_STUDY * (DBM_MAX_PAYLOAD_LEN + 64)) + 8 + \
+	 DBM_MAX_PROTOCOLS_WIRE_LEN + 8)
 #define DBM_MAX_GATT_SERVICES_LEN \
 	(4 + (DBM_MAX_DISCOVERED_SERVICES * (16 + 4 + (DBM_MAX_CHARS_PER_SERVICE * 17))))
+/* `+ EAP_MAX_STATE_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + 8` at schema v15:
+ * `StepResult.protocol: Option<ProtocolOutcome>` (embarch-study-designer/
+ * design.md §3 decision 62) is one trailing Option byte plus, when a
+ * `RunProtocol` step really ran, a state name and an `Outcome` that can carry
+ * its own `fail_reason`. */
 #define DBM_MAX_STEP_RESULT_LEN                                                                  \
 	(24 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN +                  \
-	 DBM_MAX_GATT_SERVICES_LEN)
+	 DBM_MAX_GATT_SERVICES_LEN + EAP_MAX_STATE_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + 8)
 /* A transcript record is tiny next to either of the two above -- a fixed
  * header plus one bounded payload -- so it never moves DBM_MAX_RAW_LEN.
  * Stated as its own constant anyway so the encoder has something real to
@@ -139,6 +182,28 @@
 /* COBS worst case adds one overhead byte per 254 payload bytes, plus a leading code byte
  * and a trailing 0x00 delimiter. */
 #define DBM_MAX_FRAME_LEN (DBM_MAX_RAW_LEN + (DBM_MAX_RAW_LEN / 254) + 2)
+
+/* Largest frame this firmware can ever *send*, and the exact mirror of
+ * DBM_MAX_INBOUND_RAW_LEN below -- the same finding, applied to the other
+ * direction, and found the same way: by asking which messages actually cross
+ * this link rather than which the type can hold.
+ *
+ * dev-bench sends HelloAck, LogLine, StreamOpen/StreamChunkBatch/StreamClose,
+ * StepResult and StudyDone. It never sends a StudyStart -- Core is the only
+ * sender -- so StepResult is the largest thing it can put on the wire, and
+ * main.c's TX staging buffer was holding StudyStart's bound for it. That cost
+ * ~6.6 KB before this schema version and would have cost ~9.7 KB after it,
+ * since DBM_MAX_STUDY_START_LEN now carries DBM_MAX_PROTOCOLS_WIRE_LEN as
+ * well -- growth in a buffer for a message this node cannot produce.
+ *
+ * Scoped to the *application's* TX buffer for the same reason its inbound
+ * twin is scoped to the application's RX buffer: `dbm_encode_frame`'s own
+ * staging buffer stays at DBM_MAX_RAW_LEN, because this suite's round-trip
+ * tests encode a StudyStart through it precisely to prove encode and decode
+ * agree, and narrowing it would trade a real test for RAM. */
+#define DBM_MAX_OUTBOUND_RAW_LEN DBM_MAX_STEP_RESULT_LEN
+#define DBM_MAX_OUTBOUND_FRAME_LEN \
+	(DBM_MAX_OUTBOUND_RAW_LEN + (DBM_MAX_OUTBOUND_RAW_LEN / 254) + 2)
 
 /* Largest frame this firmware can ever *receive*, as opposed to the largest it
  * can handle at all (DBM_MAX_FRAME_LEN above).
@@ -472,6 +537,33 @@ enum dbm_action_tag {
 	 * for exactly that. */
 	DBM_ACTION_GATT_MONITOR_SELECTED = 9,
 	DBM_ACTION_GATT_MONITOR_SELECTED_START = 10,
+	/* embarch-study-designer/design.md §3 decision 60, schema v15 -- hand
+	 * the link to a declared `.eap` state machine for the length of this
+	 * step. Appended, never inserted, same positional-encoding rule as
+	 * every tag above it.
+	 *
+	 * **This is the first Action this firmware does not merely dispatch but
+	 * interprets.** Every other tag here names a fixed thing ble_bridge
+	 * knows how to do; this one names an index into `StudyStart.protocols`
+	 * and a state to enter, and what happens next is whatever the manifest
+	 * says. That is the cost decision 60 accepted by name: what a payload
+	 * *means* now reaches this node, which is the knowledge decision 39
+	 * took away from it. Decision 59's split is what keeps that cost to the
+	 * primitives a running machine can actually reach -- `repeat`,
+	 * `bitpack`, `crc32` and `fixed` stay host-side and never arrive
+	 * here. */
+	DBM_ACTION_RUN_PROTOCOL = 11,
+};
+
+/* Mirrors `Action::RunProtocol { protocol, entry_state }`. Both are indices,
+ * never names. Both reach a C array subscript here, which is why
+ * `embarch_study_designer::eap::validate_protocol` and Core's own pre-flight
+ * range-check them before a `Study` is ever submitted -- and why this
+ * firmware re-checks them anyway at dispatch (§3 decision 18's rule: name the
+ * specific failure rather than letting a raw index fail). */
+struct dbm_run_protocol_action {
+	uint8_t protocol;
+	uint8_t entry_state;
 };
 
 /* How many characteristics one selective monitor step may name -- mirrors
@@ -610,6 +702,7 @@ struct dbm_step {
 		struct dbm_data_exchange_action data_exchange;
 		struct dbm_ble_set_security_action set_security;
 		struct dbm_gatt_monitor_selected_action monitor_selected;
+		struct dbm_run_protocol_action run_protocol;
 		/* DBM_ACTION_GATT_DISCOVER/DBM_ACTION_GATT_MONITOR_ALL/
 		 * DBM_ACTION_GATT_MONITOR_START/DBM_ACTION_GATT_MONITOR_STOP/
 		 * DBM_ACTION_BLE_UNBOND carry no fields of their own. */
@@ -657,6 +750,25 @@ struct dbm_study_start {
 	 * CRCs cover what dev-bench executes and what it captures, and how
 	 * verbose it is about doing so changes neither. */
 	uint8_t dev_bench_log_level;
+	/* The `.eap` protocol manifests this study resolved at build time --
+	 * schema v15 (embarch-study-designer/design.md §3 decision 58, §4.9),
+	 * appended after `dev_bench_log_level` on the wire.
+	 *
+	 * Unlike `streams`, which this node stores 12 bytes of and walks past
+	 * the rest, a protocol is stored **whole minus its names**: dev-bench
+	 * executes this one (decision 60), so every index, offset, guard and
+	 * write template has to survive the decode. */
+	struct eap_protocol_def protocols[DBM_MAX_PROTOCOLS_PER_STUDY];
+	uint32_t protocols_len;
+	uint32_t protocols_crc;
+	/* Not part of the wire format, same as `steps_crc_valid`/
+	 * `streams_crc_valid`: whether the decoded `protocols` span recomputes
+	 * to `protocols_crc`. The **third** seal, checked independently of the
+	 * other two so a mismatch names which of the three is corrupt -- which
+	 * is the whole reason there are three sibling seals rather than one
+	 * widened one. Also `false` when decoding stopped early on an
+	 * unsupported action, for the same reason its two siblings are. */
+	bool protocols_crc_valid;
 };
 
 struct dbm_outcome {
@@ -712,6 +824,29 @@ struct dbm_step_result_payload {
 	 * about", never "nobody looked". */
 	bool has_security_level;
 	uint8_t security_level; /* enum dbm_security_level */
+	/* `StepResult.protocol: Option<ProtocolOutcome>` -- schema v15's
+	 * trailing field (embarch-study-designer/design.md §3 decision 62),
+	 * and now the last field of StepResult. Appended, so this is one more
+	 * Option byte on the message this firmware sends most rather than a
+	 * re-shuffle of it.
+	 *
+	 * **Two fields, and the state name is the one the tap cannot say.**
+	 * There is deliberately no list of decoded values here: that is the
+	 * shape decision 54 retired `gatt_activity` for, and decoded bytes
+	 * reach a reader through the tap the study declared, rendered
+	 * host-side. Whether `final_state` was a terminal state is not stored
+	 * either -- it is a lookup in the `ProtocolDef` the `Study` already
+	 * carries, and a stored copy could disagree with it.
+	 *
+	 * `protocol_outcome` is a full `struct dbm_outcome` rather than a
+	 * duplicate of the step's own: the step can fail for a reason the
+	 * machine never saw (a dropped link, an exhausted step timeout), and
+	 * telling "the protocol reached its `failed` state" apart from "the
+	 * protocol never finished" is the whole diagnostic value of recording
+	 * a final state. */
+	bool has_protocol;
+	char protocol_final_state[EAP_MAX_STATE_NAME_LEN + 1];
+	struct dbm_outcome protocol_outcome;
 };
 
 struct dbm_step_result {

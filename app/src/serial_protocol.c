@@ -244,6 +244,493 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 	return 0;
 }
 
+/* ---- `.eap` protocol manifests (embarch-study-designer/design.md §3
+ *      decisions 58-62, §4.9) ----------------------------------------------
+ *
+ * The reference these have to agree with is `embarch-study-designer/src/eap.rs`
+ * (the wire types) and `src/eap_interp.rs` (the semantics). Nothing here
+ * infers a shape: every read below is the postcard encoding of a field that
+ * module declares, in the order it declares it, and the pinned wire vector in
+ * app/tests/serial_protocol is what proves the two agree rather than each
+ * agreeing with itself.
+ *
+ * **Names are walked and discarded**, all of them but `StateDef.name`. That
+ * is not an optimization applied afterwards -- it is why `struct
+ * eap_protocol_def` has no name fields at all (see serial_protocol.h). The
+ * walk is unavoidable regardless: postcard carries no per-field length, so a
+ * name cannot be skipped without being read.
+ */
+
+/* postcard encodes a signed integer as a zigzag varint. `Operand::Literal` is
+ * an `i64` and `SessionVarDef.initial` is an `i64`; nothing else in a
+ * `ProtocolDef` is signed. */
+static int pc_read_zigzag(const uint8_t *in, size_t in_len, size_t *pos, int64_t *out)
+{
+	uint64_t raw;
+
+	if (pc_read_varint(in, in_len, pos, &raw) != 0) {
+		return -1;
+	}
+	*out = (int64_t)(raw >> 1) ^ -(int64_t)(raw & 1);
+	return 0;
+}
+
+/* `Operand` (eap.rs) -- a varint discriminant, then one payload. `Field`,
+ * `Session` and `SpanLen` each carry a `u8`, which postcard writes as a raw
+ * byte rather than a varint. */
+static int pc_read_eap_operand(const uint8_t *raw, size_t raw_len, size_t *pos,
+			       struct eap_operand *out)
+{
+	uint64_t kind;
+
+	if (pc_read_varint(raw, raw_len, pos, &kind) != 0) {
+		return -1;
+	}
+	out->kind = (uint8_t)kind;
+	out->index = 0;
+	out->literal = 0;
+	switch (kind) {
+	case EAP_OP_LITERAL: {
+		/* Through a local rather than straight into `out->literal`:
+		 * `struct eap_operand` is packed (see serial_protocol.h for
+		 * why that is worth ~12 KB), so the member's address is
+		 * potentially unaligned and taking it is a diagnostic on every
+		 * compiler this builds under. Assigning through the struct is
+		 * what makes the compiler emit the byte-wise store. */
+		int64_t literal;
+
+		if (pc_read_zigzag(raw, raw_len, pos, &literal) != 0) {
+			return -1;
+		}
+		out->literal = literal;
+		return 0;
+	}
+	case EAP_OP_FIELD:
+	case EAP_OP_SESSION:
+	case EAP_OP_SPAN_LEN:
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->index = raw[(*pos)++];
+		return 0;
+	default:
+		/* A fifth operand form is a decision with a firmware reflash
+		 * attached (design.md §3 decision 60), so a tag this build has
+		 * no name for cannot be walked past and is a hard error. */
+		return -1;
+	}
+}
+
+/* `Expr` -- `Term(Operand)` or `Add(Operand, Operand)`. `Add` saturates at
+ * evaluation time, not here. */
+static int pc_read_eap_expr(const uint8_t *raw, size_t raw_len, size_t *pos,
+			    struct eap_expr *out)
+{
+	uint64_t kind;
+
+	if (pc_read_varint(raw, raw_len, pos, &kind) != 0) {
+		return -1;
+	}
+	out->kind = (uint8_t)kind;
+	memset(&out->b, 0, sizeof(out->b));
+	if (pc_read_eap_operand(raw, raw_len, pos, &out->a) != 0) {
+		return -1;
+	}
+	switch (kind) {
+	case EAP_EXPR_TERM:
+		return 0;
+	case EAP_EXPR_ADD:
+		return pc_read_eap_operand(raw, raw_len, pos, &out->b);
+	default:
+		return -1;
+	}
+}
+
+/* `Condition { lhs, op, rhs }` -- a struct, so the fields are in declaration
+ * order with no tag of their own. */
+static int pc_read_eap_condition(const uint8_t *raw, size_t raw_len, size_t *pos,
+				 struct eap_condition *out)
+{
+	uint64_t op;
+
+	if (pc_read_eap_operand(raw, raw_len, pos, &out->lhs) != 0) {
+		return -1;
+	}
+	if (pc_read_varint(raw, raw_len, pos, &op) != 0) {
+		return -1;
+	}
+	if (op > EAP_CMP_GE) {
+		return -1;
+	}
+	out->op = (uint8_t)op;
+	return pc_read_eap_operand(raw, raw_len, pos, &out->rhs);
+}
+
+/* `ActiveState.on_enter: Option<WriteAction>` (design.md §3 decision 61). */
+static int pc_read_eap_write(const uint8_t *raw, size_t raw_len, size_t *pos,
+			     struct eap_write *out)
+{
+	uint64_t len;
+
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->source = raw[(*pos)++];
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_WRITE_FIELDS) {
+		return -1;
+	}
+	out->fields_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		uint64_t ty;
+
+		if (pc_read_varint(raw, raw_len, pos, &ty) != 0) {
+			return -1;
+		}
+		out->fields[i].ty = (uint8_t)ty;
+		if (pc_read_eap_operand(raw, raw_len, pos, &out->fields[i].value) != 0) {
+			return -1;
+		}
+	}
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->with_response = raw[(*pos)++] != 0;
+	return 0;
+}
+
+/* `EventArm { frame, remember, when, otherwise }`.
+ *
+ * `otherwise: None` and `otherwise: Some(<this state>)` are genuinely
+ * different behaviors -- see `struct eap_event_arm`'s own comment and
+ * embarch-decision-reversals.md row 66 -- so the Option byte is kept rather
+ * than folded into a self-transition default. */
+static int pc_read_eap_event_arm(const uint8_t *raw, size_t raw_len, size_t *pos,
+				 struct eap_event_arm *out)
+{
+	uint64_t len;
+
+	memset(out, 0, sizeof(*out));
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->frame = raw[(*pos)++];
+
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_REMEMBER_PER_ARM) {
+		return -1;
+	}
+	out->remember_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->remember[i].var = raw[(*pos)++];
+		if (pc_read_eap_expr(raw, raw_len, pos, &out->remember[i].value) != 0) {
+			return -1;
+		}
+	}
+
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_GUARDS_PER_ARM) {
+		return -1;
+	}
+	out->when_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_read_eap_condition(raw, raw_len, pos, &out->when[i].cond) != 0) {
+			return -1;
+		}
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->when[i].goto_state = raw[(*pos)++];
+	}
+
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->has_otherwise = raw[(*pos)++] != 0;
+	if (out->has_otherwise) {
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->otherwise = raw[(*pos)++];
+	}
+	return 0;
+}
+
+/* `StateDef { name, kind }`, where `kind` is `Active(ActiveState)` or
+ * `Terminal(TerminalOutcome)`. The name is the one string kept. */
+static int pc_read_eap_state(const uint8_t *raw, size_t raw_len, size_t *pos,
+			     struct eap_state *out)
+{
+	uint64_t kind;
+	uint64_t len;
+
+	memset(out, 0, sizeof(*out));
+	if (pc_read_str(raw, raw_len, pos, out->name, sizeof(out->name)) != 0) {
+		return -1;
+	}
+	if (pc_read_varint(raw, raw_len, pos, &kind) != 0) {
+		return -1;
+	}
+	out->kind = (uint8_t)kind;
+	switch (kind) {
+	case EAP_STATE_TERMINAL: {
+		uint64_t outcome;
+
+		if (pc_read_varint(raw, raw_len, pos, &outcome) != 0) {
+			return -1;
+		}
+		if (outcome > EAP_TERMINAL_FAIL) {
+			/* `Outcome::TimedOut` is not declarable by a manifest
+			 * (design.md §3 decision 62); only a run produces it.
+			 * A third discriminant here is drift, not a new
+			 * outcome. */
+			return -1;
+		}
+		out->terminal = (uint8_t)outcome;
+		return 0;
+	}
+	case EAP_STATE_ACTIVE:
+		break;
+	default:
+		return -1;
+	}
+
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->has_on_enter = raw[(*pos)++] != 0;
+	if (out->has_on_enter && pc_read_eap_write(raw, raw_len, pos, &out->on_enter) != 0) {
+		return -1;
+	}
+
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_EVENT_ARMS_PER_STATE) {
+		/* A dev-bench-internal cap below the crate's own -- refused by
+		 * name rather than truncated, because a state machine missing a
+		 * transition runs and branches wrongly, which is strictly worse
+		 * than one that does not run. See EAP_MAX_EVENT_ARMS_PER_STATE. */
+		return -1;
+	}
+	out->on_event_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_read_eap_event_arm(raw, raw_len, pos, &out->on_event[i]) != 0) {
+			return -1;
+		}
+	}
+
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->has_on_timeout = raw[(*pos)++] != 0;
+	if (out->has_on_timeout) {
+		uint64_t after_ms;
+
+		if (pc_read_varint(raw, raw_len, pos, &after_ms) != 0) {
+			return -1;
+		}
+		out->on_timeout.after_ms = (uint32_t)after_ms;
+		if (*pos + 2 > raw_len) {
+			return -1;
+		}
+		out->on_timeout.retry = raw[(*pos)++];
+		out->on_timeout.goto_state = raw[(*pos)++];
+	}
+	return 0;
+}
+
+/* `FrameDef { name, source, select_if, fields, spans }`. */
+static int pc_read_eap_frame(const uint8_t *raw, size_t raw_len, size_t *pos,
+			     struct eap_frame *out)
+{
+	uint64_t len;
+
+	memset(out, 0, sizeof(*out));
+	if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+		return -1; /* name -- walked, not kept */
+	}
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->source = raw[(*pos)++];
+
+	if (*pos >= raw_len) {
+		return -1;
+	}
+	out->has_select = raw[(*pos)++] != 0;
+	if (out->has_select) {
+		uint64_t offset;
+
+		if (pc_read_varint(raw, raw_len, pos, &offset) != 0) {
+			return -1;
+		}
+		out->select_offset = (uint16_t)offset;
+		if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+			return -1;
+		}
+		if (len > EAP_MAX_SELECT_MATCH_LEN || *pos + len > raw_len) {
+			return -1;
+		}
+		memcpy(out->select_eq, raw + *pos, (size_t)len);
+		*pos += (size_t)len;
+		out->select_len = (uint8_t)len;
+	}
+
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_FRAME_FIELDS) {
+		return -1;
+	}
+	out->fields_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		uint64_t offset;
+		uint64_t ty;
+
+		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+			return -1; /* field name -- walked, not kept */
+		}
+		if (pc_read_varint(raw, raw_len, pos, &offset) != 0) {
+			return -1;
+		}
+		if (pc_read_varint(raw, raw_len, pos, &ty) != 0) {
+			return -1;
+		}
+		out->fields[i].offset = (uint16_t)offset;
+		out->fields[i].ty = (uint8_t)ty;
+	}
+
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_FRAME_SPANS) {
+		return -1;
+	}
+	out->spans_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		uint64_t offset;
+
+		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+			return -1; /* span name -- walked, not kept */
+		}
+		if (pc_read_varint(raw, raw_len, pos, &offset) != 0) {
+			return -1;
+		}
+		out->spans[i].offset = (uint16_t)offset;
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->spans[i].has_len = raw[(*pos)++] != 0;
+		if (out->spans[i].has_len) {
+			uint64_t span_len;
+
+			if (pc_read_varint(raw, raw_len, pos, &span_len) != 0) {
+				return -1;
+			}
+			out->spans[i].len = (uint16_t)span_len;
+		}
+	}
+	return 0;
+}
+
+/* One `ProtocolDef` (eap.rs), advancing *pos past it and filling `out` with
+ * the part this node executes. Returns 0 on success, -1 on a malformed shape
+ * or one past a dev-bench-internal cap.
+ *
+ * Every count checked here is checked because the value behind it reaches a
+ * C array subscript. `validate_protocol` and Core's pre-flight already
+ * range-check the *indices* inside a protocol host-side (design.md §3
+ * decision 18's rule), and this is the other half: the *capacities* are this
+ * firmware's own, so this is the only place that can refuse them.
+ */
+static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
+				struct eap_protocol_def *out)
+{
+	uint64_t len;
+
+	memset(out, 0, sizeof(*out));
+	if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+		return -1; /* protocol name -- walked, not kept */
+	}
+
+	/* sources */
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_SOURCES_PER_PROTOCOL) {
+		return -1;
+	}
+	out->sources_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+			return -1; /* alias -- walked, not kept */
+		}
+		if (*pos + 32 > raw_len) {
+			return -1;
+		}
+		memcpy(out->sources[i].service_uuid, raw + *pos, 16);
+		*pos += 16;
+		memcpy(out->sources[i].characteristic_uuid, raw + *pos, 16);
+		*pos += 16;
+	}
+
+	/* frames */
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_FRAMES_PER_PROTOCOL) {
+		return -1;
+	}
+	out->frames_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_read_eap_frame(raw, raw_len, pos, &out->frames[i]) != 0) {
+			return -1;
+		}
+	}
+
+	/* session -- integers only (design.md §3 decision 60) */
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_SESSION_VARS) {
+		return -1;
+	}
+	out->session_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
+			return -1; /* variable name -- walked, not kept */
+		}
+		if (pc_read_zigzag(raw, raw_len, pos, &out->session_initial[i]) != 0) {
+			return -1;
+		}
+	}
+
+	/* states */
+	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
+		return -1;
+	}
+	if (len > EAP_MAX_STATES_PER_PROTOCOL) {
+		return -1;
+	}
+	out->states_len = (uint8_t)len;
+	for (uint32_t i = 0; i < (uint32_t)len; i++) {
+		if (pc_read_eap_state(raw, raw_len, pos, &out->states[i]) != 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
 /* CRC-32 (ISO-HDLC / the common "CRC-32" used by zip/gzip/PNG/Ethernet;
  * poly 0xEDB88320 reflected, init/xorout 0xFFFFFFFF) -- matches the `crc`
  * crate's `CRC_32_ISO_HDLC` embarch-study-designer's `steps_crc()` (src/crc.rs)
@@ -613,6 +1100,15 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 				break;
 			}
 
+			case DBM_ACTION_RUN_PROTOCOL:
+				/* schema v15 -- two raw `u8` indices. */
+				if (*pos + 2 > out_cap) {
+					return -1;
+				}
+				out[(*pos)++] = step->action.run_protocol.protocol;
+				out[(*pos)++] = step->action.run_protocol.entry_state;
+				break;
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
@@ -662,6 +1158,27 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * value, which is what lets this file's own round-trip test prove
 		 * the field survives both directions. */
 		WRITE_VARINT(msg->study_start.dev_bench_log_level);
+		/* protocols + protocols_crc -- schema v15 (design.md §3
+		 * decision 58). Written as an **empty list**, exactly as
+		 * `streams` above and for the identical reason: this encoder
+		 * exists only for this file's own round-trip tests, and a
+		 * `ProtocolDef` cannot be re-encoded from `struct
+		 * eap_protocol_def` at all -- the decoder discards every name in
+		 * a manifest but the state names (serial_protocol.h), so a
+		 * re-encode would produce different bytes and a different CRC
+		 * from the ones that arrived.
+		 *
+		 * That is not a gap in coverage, it is where the coverage moved
+		 * to: decision 36's both-languages rule puts the real proof in a
+		 * literal frame this crate produced, decoded here and asserted
+		 * field by field (app/tests/serial_protocol), which is the only
+		 * kind of test that can catch the two languages disagreeing.
+		 *
+		 * The 0 CRC is genuine, not a placeholder: CRC-32/ISO-HDLC over
+		 * zero bytes is 0, so the decoder's own check passes on these
+		 * bytes for the right reason. */
+		WRITE_VARINT(0); /* protocols: Vec<ProtocolDef>, empty */
+		WRITE_VARINT(0); /* protocols_crc: CRC-32 of nothing */
 		return 0;
 	case DBM_TAG_STEP_RESULT: {
 		const struct dbm_step_result_payload *r = &msg->step_result.result;
@@ -757,6 +1274,36 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		out[(*pos)++] = r->has_security_level ? 1 : 0;
 		if (r->has_security_level) {
 			WRITE_VARINT(r->security_level);
+		}
+
+		/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
+		 * field (embarch-study-designer/design.md §3 decision 62), and
+		 * the last field of `StepResult` since v15.
+		 *
+		 * `None` for every action but `RunProtocol`, which is every
+		 * action that existed before it -- so on the message this
+		 * firmware sends most, this is one `0x00` byte. That is why the
+		 * field was appended rather than inserted: the wire diff a human
+		 * has to check is a suffix, and this decoder adopts it by
+		 * reading one more Option at the end rather than by re-walking
+		 * the message. */
+		if (*pos + 1 > out_cap) {
+			return -1;
+		}
+		out[(*pos)++] = r->has_protocol ? 1 : 0;
+		if (r->has_protocol) {
+			if (pc_write_bytes((const uint8_t *)r->protocol_final_state,
+					    strlen(r->protocol_final_state), out, out_cap,
+					    pos) != 0) {
+				return -1;
+			}
+			WRITE_VARINT(r->protocol_outcome.tag);
+			if (r->protocol_outcome.tag == 1 &&
+			    pc_write_bytes((const uint8_t *)r->protocol_outcome.fail_reason,
+					    strlen(r->protocol_outcome.fail_reason), out, out_cap,
+					    pos) != 0) {
+				return -1;
+			}
 		}
 		return 0;
 	}
@@ -1111,6 +1658,23 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				break;
 			}
 
+			case DBM_ACTION_RUN_PROTOCOL: {
+				/* schema v15 -- two raw `u8` indices, not
+				 * varints (embarch-study-designer/src/study.rs's
+				 * `Action::RunProtocol { protocol, entry_state }`).
+				 * Range-checking them against the study's own
+				 * `protocols` happens at dispatch, not here:
+				 * `protocols` arrives *after* every step on the
+				 * wire, so at this point there is nothing yet to
+				 * check against. */
+				if (pos + 2 > raw_len) {
+					return -1;
+				}
+				step->action.run_protocol.protocol = raw[pos++];
+				step->action.run_protocol.entry_state = raw[pos++];
+				break;
+			}
+
 			case DBM_ACTION_GATT_DISCOVER:
 			case DBM_ACTION_GATT_MONITOR_ALL:
 			case DBM_ACTION_GATT_MONITOR_START:
@@ -1172,6 +1736,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		if (unsupported) {
 			ss->steps_crc_valid = false;
 			ss->streams_crc_valid = false;
+			ss->protocols_crc_valid = false;
 			return 0;
 		}
 
@@ -1245,6 +1810,65 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			log_level = DBM_LOG_LEVEL_DBG;
 		}
 		ss->dev_bench_log_level = (uint8_t)log_level;
+
+		/* protocols + protocols_crc -- schema v15
+		 * (embarch-study-designer/design.md §3 decision 58, §4.9). The
+		 * study's **third** seal, and a sibling of the two above rather
+		 * than a widening of either: each covers one contiguous span and
+		 * is carried immediately after it, so this hand-written C
+		 * digests one run of bytes per seal and a mismatch names which
+		 * of the three is corrupt.
+		 *
+		 * Appended after `dev_bench_log_level` rather than inserted
+		 * beside `streams_crc` -- postcard is positional, and an append
+		 * makes the wire diff a suffix. The structural rule is satisfied
+		 * by `protocols_crc` following `protocols`, which is a property
+		 * of the pair, not of where the pair sits.
+		 *
+		 * Like its two siblings, the digest covers the concatenated
+		 * element encodings and **not** the vector's own length prefix,
+		 * matching `protocols_crc()`'s one-protocol-at-a-time digest in
+		 * src/crc.rs. */
+		uint64_t protocols_len;
+
+		if (pc_read_varint(raw, raw_len, &pos, &protocols_len) != 0) {
+			return -1;
+		}
+		if (protocols_len > DBM_MAX_PROTOCOLS_PER_STUDY) {
+			return -1;
+		}
+
+		size_t protocols_start_pos = pos;
+
+		for (uint32_t i = 0; i < protocols_len; i++) {
+			if (pc_read_protocol_def(raw, raw_len, &pos, &ss->protocols[i]) != 0) {
+				return -1;
+			}
+		}
+		ss->protocols_len = (uint32_t)protocols_len;
+
+		size_t protocols_end_pos = pos;
+
+		/* The disclosed byte cap (DBM_MAX_PROTOCOLS_WIRE_LEN). Checked
+		 * on the *walked* span rather than guessed at from the counts,
+		 * and after the walk rather than before it, because postcard
+		 * carries no length for a sequence's bytes -- the only way to
+		 * know how big the span is, is to have crossed it. A span this
+		 * firmware could not have received at all is caught earlier
+		 * still, by the frame-length check in dbm_decode_frame. */
+		if (protocols_end_pos - protocols_start_pos > DBM_MAX_PROTOCOLS_WIRE_LEN) {
+			return -1;
+		}
+
+		uint64_t protocols_crc;
+
+		if (pc_read_varint(raw, raw_len, &pos, &protocols_crc) != 0) {
+			return -1;
+		}
+		ss->protocols_crc = (uint32_t)protocols_crc;
+		ss->protocols_crc_valid =
+			dbm_crc32(raw + protocols_start_pos,
+				  protocols_end_pos - protocols_start_pos) == ss->protocols_crc;
 		return 0;
 	}
 	case DBM_TAG_STEP_RESULT: {
@@ -1381,6 +2005,36 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				return -1;
 			}
 			sr->result.security_level = (uint8_t)level;
+		}
+
+		/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
+		 * field (embarch-study-designer/design.md §3 decision 62). */
+		if (pos >= raw_len) {
+			return -1;
+		}
+		bool has_protocol = raw[pos++] != 0;
+
+		sr->result.has_protocol = has_protocol;
+		if (has_protocol) {
+			uint64_t protocol_outcome_tag;
+
+			if (pc_read_str(raw, raw_len, &pos, sr->result.protocol_final_state,
+					 sizeof(sr->result.protocol_final_state)) != 0) {
+				return -1;
+			}
+			if (pc_read_varint(raw, raw_len, &pos, &protocol_outcome_tag) != 0) {
+				return -1;
+			}
+			if (protocol_outcome_tag > 2) {
+				return -1;
+			}
+			sr->result.protocol_outcome.tag = (uint8_t)protocol_outcome_tag;
+			if (protocol_outcome_tag == 1 &&
+			    pc_read_str(raw, raw_len, &pos,
+					sr->result.protocol_outcome.fail_reason,
+					sizeof(sr->result.protocol_outcome.fail_reason)) != 0) {
+				return -1;
+			}
 		}
 		return 0;
 	}

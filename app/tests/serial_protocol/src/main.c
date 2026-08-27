@@ -11,6 +11,7 @@
 
 #include <zephyr/ztest.h>
 
+#include "eap_interp.h"
 #include "serial_protocol.h"
 
 ZTEST_SUITE(serial_protocol, NULL, NULL, NULL, NULL, NULL);
@@ -479,6 +480,15 @@ static const uint8_t core_study_start_frame[] = {
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
+	/* protocols + protocols_crc -- schema v15
+	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
+	 * rather than unset ones, the same way the empty-`streams` pair is:
+	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
+	 * `dev_bench_log_level` would still pass every assertion in this test,
+	 * which is why `core_study_start_with_protocol_frame` below carries a
+	 * real manifest and a real seal. */
+	0x00, 0x00,
 };
 
 /* An independent COBS encoder, deliberately not serial_protocol.c's own
@@ -626,6 +636,15 @@ static const uint8_t core_study_start_with_taps_frame[] = {
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
+	/* protocols + protocols_crc -- schema v15
+	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
+	 * rather than unset ones, the same way the empty-`streams` pair is:
+	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
+	 * `dev_bench_log_level` would still pass every assertion in this test,
+	 * which is why `core_study_start_with_protocol_frame` below carries a
+	 * real manifest and a real seal. */
+	0x00, 0x00,
 };
 
 ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
@@ -725,6 +744,15 @@ static const uint8_t core_study_start_selective_monitor_frame[] = {
 	0xca, 0x9e, 0x6e, 0x40, 0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9,
 	0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x05, 0x01, 0x00, 0xa7, 0xaf, 0xc4,
 	0xec, 0x0d, 0x04,
+	/* protocols + protocols_crc -- schema v15
+	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
+	 * rather than unset ones, the same way the empty-`streams` pair is:
+	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
+	 * `dev_bench_log_level` would still pass every assertion in this test,
+	 * which is why `core_study_start_with_protocol_frame` below carries a
+	 * real manifest and a real seal. */
+	0x00, 0x00,
 };
 
 ZTEST(serial_protocol, test_decodes_cores_selective_monitor_study_start)
@@ -950,7 +978,17 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 		 * level -- the same class of drift the retired
 		 * `power_samples_ref`/`waveform_ref` bytes caused for a whole
 		 * schema version, which is why this vector exists. */
-		0x01, 0x00,
+		0x01,
+		/* Schema v15's own trailing `protocol: Option<ProtocolOutcome>`
+		 * (embarch-study-designer/design.md §3 decision 62), None here
+		 * -- and None on every step but a `RunProtocol` one, which is
+		 * every step this firmware has produced to date. One more COBS
+		 * zero-run code byte, which is exactly what "appended, not
+		 * inserted" is supposed to look like on the message this
+		 * firmware sends most. The populated case is pinned separately
+		 * below. */
+		0x01,
+		0x00,
 	};
 	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
 
@@ -1343,7 +1381,10 @@ ZTEST(serial_protocol, test_step_result_with_security_level_encodes_to_the_pinne
 		 * that kept writing it would put the level one byte late --
 		 * and this is the vector where that shows up as a wrong
 		 * *value* rather than only a wrong length. */
-		0x01, 0x01, 0x03, 0x01, 0x03, 0x00,
+		0x01, 0x01, 0x03, 0x01, 0x03,
+		/* Schema v15's trailing `protocol` Option, None. */
+		0x01,
+		0x00,
 	};
 	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
 
@@ -1475,6 +1516,10 @@ static const uint8_t core_study_start_with_security_frame[] = {
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
+	/* protocols + protocols_crc -- schema v15
+	 * (embarch-study-designer/design.md §3 decision 58): an empty list and
+	 * the CRC of nothing, both correct values rather than unset ones. */
+	0x00, 0x00,
 };
 
 ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
@@ -1514,4 +1559,706 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
 		      "dev_bench_log_level mismatch (got %u)",
 		      (unsigned int)ss->dev_bench_log_level);
 
+}
+
+/* ---- `.eap` protocol manifests (embarch-study-designer/design.md §3
+ *      decisions 58-62, §4.9) ----------------------------------------------
+ *
+ * Two kinds of test here, and the split is deliberate.
+ *
+ * The first is the usual decision-36 cross-language pin: a literal frame that
+ * crate produced, decoded here and asserted field by field. Nothing in this
+ * file can produce those bytes -- `dbm_encode_frame` writes an empty
+ * `protocols` list on purpose, because the decoder discards every name in a
+ * manifest and a re-encode would differ -- so a round-trip test would only
+ * prove this implementation agrees with itself, which is exactly the blind
+ * spot the pinning rule exists to close.
+ *
+ * The second drives `eap_interp.c` directly. Those tests are the C half of
+ * `embarch-study-designer/tests/eap_worked_protocols.rs`: the same worked BDS
+ * download, the same sequences, the same expected transitions. They exist
+ * because §3 decision 60 put the **executor** on this side while leaving the
+ * **specification** in that crate, and the only way that division is safe is
+ * if both are exercised against the same cases.
+ */
+
+/* Core's own bytes for a `StudyStart` carrying the worked BDS batch-download
+ * protocol and an `Action::RunProtocol` step naming it -- schema v15.
+ *
+ * Produced by embarch-study-designer/tests/firmware_test_vectors.rs's
+ * dump_study_start_with_protocol_wire_bytes; run it with --nocapture to
+ * regenerate. The protocol is the **real** worked one out of
+ * tests/fixtures/bds_batch_download.eap rather than a shrunk stand-in,
+ * because a decoder pinned against a purpose-built protocol would prove it
+ * can walk a shape nobody authors. Between them these bytes exercise every
+ * branch of the walker: three sources, a `select_if` frame *and* an
+ * unguarded one, a byte span with no declared length, two session variables,
+ * both write forms, a `remember` over `len(...)`, a guarded `goto`, a
+ * self-transitioning `otherwise`, a `retry` timeout, a zero-retry stall
+ * watchdog, and both terminal outcomes.
+ */
+static const uint8_t core_study_start_with_protocol_frame[] = {
+	/* tag, then one step: "download", Action::RunProtocol { protocol: 0,
+	 * entry_state: 0 }, timeout 30000, then steps_crc = 0x8BFD158E. */
+	0x06, 0x01, 0x08, 0x64, 0x6f, 0x77, 0x6e, 0x6c, 0x6f, 0x61, 0x64, 0x0b, 0x00, 0x00,
+	0xb0, 0xea, 0x01, 0x00, 0x00, 0x8e, 0xab, 0xf4, 0xdf, 0x08,
+	/* streams: empty, streams_crc: the CRC of nothing. Then
+	 * dev_bench_log_level = Debug (4). */
+	0x00, 0x00, 0x04,
+	/* protocols: one ProtocolDef. */
+	0x01,
+	/* name "bds_batch_download" */
+	0x12, 0x62, 0x64, 0x73, 0x5f, 0x62, 0x61, 0x74, 0x63, 0x68, 0x5f, 0x64, 0x6f, 0x77,
+	0x6e, 0x6c, 0x6f, 0x61, 0x64,
+	/* sources: 3 -- "ctrl", "status", "data", each a discarded alias
+	 * followed by two raw 16-byte UUIDs. The characteristic UUIDs are the
+	 * 16-bit shorthands 0x0021/0x0022/0x0023 expanded through the Bluetooth
+	 * Base UUID, which is what makes them differ only in one byte. */
+	0x03,
+	0x04, 0x63, 0x74, 0x72, 0x6c,
+	0x00, 0x00, 0x00, 0x20, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34,
+	0x56, 0x78, 0x00, 0x00, 0x00, 0x21, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80,
+	0x5f, 0x9b, 0x34, 0xfb,
+	0x06, 0x73, 0x74, 0x61, 0x74, 0x75, 0x73,
+	0x00, 0x00, 0x00, 0x20, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34,
+	0x56, 0x78, 0x00, 0x00, 0x00, 0x22, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80,
+	0x5f, 0x9b, 0x34, 0xfb,
+	0x04, 0x64, 0x61, 0x74, 0x61,
+	0x00, 0x00, 0x00, 0x20, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x12, 0x34,
+	0x56, 0x78, 0x00, 0x00, 0x00, 0x23, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0x80,
+	0x5f, 0x9b, 0x34, 0xfb,
+	/* frames: 2. "progress" on source 1 with select_if { offset 0, eq [0x02] }
+	 * and three scalars (u8 @0, u32be @1, u32be @5); "chunk" on source 2
+	 * with no select_if, no scalars, and one span "payload" @0 with no
+	 * declared length. */
+	0x02,
+	0x08, 0x70, 0x72, 0x6f, 0x67, 0x72, 0x65, 0x73, 0x73, 0x01, 0x01, 0x00, 0x01, 0x02,
+	0x03,
+	0x08, 0x6d, 0x73, 0x67, 0x5f, 0x74, 0x79, 0x70, 0x65, 0x00, 0x00,
+	0x06, 0x6f, 0x66, 0x66, 0x73, 0x65, 0x74, 0x01, 0x07,
+	0x05, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x05, 0x07,
+	0x00,
+	0x05, 0x63, 0x68, 0x75, 0x6e, 0x6b, 0x02, 0x00, 0x00, 0x01,
+	0x07, 0x70, 0x61, 0x79, 0x6c, 0x6f, 0x61, 0x64, 0x00, 0x00,
+	/* session: 2 -- "received" = 0, "expect_total" = 0 (zigzag). */
+	0x02,
+	0x08, 0x72, 0x65, 0x63, 0x65, 0x69, 0x76, 0x65, 0x64, 0x00,
+	0x0c, 0x65, 0x78, 0x70, 0x65, 0x63, 0x74, 0x5f, 0x74, 0x6f, 0x74, 0x61, 0x6c, 0x00,
+	/* states: 6. */
+	0x06,
+	/* 0 "start": on_enter write ctrl { u8 0x01 } with_response; on_event
+	 * frame 0 { remember session[1] = frame.field[2]; otherwise goto 1 };
+	 * on_timeout 2000ms retry 2 -> goto 5. */
+	0x05, 0x73, 0x74, 0x61, 0x72, 0x74, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x02, 0x01,
+	0x01, 0x00, 0x01, 0x01, 0x00, 0x01, 0x02, 0x00, 0x01, 0x01, 0x01, 0xd0, 0x0f, 0x02,
+	0x05,
+	/* 1 "pumping": on_enter write ctrl { u8 0x02 } **without** response;
+	 * on_event frame 1 { remember session[0] = session[0] + len(span 0);
+	 * when session[0] >= session[1] -> goto 2; otherwise goto 1 };
+	 * on_timeout 1500ms retry 0 -> goto 3. The self-transitioning
+	 * `otherwise` is the flow-control ack, and the one thing this whole
+	 * fixture exists to keep honest. */
+	0x07, 0x70, 0x75, 0x6d, 0x70, 0x69, 0x6e, 0x67, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+	0x04, 0x00, 0x01, 0x01, 0x01, 0x00, 0x01, 0x02, 0x00, 0x03, 0x00, 0x01, 0x02, 0x00,
+	0x05, 0x02, 0x01, 0x02, 0x01, 0x01, 0x01, 0xdc, 0x0b, 0x00, 0x03,
+	/* 2 "consuming": write ctrl { u8 0x03 } with_response; on_event frame 0
+	 * -> goto 4; on_timeout 2000ms retry 1 -> goto 3. */
+	0x09, 0x63, 0x6f, 0x6e, 0x73, 0x75, 0x6d, 0x69, 0x6e, 0x67, 0x00, 0x01, 0x00, 0x01,
+	0x00, 0x00, 0x06, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0xd0, 0x0f, 0x01,
+	0x03,
+	/* 3 "aborting": write ctrl { u8 0x04 } with_response; on_event frame 0
+	 * -> goto 5; on_timeout 2000ms retry 0 -> goto 5. */
+	0x08, 0x61, 0x62, 0x6f, 0x72, 0x74, 0x69, 0x6e, 0x67, 0x00, 0x01, 0x00, 0x01, 0x00,
+	0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x01, 0xd0, 0x0f, 0x00, 0x05,
+	/* 4 "done" outcome: pass, 5 "failed" outcome: fail. */
+	0x04, 0x64, 0x6f, 0x6e, 0x65, 0x01, 0x00,
+	0x06, 0x66, 0x61, 0x69, 0x6c, 0x65, 0x64, 0x01, 0x01,
+	/* protocols_crc = 0xEFF3E046. */
+	0xc6, 0xc0, 0xcf, 0xff, 0x0e,
+};
+
+ZTEST(serial_protocol, test_decodes_cores_study_start_carrying_a_protocol)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(core_study_start_with_protocol_frame,
+					     sizeof(core_study_start_with_protocol_frame), framed);
+
+	zassert_true(framed_len > 0, "COBS encode of Core's payload failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode a StudyStart carrying an .eap protocol");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(ss->steps_len, 1, "steps_len mismatch");
+	zassert_false(ss->has_unsupported_action, "DBM_ACTION_RUN_PROTOCOL must be recognized");
+	zassert_true(ss->steps_crc_valid,
+		     "steps_crc must validate -- a RunProtocol action walked as field-less "
+		     "reads its two index bytes as the next field and is exactly what this "
+		     "catches");
+	zassert_equal(ss->steps[0].action_tag, DBM_ACTION_RUN_PROTOCOL, "step 0 action_tag");
+	zassert_equal(ss->steps[0].action.run_protocol.protocol, 0, "step 0 protocol index");
+	zassert_equal(ss->steps[0].action.run_protocol.entry_state, 0, "step 0 entry_state");
+	zassert_equal(ss->steps[0].timeout_ms, 30000, "step 0 timeout");
+
+	/* The third seal, checked independently of the other two -- which is
+	 * the whole reason there are three siblings rather than one widened
+	 * one: a mismatch says which of the three is corrupt. */
+	zassert_true(ss->streams_crc_valid, "streams_crc (of nothing) must still validate");
+	zassert_equal(ss->protocols_crc, 0xEFF3E046, "protocols_crc mismatch");
+	zassert_true(ss->protocols_crc_valid,
+		     "protocols_crc computed over the crate's own manifest bytes must validate");
+
+	zassert_equal(ss->protocols_len, 1, "protocols_len mismatch");
+
+	const struct eap_protocol_def *def = &ss->protocols[0];
+
+	zassert_equal(def->sources_len, 3, "sources_len mismatch");
+	zassert_equal(def->frames_len, 2, "frames_len mismatch");
+	zassert_equal(def->session_len, 2, "session_len mismatch");
+	zassert_equal(def->states_len, 6, "states_len mismatch");
+
+	/* Sources: the three characteristic UUIDs differ in one byte, so a
+	 * decoder that read one source three times passes every length
+	 * assertion above and fails here. */
+	zassert_equal(def->sources[0].characteristic_uuid[3], 0x21, "source 0 characteristic");
+	zassert_equal(def->sources[1].characteristic_uuid[3], 0x22, "source 1 characteristic");
+	zassert_equal(def->sources[2].characteristic_uuid[3], 0x23, "source 2 characteristic");
+
+	/* Frame 0 dispatches on a magic byte; frame 1 does not, and a frame
+	 * with no `select_if` matches any payload on its source. */
+	zassert_equal(def->frames[0].source, 1, "frame 0 source");
+	zassert_true(def->frames[0].has_select, "frame 0 has a select_if");
+	zassert_equal(def->frames[0].select_offset, 0, "frame 0 select offset");
+	zassert_equal(def->frames[0].select_len, 1, "frame 0 select length");
+	zassert_equal(def->frames[0].select_eq[0], 0x02, "frame 0 select byte");
+	zassert_equal(def->frames[0].fields_len, 3, "frame 0 fields_len");
+	zassert_equal(def->frames[0].fields[2].offset, 5, "frame 0 field 2 offset");
+	zassert_equal(def->frames[0].fields[2].ty, EAP_SCALAR_U32BE, "frame 0 field 2 type");
+	zassert_equal(def->frames[0].spans_len, 0, "frame 0 spans_len");
+
+	zassert_equal(def->frames[1].source, 2, "frame 1 source");
+	zassert_false(def->frames[1].has_select, "frame 1 has no select_if");
+	zassert_equal(def->frames[1].spans_len, 1, "frame 1 spans_len");
+	zassert_false(def->frames[1].spans[0].has_len, "frame 1 span is 'the rest of the payload'");
+
+	/* States: the one string a manifest keeps, and the shapes the machine
+	 * runs on. */
+	zassert_str_equal(def->states[0].name, "start", "state 0 name");
+	zassert_equal(def->states[0].kind, EAP_STATE_ACTIVE, "state 0 kind");
+	zassert_true(def->states[0].has_on_enter, "state 0 writes on entry");
+	zassert_true(def->states[0].on_enter.with_response, "state 0's REQUEST_OLDEST is acked");
+	zassert_equal(def->states[0].on_enter.fields_len, 1, "state 0 write field count");
+	zassert_equal(def->states[0].on_enter.fields[0].value.kind, EAP_OP_LITERAL,
+		      "state 0 write operand kind");
+	zassert_equal((int)def->states[0].on_enter.fields[0].value.literal, 0x01,
+		      "state 0 write opcode");
+	zassert_true(def->states[0].has_on_timeout, "state 0 has a timeout");
+	zassert_equal(def->states[0].on_timeout.after_ms, 2000, "state 0 timeout");
+	zassert_equal(def->states[0].on_timeout.retry, 2, "state 0 retries");
+	zassert_equal(def->states[0].on_timeout.goto_state, 5, "state 0 timeout target");
+
+	/* `with_response` really is per-write, not per-protocol: NEXT_CHUNK is
+	 * a Write Command and REQUEST_OLDEST is a Write Request. */
+	zassert_str_equal(def->states[1].name, "pumping", "state 1 name");
+	zassert_false(def->states[1].on_enter.with_response, "state 1's NEXT_CHUNK is unacked");
+	zassert_equal(def->states[1].on_event_len, 1, "state 1 arm count");
+	zassert_equal(def->states[1].on_event[0].frame, 1, "state 1 reacts to the chunk frame");
+	zassert_equal(def->states[1].on_event[0].remember_len, 1, "state 1 remember count");
+	zassert_equal(def->states[1].on_event[0].remember[0].value.kind, EAP_EXPR_ADD,
+		      "state 1 accumulates rather than assigning");
+	zassert_equal(def->states[1].on_event[0].remember[0].value.b.kind, EAP_OP_SPAN_LEN,
+		      "state 1 counts the chunk's own length");
+	zassert_equal(def->states[1].on_event[0].when_len, 1, "state 1 guard count");
+	zassert_equal(def->states[1].on_event[0].when[0].cond.op, EAP_CMP_GE, "state 1 guard op");
+	zassert_equal(def->states[1].on_event[0].when[0].goto_state, 2, "state 1 guard target");
+	/* **The distinction row 66 of embarch-decision-reversals.md is about.**
+	 * This arm has an `otherwise` pointing at its own state, which
+	 * re-enters and re-sends the ack; an absent `otherwise` would consume
+	 * every chunk correctly, ack none of them, and stall at the watchdog. */
+	zassert_true(def->states[1].on_event[0].has_otherwise, "state 1 has an otherwise");
+	zassert_equal(def->states[1].on_event[0].otherwise, 1, "state 1 otherwise self-transitions");
+
+	zassert_str_equal(def->states[4].name, "done", "state 4 name");
+	zassert_equal(def->states[4].kind, EAP_STATE_TERMINAL, "state 4 kind");
+	zassert_equal(def->states[4].terminal, EAP_TERMINAL_PASS, "state 4 outcome");
+	zassert_str_equal(def->states[5].name, "failed", "state 5 name");
+	zassert_equal(def->states[5].terminal, EAP_TERMINAL_FAIL, "state 5 outcome");
+}
+
+ZTEST(serial_protocol, test_a_corrupt_protocol_span_fails_only_its_own_seal)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	uint8_t corrupt[sizeof(core_study_start_with_protocol_frame)];
+
+	memcpy(corrupt, core_study_start_with_protocol_frame, sizeof(corrupt));
+	/* Flip one bit of a state name, inside the protocols span and outside
+	 * both other spans. The whole point of three sibling seals rather than
+	 * one widened one is that this says *which* half of a Study arrived
+	 * corrupt. */
+	corrupt[sizeof(corrupt) - 20] ^= 0x01;
+
+	size_t framed_len = test_cobs_encode(corrupt, sizeof(corrupt), framed);
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "a corrupt protocol must still decode -- the seal reports it, the "
+		      "decoder does not refuse it");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_true(ss->steps_crc_valid, "steps_crc is unaffected by a corrupt protocol");
+	zassert_true(ss->streams_crc_valid, "streams_crc is unaffected by a corrupt protocol");
+	zassert_false(ss->protocols_crc_valid, "protocols_crc must not validate");
+}
+
+ZTEST(serial_protocol, test_step_result_with_a_protocol_outcome_encodes_to_the_pinned_wire_bytes)
+{
+	/* Schema v15's populated trailing field. The all-None vectors above
+	 * pin the one appended `0x00`; this is the case that catches an encoder
+	 * writing the Option byte and nothing after it.
+	 *
+	 * The step's own outcome is `TimedOut` while the protocol's is `Fail`
+	 * -- deliberately different, because they are two facts and a vector
+	 * where they agreed would pass against an encoder that filled one from
+	 * the other. Pre-COBS body pinned by embarch-study-designer's
+	 * dump_step_result_with_protocol_wire_bytes. */
+	static const uint8_t expected[] = {
+		0x0d, 0x07, 0x01, 0x08, 0x64, 0x6f, 0x77, 0x6e, 0x6c, 0x6f, 0x61, 0x64,
+		0x02, 0x01, 0x01, 0x35, 0x01, 0x08, 0x61, 0x62, 0x6f, 0x72, 0x74, 0x69,
+		0x6e, 0x67, 0x01, 0x28, 0x70, 0x72, 0x6f, 0x74, 0x6f, 0x63, 0x6f, 0x6c,
+		0x20, 0x72, 0x65, 0x61, 0x63, 0x68, 0x65, 0x64, 0x20, 0x74, 0x65, 0x72,
+		0x6d, 0x69, 0x6e, 0x61, 0x6c, 0x20, 0x73, 0x74, 0x61, 0x74, 0x65, 0x20,
+		0x61, 0x62, 0x6f, 0x72, 0x74, 0x69, 0x6e, 0x67, 0x00,
+	};
+	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
+
+	memset(&pinned_step_result_msg, 0, sizeof(pinned_step_result_msg));
+	pinned_step_result_msg.tag = DBM_TAG_STEP_RESULT;
+	pinned_step_result_msg.step_result.step_index = 1;
+	strcpy(r->step_name, "download");
+	r->outcome.tag = 2; /* TimedOut */
+	r->has_protocol = true;
+	strcpy(r->protocol_final_state, "aborting");
+	r->protocol_outcome.tag = 1; /* Fail */
+	strcpy(r->protocol_outcome.fail_reason, "protocol reached terminal state aborting");
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+	int frame_len = dbm_encode_frame(&pinned_step_result_msg, frame, sizeof(frame));
+
+	zassert_equal(frame_len, (int)sizeof(expected), "frame length mismatch");
+	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
+}
+
+/* ---- the interpreter itself (eap_interp.c) -----------------------------
+ *
+ * These are the C half of `embarch-study-designer/tests/eap_worked_protocols.rs`
+ * -- the same worked BDS download, the same sequences, the same expected
+ * transitions. §3 decision 60 put the executor on this side and left the
+ * specification in that crate, and the only thing that makes that division
+ * safe is both being driven through the same cases.
+ *
+ * The manifest under test is not hand-built: it is decoded out of the pinned
+ * frame above, so these tests run against the same bytes Core would send.
+ */
+
+static struct dev_bench_message interp_msg;
+
+static const struct eap_protocol_def *worked_protocol(void)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(core_study_start_with_protocol_frame,
+					     sizeof(core_study_start_with_protocol_frame), framed);
+
+	memset(&interp_msg, 0, sizeof(interp_msg));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &interp_msg), 0,
+		      "the worked protocol must decode");
+	return &interp_msg.study_start.protocols[0];
+}
+
+/* A `progress` notification: type 0x02, then big-endian offset and total. */
+static void progress_frame(uint8_t out[9], uint32_t offset, uint32_t total)
+{
+	out[0] = 0x02;
+	out[1] = (uint8_t)(offset >> 24);
+	out[2] = (uint8_t)(offset >> 16);
+	out[3] = (uint8_t)(offset >> 8);
+	out[4] = (uint8_t)offset;
+	out[5] = (uint8_t)(total >> 24);
+	out[6] = (uint8_t)(total >> 16);
+	out[7] = (uint8_t)(total >> 8);
+	out[8] = (uint8_t)total;
+}
+
+static void notify(struct eap_run *run, uint8_t source, const uint8_t *payload, size_t len,
+		   struct eap_step *step)
+{
+	struct eap_event ev = {
+		.kind = EAP_EVENT_NOTIFY, .source = source, .payload = payload, .payload_len = len};
+
+	eap_run_on_event(run, &ev, step);
+}
+
+static void expire(struct eap_run *run, struct eap_step *step)
+{
+	struct eap_event ev = {.kind = EAP_EVENT_TIMEOUT};
+
+	eap_run_on_event(run, &ev, step);
+}
+
+ZTEST(serial_protocol, test_bds_download_runs_to_pass_over_a_real_chunk_sequence)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+	uint8_t chunk[200] = {0};
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, "run starts at `start`");
+	eap_run_enter(&run, &step);
+
+	/* start: REQUEST_OLDEST, acknowledged. */
+	zassert_equal(step.kind, EAP_STEP_WRITE, "entering `start` writes");
+	zassert_equal(step.source, 0, "REQUEST_OLDEST goes to ctrl");
+	zassert_equal(step.payload_len, 1, "one-byte opcode");
+	zassert_equal(step.payload[0], 0x01, "REQUEST_OLDEST");
+	zassert_true(step.with_response, "REQUEST_OLDEST is acked");
+	zassert_true(step.has_deadline, "`start` arms its own 2s deadline");
+	zassert_equal(step.deadline_ms, 2000, "`start` deadline");
+
+	/* The DUT answers on a *different* characteristic -- the whole reason
+	 * nothing here transitions on a write's own ATT response. */
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+
+	zassert_equal(step.kind, EAP_STEP_WRITE, "the transition into `pumping` writes");
+	zassert_equal(step.payload[0], 0x02, "NEXT_CHUNK");
+	zassert_false(step.with_response, "NEXT_CHUNK is a Write Command");
+	zassert_equal(eap_run_state(&run), 1, "now in `pumping`");
+
+	/* 700 bytes in 200-byte chunks: three full, one short. Each of the
+	 * first three self-transitions, which re-sends the ack. */
+	for (int i = 0; i < 3; i++) {
+		notify(&run, 2, chunk, 200, &step);
+		zassert_equal(step.kind, EAP_STEP_WRITE, "chunk %d re-acks", i);
+		zassert_equal(step.payload[0], 0x02, "chunk %d re-sends NEXT_CHUNK", i);
+		zassert_equal(eap_run_state(&run), 1, "chunk %d stays in `pumping`", i);
+	}
+
+	notify(&run, 2, chunk, 100, &step);
+	zassert_equal(eap_run_state(&run), 2, "700 received -> `consuming`");
+	zassert_equal(step.kind, EAP_STEP_WRITE, "entering `consuming` writes");
+	zassert_equal(step.payload[0], 0x03, "CONSUME_OLDEST");
+
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(step.kind, EAP_STEP_DONE, "the run finished");
+	zassert_equal(step.outcome.tag, EAP_OUTCOME_PASS, "`done` declares pass");
+	zassert_str_equal(step.final_state, "done", "final state");
+}
+
+ZTEST(serial_protocol, test_retry_re_sends_the_on_enter_write_rather_than_waiting_longer)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	zassert_equal(step.payload[0], 0x01, "the first REQUEST_OLDEST");
+
+	/* `retry 2`: two expiries re-send, the third takes the goto. This is
+	 * the behavior the whole `retry` field exists for -- a bench that
+	 * merely waited longer would look identical for two expiries and
+	 * differ only in what the DUT saw. */
+	for (int i = 0; i < 2; i++) {
+		expire(&run, &step);
+		zassert_equal(step.kind, EAP_STEP_WRITE, "retry %d re-sends", i);
+		zassert_equal(step.payload[0], 0x01, "retry %d re-sends REQUEST_OLDEST", i);
+		zassert_equal(eap_run_state(&run), 0, "retry %d stays in `start`", i);
+	}
+
+	expire(&run, &step);
+	zassert_equal(step.kind, EAP_STEP_DONE, "retries exhausted -> terminal");
+	zassert_equal(step.outcome.tag, EAP_OUTCOME_FAIL, "`failed` declares fail");
+	zassert_str_equal(step.final_state, "failed", "final state");
+	/* Byte-for-byte the sentence `eap_interp.rs`'s own `fail_reason`
+	 * builds, so a run reads identically whichever interpreter produced
+	 * it. */
+	zassert_str_equal(step.outcome.fail_reason, "protocol reached terminal state failed",
+			  "fail_reason must match the Rust reference's wording");
+}
+
+ZTEST(serial_protocol, test_a_stalled_pump_takes_the_watchdog_to_aborting_and_then_fails)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(eap_run_state(&run), 1, "in `pumping`");
+
+	/* `retry 0` on the stall watchdog: the first expiry takes the goto,
+	 * which is what a watchdog wants and the opposite of `start`'s. */
+	expire(&run, &step);
+	zassert_equal(eap_run_state(&run), 3, "the stall watchdog goes straight to `aborting`");
+	zassert_equal(step.kind, EAP_STEP_WRITE, "`aborting` writes ABORT");
+	zassert_equal(step.payload[0], 0x04, "ABORT opcode");
+	zassert_true(step.with_response, "ABORT is always acked -- the DUT must not stay wedged");
+
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(step.kind, EAP_STEP_DONE, "aborting -> failed");
+	zassert_str_equal(step.final_state, "failed", "final state");
+}
+
+ZTEST(serial_protocol, test_an_unrelated_notification_is_ignored_rather_than_failing_the_run)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t not_progress[9] = {0x7f, 0, 0, 0, 0, 0, 0, 0, 0};
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+
+	/* Wrong magic byte on the status characteristic: no frame selects, so
+	 * nothing happens. A machine that failed on the first unrelated
+	 * notification could not survive a real connection. */
+	notify(&run, 1, not_progress, sizeof(not_progress), &step);
+	zassert_equal(step.kind, EAP_STEP_WAIT, "an unmatched frame is ignored");
+	zassert_equal(eap_run_state(&run), 0, "and does not move the machine");
+	zassert_true(step.has_deadline, "the state's deadline keeps running");
+
+	/* A notification on a source no frame reads is equally ignored. */
+	notify(&run, 0, not_progress, sizeof(not_progress), &step);
+	zassert_equal(step.kind, EAP_STEP_WAIT, "an unread source is ignored");
+	zassert_equal(eap_run_state(&run), 0, "and does not move the machine");
+}
+
+ZTEST(serial_protocol, test_a_truncated_frame_is_never_zero_filled)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	/* `progress.total` lives at offset 5. This payload matches the magic
+	 * byte and then stops short of it. */
+	uint8_t truncated[5] = {0x02, 0, 0, 0, 1};
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+
+	notify(&run, 1, truncated, sizeof(truncated), &step);
+
+	/* The arm's `otherwise` is unconditional, so the machine does move --
+	 * that is the manifest's decision. What the interpreter guarantees is
+	 * the other half: `expect_total` keeps its **declared** initial value
+	 * rather than a zero conjured out of bytes that never arrived. Mirrors
+	 * the crate's own `a_truncated_frame_does_not_advance_the_machine`. */
+	zassert_equal((int)eap_run_session(&run)[1], 0,
+		      "the declared initial value, not a decoded one");
+}
+
+ZTEST(serial_protocol, test_a_short_payload_makes_a_guard_false_rather_than_true)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(eap_run_state(&run), 1, "in `pumping` with expect_total = 700");
+
+	/* A zero-length chunk: `len(chunk.payload)` resolves to 0 (the span is
+	 * "the rest of the payload" and there is none), so `received` stays 0
+	 * and the guard is false. The machine self-transitions and asks again
+	 * rather than declaring the download complete. */
+	notify(&run, 2, progress, 0, &step);
+	zassert_equal(eap_run_state(&run), 1, "a zero-length chunk does not finish the download");
+	zassert_equal(step.kind, EAP_STEP_WRITE, "it re-acks instead");
+	zassert_equal(step.payload[0], 0x02, "NEXT_CHUNK again");
+}
+
+ZTEST(serial_protocol, test_the_step_timeout_is_the_only_way_to_reach_timed_out)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+	struct eap_step step;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+
+	/* `Outcome::TimedOut` is the one outcome no manifest can declare --
+	 * `TerminalOutcome` has exactly `pass` and `fail` -- so the only
+	 * producer of it is the step's own budget running out. */
+	eap_run_abandon(&run, &step);
+	zassert_equal(step.kind, EAP_STEP_DONE, "abandoning ends the run");
+	zassert_equal(step.outcome.tag, EAP_OUTCOME_TIMED_OUT, "reported as TimedOut");
+	zassert_str_equal(step.final_state, "start",
+			  "against whatever state it was sitting in, which is the whole "
+			  "diagnostic value of recording one");
+}
+
+ZTEST(serial_protocol, test_an_out_of_range_entry_state_is_refused)
+{
+	const struct eap_protocol_def *def = worked_protocol();
+	struct eap_run run;
+
+	/* Belt and braces -- `validate_protocol`, Core's pre-flight and
+	 * main.c's own check all range-check this first. Refused here anyway
+	 * rather than left to a raw array subscript, which is §3 decision 18's
+	 * rule. */
+	zassert_equal(eap_run_start(&run, def, def->states_len), -1,
+		      "an entry state past the end must be refused");
+}
+
+/* ---- the disclosed capacity limits -------------------------------------
+ *
+ * Every cap this firmware sets below the crate's own is refused **outright
+ * and by returning a failure**, never by truncating -- the posture
+ * DBM_MAX_STEPS_PER_STUDY established. A truncated protocol is worse than a
+ * refused one: a state machine missing an event arm still runs, and branches
+ * wrongly while looking correct.
+ */
+
+/* A minimal well-formed `protocols` span: one protocol, one source, one
+ * frame, no session variables, and `states_len` states whose first has
+ * `arms` event arms. Returns the body length written.
+ *
+ * Hand-built rather than dumped from the crate on purpose: the crate cannot
+ * *produce* a manifest past this firmware's own caps -- they are below its
+ * ceilings, which is the whole point -- so the only way to test the refusal
+ * is to write the bytes here. */
+static size_t build_protocol_study_start(uint8_t *out, uint8_t protocols, uint8_t arms)
+{
+	size_t n = 0;
+
+	out[n++] = 0x06; /* StudyStart */
+	out[n++] = 0x00; /* steps: empty */
+	out[n++] = 0x00; /* steps_crc = 0 (the CRC of nothing) */
+	out[n++] = 0x00; /* streams: empty */
+	out[n++] = 0x00; /* streams_crc = 0 */
+	out[n++] = 0x00; /* dev_bench_log_level = Off */
+	out[n++] = protocols;
+	for (uint8_t p = 0; p < protocols; p++) {
+		out[n++] = 0x01;
+		out[n++] = 'p'; /* name */
+		out[n++] = 0x01; /* sources: 1 */
+		out[n++] = 0x01;
+		out[n++] = 's'; /* alias */
+		memset(out + n, 0, 32); /* service + characteristic UUIDs */
+		n += 32;
+		out[n++] = 0x01; /* frames: 1 */
+		out[n++] = 0x01;
+		out[n++] = 'f';  /* name */
+		out[n++] = 0x00; /* source 0 */
+		out[n++] = 0x00; /* select_if: None */
+		out[n++] = 0x00; /* fields: none */
+		out[n++] = 0x00; /* spans: none */
+		out[n++] = 0x00; /* session: none */
+		out[n++] = 0x01; /* states: 1 */
+		out[n++] = 0x01;
+		out[n++] = 'a';  /* name */
+		out[n++] = 0x00; /* StateKind::Active */
+		out[n++] = 0x00; /* on_enter: None */
+		out[n++] = arms; /* on_event */
+		for (uint8_t a = 0; a < arms; a++) {
+			out[n++] = 0x00; /* frame 0 */
+			out[n++] = 0x00; /* remember: none */
+			out[n++] = 0x00; /* when: none */
+			out[n++] = 0x00; /* otherwise: None */
+		}
+		out[n++] = 0x00; /* on_timeout: None */
+	}
+	out[n++] = 0x00; /* protocols_crc (deliberately wrong; unread on a reject) */
+	return n;
+}
+
+static int decode_built(const uint8_t *body, size_t body_len)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(body, body_len, framed);
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	return dbm_decode_frame(framed, framed_len, &study_start_decoded);
+}
+
+ZTEST(serial_protocol, test_a_protocol_within_every_cap_decodes)
+{
+	uint8_t body[256];
+	size_t len = build_protocol_study_start(body, DBM_MAX_PROTOCOLS_PER_STUDY,
+						EAP_MAX_EVENT_ARMS_PER_STATE);
+
+	/* The control for the two refusals below: at exactly the caps, this
+	 * shape decodes. Without it, a decoder that rejected everything would
+	 * pass both of them. */
+	zassert_equal(decode_built(body, len), 0, "a manifest at the caps must decode");
+	zassert_equal(study_start_decoded.study_start.protocols_len,
+		      DBM_MAX_PROTOCOLS_PER_STUDY, "protocols_len mismatch");
+	zassert_equal(study_start_decoded.study_start.protocols[0].states[0].on_event_len,
+		      EAP_MAX_EVENT_ARMS_PER_STATE, "on_event_len mismatch");
+}
+
+ZTEST(serial_protocol, test_more_protocols_than_this_bench_holds_is_refused)
+{
+	uint8_t body[512];
+	size_t len = build_protocol_study_start(body, DBM_MAX_PROTOCOLS_PER_STUDY + 1,
+						EAP_MAX_EVENT_ARMS_PER_STATE);
+
+	zassert_not_equal(decode_built(body, len), 0,
+			  "protocols_len beyond struct eap_protocol_def[]'s bound must be "
+			  "rejected, not read out of bounds");
+}
+
+ZTEST(serial_protocol, test_more_event_arms_than_this_bench_holds_is_refused)
+{
+	uint8_t body[256];
+	size_t len = build_protocol_study_start(body, 1, EAP_MAX_EVENT_ARMS_PER_STATE + 1);
+
+	/* The one cap below the crate's own (4 there, 2 here -- see
+	 * EAP_MAX_EVENT_ARMS_PER_STATE). Core considers this legal; this
+	 * firmware cannot hold it and says so rather than dropping the third
+	 * transition, which would be a state machine that runs and branches
+	 * wrongly. */
+	zassert_not_equal(decode_built(body, len), 0,
+			  "an event-arm count past this firmware's cap must be rejected");
+}
+
+ZTEST(serial_protocol, test_a_protocols_span_past_the_byte_cap_is_refused)
+{
+	static uint8_t body[DBM_MAX_PROTOCOLS_WIRE_LEN + 256];
+	size_t n = 0;
+	/* A protocol *name* long enough to push the span past the byte cap on
+	 * its own. Names are the bulk of what a manifest spends bytes on and
+	 * the whole of what this firmware discards, which is exactly why the
+	 * cap is on bytes rather than on the counts. */
+	const size_t name_len = DBM_MAX_PROTOCOLS_WIRE_LEN + 1;
+
+	body[n++] = 0x06;
+	body[n++] = 0x00; /* steps: empty */
+	body[n++] = 0x00; /* steps_crc */
+	body[n++] = 0x00; /* streams: empty */
+	body[n++] = 0x00; /* streams_crc */
+	body[n++] = 0x00; /* dev_bench_log_level */
+	body[n++] = 0x01; /* protocols: 1 */
+	/* name: a varint length, then that many bytes. */
+	body[n++] = (uint8_t)((name_len & 0x7f) | 0x80);
+	body[n++] = (uint8_t)(name_len >> 7);
+	memset(body + n, 'x', name_len);
+	n += name_len;
+	body[n++] = 0x00; /* sources: none */
+	body[n++] = 0x00; /* frames: none */
+	body[n++] = 0x00; /* session: none */
+	body[n++] = 0x00; /* states: none */
+	body[n++] = 0x00; /* protocols_crc */
+
+	zassert_true(n <= sizeof(body), "test body overflowed its own buffer");
+	zassert_not_equal(decode_built(body, n), 0,
+			  "a protocols span past DBM_MAX_PROTOCOLS_WIRE_LEN must be refused");
 }
