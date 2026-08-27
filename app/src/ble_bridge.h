@@ -384,6 +384,34 @@ struct ble_transcript_entry {
 typedef void (*ble_transcript_sink)(const struct ble_transcript_entry *entry, void *user_data);
 void ble_bridge_set_transcript_sink(ble_transcript_sink sink, void *user_data);
 
+/* Receives notice that **one inbound notification was lost before it could
+ * reach the transcript sink at all**, identified by the characteristic it
+ * would have carried.
+ *
+ * This exists because a loss inside the bridge is invisible to the sink
+ * above by construction: `execute_run_protocol` feeds the transcript from
+ * its own dequeue loop, so a notification the interpreter's four-slot queue
+ * (`PROTOCOL_NOTIFY_QUEUE_SLOTS`) drops is never emitted, and a
+ * `StreamSource::GattNotify` tap on that characteristic silently loses
+ * payload while its `truncated` flag stays false. That is exactly the
+ * silently-incomplete capture the transcript's own drop counter exists to
+ * prevent, arriving through the one path that counter cannot see
+ * (embarch-doc/embarch-decision-reversals.md row 73). One call per lost
+ * notification; the count is the sink's to keep.
+ *
+ * Same context and same restrictions as the transcript sink: invoked from
+ * Zephyr's BT RX thread, **must not block**, must not touch the link UART.
+ * A drop is deliberately *not* reported as a `ble_transcript_entry` with
+ * some new kind -- a `GattNotify` tap's file is the characteristic's raw
+ * bytes and nothing else, so a marker record in it would corrupt the very
+ * capture this is trying to describe. It is a count, out of band, and it
+ * ends up on `StreamClose.dropped` where Core already knows how to read it.
+ *
+ * With no sink registered, drops are counted only in the bridge's own
+ * end-of-run log line, which is where they all went before this existed. */
+typedef void (*ble_drop_sink)(const uint8_t characteristic_uuid[16], void *user_data);
+void ble_bridge_set_drop_sink(ble_drop_sink sink, void *user_data);
+
 /* Receives a human-readable diagnostic line from the bridge.
  *
  * Unlike the transcript sink above, this is **only ever invoked from the

@@ -183,6 +183,33 @@ static volatile uint32_t transcript_step_index;
  * failure mode decision 36 exists to remove. */
 static volatile uint32_t transcript_dropped;
 
+/* Per-tap loss, by index into `study_taps`, sent on that tap's own
+ * `StreamClose.dropped` and turned into `StreamRef.truncated` by Core.
+ *
+ * This array is the fix for the asymmetry row 73 records: `transcript_dropped`
+ * above was this firmware's *only* drop counter and the transcript tap its
+ * only possible subject, so every `StreamSource::GattNotify` tap reported 0
+ * unconditionally -- including the ones that had genuinely lost data. A
+ * capture reported 28,548 bytes and `truncated: false` while 275
+ * notifications were missing from it.
+ *
+ * Three distinct paths can lose a record and all three land here now:
+ *   1. `transcript_q` full in the sink below -- charged to every open tap
+ *      that wanted the entry, since one entry legitimately feeds several.
+ *   2. an oversized or unencodable record in the TX thread -- charged to
+ *      the one tap it was being built for.
+ *   3. `protocol_notify_q` full **inside the bridge**, which never reaches
+ *      the sink at all and arrives instead through `drop_sink_cb`.
+ *
+ * Written from both the BT RX thread (1, 3) and the transcript TX thread (2)
+ * and read by the dispatch thread at close. Deliberately not atomics: a lost
+ * increment under a genuine race would understate a count that is already
+ * only ever compared against zero by Core, and the alternative -- a lock in
+ * the notify callback -- is what ble_bridge.h's contract forbids outright.
+ * Being approximately right about how much was lost is worth far more than
+ * being exactly right about nothing, which is what this reported before. */
+static volatile uint32_t tap_dropped[DBM_MAX_STREAMS_PER_STUDY];
+
 /* ble_bridge's sink: runs in the BT RX thread for anything inbound. Does the
  * least possible work -- one bounded copy into the queue -- and never touches
  * the UART, per ble_bridge.h's contract. */
@@ -232,6 +259,61 @@ static bool notify_tap_wants(const struct ble_transcript_entry *entry)
 	return false;
 }
 
+/* Charges one lost entry to every open tap that would have received it.
+ *
+ * The fan-out mirrors `transcript_tx_thread`'s exactly, and it has to: a
+ * notification can legitimately land in both the transcript's file and its
+ * characteristic's own, so losing it is a loss for both and charging it to
+ * one would leave the other reading as complete. Runs in the BT RX thread,
+ * so it does the same bounded walk `notify_tap_wants` already does and
+ * nothing more. */
+static void charge_drop_to_taps(const struct ble_transcript_entry *entry)
+{
+	if (transcript_tap_open && transcript_tap_index >= 0) {
+		tap_dropped[transcript_tap_index]++;
+	}
+	if (!entry->has_characteristic_uuid) {
+		return;
+	}
+	if (entry->kind != BLE_GATT_EVT_NOTIFICATION && entry->kind != BLE_GATT_EVT_INDICATION) {
+		return;
+	}
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		if (study_taps[i].source_tag != DBM_STREAM_SRC_GATT_NOTIFY || !tap_open[i]) {
+			continue;
+		}
+		if (memcmp(study_taps[i].characteristic_uuid, entry->characteristic_uuid, 16) == 0) {
+			tap_dropped[i]++;
+		}
+	}
+}
+
+/* ble_bridge's `ble_drop_sink`: a notification the interpreter's own
+ * four-slot queue dropped before it could ever be emitted as a transcript
+ * entry (ble_bridge.h, embarch-doc/embarch-decision-reversals.md row 73).
+ *
+ * Charged only to `GattNotify` taps on that characteristic, and deliberately
+ * **not** to the transcript tap: this loss happens upstream of
+ * `transcript_emit`, so the transcript never had the entry to lose and
+ * counting it there would overstate a number an engineer reads as "rows
+ * missing from this file". The bridge keeps its own total for its end-of-run
+ * log line; this is the per-tap half of the same fact.
+ *
+ * BT RX thread, one bounded walk, no lock -- same contract as the sink. */
+static void drop_sink_cb(const uint8_t characteristic_uuid[16], void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		if (study_taps[i].source_tag != DBM_STREAM_SRC_GATT_NOTIFY || !tap_open[i]) {
+			continue;
+		}
+		if (memcmp(study_taps[i].characteristic_uuid, characteristic_uuid, 16) == 0) {
+			tap_dropped[i]++;
+		}
+	}
+}
+
 static void transcript_sink_cb(const struct ble_transcript_entry *entry, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -255,6 +337,7 @@ static void transcript_sink_cb(const struct ble_transcript_entry *entry, void *u
 	 * reported instead. */
 	if (k_msgq_put(&transcript_q, &item, K_NO_WAIT) != 0) {
 		transcript_dropped++;
+		charge_drop_to_taps(entry);
 	}
 }
 
@@ -318,8 +401,11 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 					 * firmware produced (one ATT MTU is
 					 * smaller), but counted rather than
 					 * silently skipped so a truncated
-					 * capture never reads as complete. */
+					 * capture never reads as complete --
+					 * on **this tap**, which is the one
+					 * whose file would be short. */
 					transcript_dropped++;
+					tap_dropped[i]++;
 					continue;
 				}
 
@@ -402,6 +488,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 			 * "NOT exhaustive" report stays true if it ever does.
 			 */
 			transcript_dropped++;
+			tap_dropped[tap_index]++;
 			k_mutex_unlock(&link_tx_mutex);
 			continue;
 		}
@@ -511,14 +598,14 @@ static void sync_taps_for_step(uint32_t step_index)
 		if (want_open == tap_open[i]) {
 			continue;
 		}
-		/* `transcript_dropped` is this firmware's only drop counter,
-		 * and the transcript tap is the only tap it can describe --
-		 * every other tap reports 0 because nothing here produces
-		 * records for one yet. Reporting a count that isn't this
-		 * tap's would be worse than reporting none. */
-		uint32_t dropped = (!want_open && (int)i == transcript_tap_index)
-					   ? transcript_dropped
-					   : 0;
+		/* Each tap reports **its own** loss. Until 2026-08-27 this read
+		 * `transcript_dropped` for the transcript tap and a hardcoded
+		 * 0 for every other, which was true only for as long as the
+		 * transcript was the sole thing that could lose a record --
+		 * `GattNotify` taps outlived that and kept the 0, so a capture
+		 * missing 275 notifications closed with `dropped: 0` and Core
+		 * marked it `truncated: false` (row 73). */
+		uint32_t dropped = want_open ? 0 : tap_dropped[i];
 
 		set_tap_open(i, want_open, dropped);
 	}
@@ -533,6 +620,7 @@ static void load_study_taps(const struct dbm_study_start *study)
 	transcript_tap_index = -1;
 	transcript_tap_open = false;
 	memset(tap_open, 0, sizeof(tap_open));
+	memset((void *)tap_dropped, 0, sizeof(tap_dropped));
 
 	for (uint32_t i = 0; i < study_taps_len; i++) {
 		study_taps[i] = study->streams[i];
@@ -1378,6 +1466,7 @@ int main(void)
 	}
 
 	ble_bridge_set_transcript_sink(transcript_sink_cb, NULL);
+	ble_bridge_set_drop_sink(drop_sink_cb, NULL);
 	/* Safe to write the link directly from this sink, unlike the transcript
 	 * one: ble_bridge.h's `ble_log_sink` contract is that it's only ever
 	 * called from this thread, inside ble_bridge_execute. */
