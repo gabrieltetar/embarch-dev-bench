@@ -215,8 +215,12 @@ static struct bt_gatt_discover_params monitor_ccc_discover_params[BLE_MAX_MONITO
 static uint16_t monitor_char_index[BLE_MAX_MONITOR_SUBSCRIPTIONS];
 static uint8_t monitor_subscribe_count;
 
-static struct ble_gatt_activity_record activity[BLE_MAX_GATT_ACTIVITY_RECORDS];
-static size_t activity_len;
+/* `activity[]`/`activity_len` were here -- the fixed-size inline summary
+ * `StepResult.gatt_activity` carried. Retired with that field
+ * (embarch-study-designer/design.md §3 decision 54): 32 × 528 bytes of
+ * static RAM holding the first 32 records of a capture the transcript tap
+ * already streams to Core in full. Nothing read the truncated copy that
+ * couldn't read the complete one. */
 
 /* ---- GATT transcript (design.md §3 decision 36) ------------------------- */
 
@@ -1527,51 +1531,55 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 	const uint8_t *tr_char_uuid = NULL;
 
 	(void)uuids_for_flat_index(flat_for_transcript, &tr_service_uuid, &tr_char_uuid);
-	/* Emitted before the cap check below, deliberately: the streamed
-	 * transcript is bounded only by the study's own duration (design.md §3
-	 * decision 36), where `activity` is a fixed-size inline summary. This
-	 * is the one line that makes "exhaustive" true -- a capture past
-	 * BLE_MAX_GATT_ACTIVITY_RECORDS still reaches Core in full, even though
-	 * the `events.json` summary stops growing. */
+	/* **The only sink for a captured notification, as of schema v14.** It
+	 * used to be one of two, the other being a 32-record inline summary
+	 * that stopped growing mid-capture (design.md §3 decision 54 retired
+	 * it). The transcript is bounded only by the study's own duration, and
+	 * main.c fans one entry out to the declared transcript tap and to any
+	 * GattNotify tap that named this characteristic
+	 * (embarch-study-designer/design.md §3 decision 55) -- so
+	 * "exhaustive" is now true of every route a record can take, rather
+	 * than of one of two. */
 	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, tr_service_uuid,
 			tr_char_uuid, 0, data, length);
-
-	if (activity_len >= BLE_MAX_GATT_ACTIVITY_RECORDS) {
-		/* Overflow: stop adding to the inline summary for this step, keep
-		 * what's already buffered and keep every subscription alive
-		 * rather than tearing anything down (design.md §3 decision 32's
-		 * own overflow addendum: still Pass, not Fail/TimedOut). The
-		 * transcript above is unaffected. */
-		return BT_GATT_ITER_CONTINUE;
-	}
-
-	ptrdiff_t idx = params - monitor_subscribe_params;
-	struct ble_gatt_activity_record *rec = &activity[activity_len];
-
-	/* Device-uptime timestamp, not yet UTC-corrected -- this firmware has
-	 * no `Hello.host_utc_ms` clock-offset tracking implemented yet for any
-	 * timestamp (design.md §7's already-open "clock-resync accuracy... not
-	 * validated" item covers `Sample.rx_utc_ms` too, an existing gap this
-	 * new field inherits rather than one introduced here). */
-	rec->rx_utc_ms = (uint64_t)k_uptime_get();
-	rec->characteristic_index = (idx >= 0 && (size_t)idx < monitor_subscribe_count)
-					     ? monitor_char_index[idx]
-					     : 0;
-	size_t copy = (length < sizeof(rec->payload)) ? length : sizeof(rec->payload);
-
-	memcpy(rec->payload, data, copy);
-	rec->payload_len = (uint16_t)copy;
-	activity_len++;
 
 	return BT_GATT_ITER_CONTINUE;
 }
 
-/* Discovery + subscribe-to-everything, shared by ACTION_GATT_MONITOR_ALL and
- * ACTION_GATT_MONITOR_START (design.md §3 decision 36). Leaves every
- * subscription armed; the caller decides whether to tear them down at the end
- * of its own step (MonitorAll) or leave them live across the steps that
- * follow (MonitorStart). */
-static struct outcome monitor_subscribe_all(int64_t deadline)
+/* Which target in `params` a discovered characteristic matches, or -1.
+ * A NULL/empty target list means "everything", which is what
+ * ACTION_GATT_MONITOR_ALL/START pass. */
+static int target_index_for(const struct gatt_monitor_selected_params *params,
+			     const uint8_t *service_uuid, const uint8_t *char_uuid)
+{
+	if (params == NULL || params->targets_len == 0) {
+		return 0; /* unfiltered: everything matches */
+	}
+	for (size_t t = 0; t < params->targets_len; t++) {
+		if (memcmp(params->targets[t].service_uuid, service_uuid, 16) == 0 &&
+		    memcmp(params->targets[t].characteristic_uuid, char_uuid, 16) == 0) {
+			return (int)t;
+		}
+	}
+	return -1;
+}
+
+/* Discovery + subscribe, shared by all four monitor actions -- the
+ * unfiltered pair (design.md §3 decision 36) pass `params == NULL`, the
+ * selective pair (that doc's decision 53) pass their target list. Leaves
+ * every subscription armed; the caller decides whether to tear them down at
+ * the end of its own step (MonitorAll/Selected) or leave them live across
+ * the steps that follow (MonitorStart/SelectedStart).
+ *
+ * **The two differ in what a characteristic that isn't subscribed means.**
+ * Unfiltered, skipping one is routine -- nothing named it. Filtered, every
+ * target is something the study said it expects, so a target that matched no
+ * discovered characteristic, or matched one that can neither notify nor
+ * indicate, fails the step naming it. Left as a skip it would be a study
+ * that passes having captured nothing, which is the failure decisions 34, 36,
+ * 53 and 54 were each opened by. */
+static struct outcome monitor_subscribe_matching(int64_t deadline,
+						  const struct gatt_monitor_selected_params *params)
 {
 	if (active_conn == NULL) {
 		return outcome_fail("no active connection -- run a BleConnect step first");
@@ -1584,7 +1592,13 @@ static struct outcome monitor_subscribe_all(int64_t deadline)
 	}
 
 	monitor_subscribe_count = 0;
-	activity_len = 0;
+
+	/* Per-target: did it match a discovered characteristic at all, and was
+	 * that characteristic subscribable. Both reported, because they are
+	 * different mistakes -- a typo'd UUID and a read-only characteristic
+	 * need different fixes. */
+	bool target_found[BLE_MAX_MONITOR_TARGETS] = {false};
+	bool target_subscribable[BLE_MAX_MONITOR_TARGETS] = {false};
 
 	for (uint8_t s = 0; s < discovered_len; s++) {
 		struct ble_gatt_service_info *service = &discovered[s];
@@ -1593,7 +1607,16 @@ static struct outcome monitor_subscribe_all(int64_t deadline)
 			uint8_t props = service->characteristics[c].properties;
 			bool notify = (props & BT_GATT_CHRC_NOTIFY) != 0;
 			bool indicate = (props & BT_GATT_CHRC_INDICATE) != 0;
+			int target = target_index_for(params, service->uuid,
+						       service->characteristics[c].uuid);
 
+			if (target < 0) {
+				continue; /* not named by this step */
+			}
+			if (params != NULL && params->targets_len > 0) {
+				target_found[target] = true;
+				target_subscribable[target] = notify || indicate;
+			}
 			if (!notify && !indicate) {
 				continue;
 			}
@@ -1656,6 +1679,29 @@ static struct outcome monitor_subscribe_all(int64_t deadline)
 		}
 	}
 
+	if (params != NULL && params->targets_len > 0) {
+		for (size_t t = 0; t < params->targets_len; t++) {
+			if (!target_found[t]) {
+				return outcome_fail(
+					"target %u (%02x%02x..%02x%02x) is not on this DUT",
+					(unsigned int)t + 1,
+					params->targets[t].characteristic_uuid[0],
+					params->targets[t].characteristic_uuid[1],
+					params->targets[t].characteristic_uuid[14],
+					params->targets[t].characteristic_uuid[15]);
+			}
+			if (!target_subscribable[t]) {
+				return outcome_fail(
+					"target %u (%02x%02x..%02x%02x) can neither notify nor indicate",
+					(unsigned int)t + 1,
+					params->targets[t].characteristic_uuid[0],
+					params->targets[t].characteristic_uuid[1],
+					params->targets[t].characteristic_uuid[14],
+					params->targets[t].characteristic_uuid[15]);
+			}
+		}
+	}
+
 	return outcome_pass();
 }
 
@@ -1676,21 +1722,29 @@ static void monitor_unsubscribe_all(void)
 	monitor_subscribe_count = 0;
 }
 
-/* Fills in the two discovery/activity fields every monitor action reports. */
+/* Fills in the discovery field every monitor action reports.
+ *
+ * It used to fill two -- `gatt_activity` was the other, retired at schema
+ * v14 (embarch-study-designer/design.md §3 decision 54). What a monitor step
+ * captured is read out of the study's `streams/` files now, which is where
+ * all of it is rather than the first 32 records of it. */
 static struct outcome monitor_result(void)
 {
 	struct outcome result = outcome_pass();
 
 	result.gatt_services = discovered;
 	result.gatt_service_count = discovered_len;
-	result.gatt_activity = activity;
-	result.gatt_activity_count = activity_len;
 	return result;
 }
 
-static struct outcome execute_gatt_monitor_all(int64_t deadline)
+/* Shared by ACTION_GATT_MONITOR_ALL and ACTION_GATT_MONITOR_SELECTED --
+ * `params` is NULL for the first and the step's target list for the second,
+ * and that is the *only* difference between them (design.md §3 decision
+ * 53). */
+static struct outcome execute_gatt_monitor_window(
+	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
-	struct outcome subscribed_result = monitor_subscribe_all(deadline);
+	struct outcome subscribed_result = monitor_subscribe_matching(deadline, params);
 
 	if (subscribed_result.kind != OUTCOME_PASS) {
 		return subscribed_result;
@@ -1712,17 +1766,18 @@ static struct outcome execute_gatt_monitor_all(int64_t deadline)
 	monitor_unsubscribe_all();
 
 	if (dropped) {
-		return outcome_fail("disconnected during GATT monitor-all capture");
+		return outcome_fail("disconnected during GATT monitor capture");
 	}
 
 	return monitor_result();
 }
 
-/* design.md §3 decision 36. Subscribes to everything and returns immediately,
- * leaving the window open: the step costs only discovery+subscribe time, not
- * its whole timeout_ms, because the capture happens during the steps that
- * follow rather than during this one. */
-static struct outcome execute_gatt_monitor_start(int64_t deadline)
+/* design.md §3 decision 36 (and 53's selective half). Subscribes and returns
+ * immediately, leaving the window open: the step costs only
+ * discovery+subscribe time, not its whole timeout_ms, because the capture
+ * happens during the steps that follow rather than during this one. */
+static struct outcome execute_gatt_monitor_window_start(
+	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
 	if (monitor_window_open) {
 		/* Re-arming over a live window would silently orphan the first
@@ -1730,7 +1785,7 @@ static struct outcome execute_gatt_monitor_start(int64_t deadline)
 		monitor_unsubscribe_all();
 	}
 
-	struct outcome subscribed_result = monitor_subscribe_all(deadline);
+	struct outcome subscribed_result = monitor_subscribe_matching(deadline, params);
 
 	if (subscribed_result.kind != OUTCOME_PASS) {
 		monitor_window_open = false;
@@ -1740,8 +1795,8 @@ static struct outcome execute_gatt_monitor_start(int64_t deadline)
 	monitor_window_open = true;
 
 	/* Reports what it subscribed to, so the step's own result is useful on
-	 * its own; `gatt_activity` is necessarily empty this early, and the
-	 * matching GattMonitorStop is what carries the window's summary. */
+	 * its own. What the window actually captures lands in the study's
+	 * `streams/` files as it arrives, not in this step's result. */
 	struct outcome result = outcome_pass();
 
 	result.gatt_services = discovered;
@@ -2431,9 +2486,13 @@ static struct outcome dispatch_action(const struct action *action, int64_t deadl
 	case ACTION_GATT_DISCOVER:
 		return execute_gatt_discover(deadline);
 	case ACTION_GATT_MONITOR_ALL:
-		return execute_gatt_monitor_all(deadline);
+		return execute_gatt_monitor_window(deadline, NULL);
 	case ACTION_GATT_MONITOR_START:
-		return execute_gatt_monitor_start(deadline);
+		return execute_gatt_monitor_window_start(deadline, NULL);
+	case ACTION_GATT_MONITOR_SELECTED:
+		return execute_gatt_monitor_window(deadline, &action->monitor_selected);
+	case ACTION_GATT_MONITOR_SELECTED_START:
+		return execute_gatt_monitor_window_start(deadline, &action->monitor_selected);
 	case ACTION_GATT_MONITOR_STOP:
 		return execute_gatt_monitor_stop();
 	case ACTION_BLE_SECURITY:
@@ -2451,10 +2510,10 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 
 	/* Each action reports only what it observed itself: no captured bytes and
 	 * no already-pending notification carry over from a previous step.
-	 * Note what is deliberately *not* reset here: `activity`/`activity_len`
-	 * and the monitor subscriptions, which by design span steps once a
-	 * window is open (design.md §3 decision 36) -- monitor_subscribe_all
-	 * clears them when a new window opens instead. */
+	 * Note what is deliberately *not* reset here: the monitor
+	 * subscriptions, which by design span steps once a window is open
+	 * (design.md §3 decision 36) -- monitor_subscribe_matching clears them
+	 * when a new window opens instead. */
 	capture_reset();
 	link_lost = false;
 	k_sem_reset(&notify_sem);
@@ -2528,7 +2587,6 @@ void ble_bridge_reset(void)
 	 * left open by a previous study dies with it. */
 	monitor_window_open = false;
 	discovered_len = 0;
-	activity_len = 0;
 
 	if (active_conn != NULL) {
 		/* disconnected_cb drops the reference and clears active_conn; don't

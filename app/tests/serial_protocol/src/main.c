@@ -686,6 +686,178 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 
 }
 
+/* Schema v14's own cross-language pin (embarch-study-designer/design.md §3
+ * decisions 52/53): a `StudyStart` whose first step is a
+ * `GattMonitorSelectedStart` carrying two targets, whose second is a
+ * field-less `GattMonitorStop`, and whose one tap is a `GattNotify` source
+ * with a `Struct` encoding.
+ *
+ * Produced by embarch-study-designer/tests/firmware_test_vectors.rs's
+ * dump_study_start_with_selective_monitor_wire_bytes -- run it with
+ * --nocapture to regenerate. Three things here are unwalkable by a decoder
+ * that predates v14, and each shifts everything after it:
+ *
+ *   - the target *sequence*: every monitor action before v14 was field-less,
+ *     so a decoder treating this one the same way reads the target-count
+ *     varint as the next step's name length and decodes a step list that
+ *     still parses, into nonsense. The `GattMonitorStop` step after it is
+ *     what catches that.
+ *   - `StreamEncoding::Struct`'s one raw u8, inside the span `streams_crc`
+ *     seals. Skipped at the wrong width, the CRC check fails -- loudly, at
+ *     the handshake, rather than as a study that runs and captures into the
+ *     wrong file. The decoder value is deliberately 1, not 0, so a decoder
+ *     that skipped the byte entirely still shifts the span.
+ *   - the kept `characteristic_uuid` on a GattNotify tap (decision 55), which
+ *     nothing kept before v14 and which is what routes a notification to this
+ *     tap's id at all.
+ */
+static const uint8_t core_study_start_selective_monitor_frame[] = {
+	0x06, 0x02, 0x07, 0x6d, 0x6f, 0x6e, 0x69, 0x74, 0x6f, 0x72, 0x0a, 0x02,
+	0x6e, 0x40, 0x00, 0x01, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e,
+	0x24, 0xdc, 0xca, 0x9e, 0x6e, 0x40, 0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93,
+	0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x6e, 0x40, 0x00, 0x01,
+	0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e,
+	0x6e, 0x40, 0x00, 0x02, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e,
+	0x24, 0xdc, 0xca, 0x9e, 0x88, 0x27, 0x00, 0x00, 0x04, 0x73, 0x74, 0x6f,
+	0x70, 0x06, 0xe8, 0x07, 0x00, 0xfa, 0x01, 0xca, 0xda, 0xc4, 0xa6, 0x0c,
+	0x01, 0x00, 0x06, 0x6e, 0x75, 0x73, 0x2d, 0x74, 0x78, 0x00, 0x6e, 0x40,
+	0x00, 0x01, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9, 0xe5, 0x0e, 0x24, 0xdc,
+	0xca, 0x9e, 0x6e, 0x40, 0x00, 0x03, 0xb5, 0xa3, 0xf3, 0x93, 0xe0, 0xa9,
+	0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x05, 0x01, 0x00, 0xa7, 0xaf, 0xc4,
+	0xec, 0x0d, 0x04,
+};
+
+ZTEST(serial_protocol, test_decodes_cores_selective_monitor_study_start)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+
+	size_t framed_len = test_cobs_encode(core_study_start_selective_monitor_frame,
+					     sizeof(core_study_start_selective_monitor_frame),
+					     framed);
+
+	zassert_true(framed_len > 0, "COBS encode of Core's payload failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode a StudyStart carrying a selective monitor step");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(ss->steps_len, 2, "steps_len mismatch");
+	zassert_false(ss->has_unsupported_action, "v14's actions must be recognized");
+	zassert_true(ss->steps_crc_valid,
+		     "steps_crc computed over the crate's own bytes must validate -- a target "
+		     "list walked at the wrong width is exactly what this catches");
+
+	zassert_equal(ss->steps[0].action_tag, DBM_ACTION_GATT_MONITOR_SELECTED_START,
+		      "step 0 action_tag mismatch");
+	zassert_equal(ss->steps[0].action.monitor_selected.targets_len, 2,
+		      "step 0 targets_len mismatch");
+	/* Nordic UART Service: 6e400001-... service, 6e400003-... TX and
+	 * 6e400002-... RX. Asserted on the bytes that differ between the two,
+	 * so a decoder that read one target twice fails here. */
+	zassert_equal(ss->steps[0].action.monitor_selected.targets[0].characteristic_uuid[3], 0x03,
+		      "target 0 characteristic mismatch");
+	zassert_equal(ss->steps[0].action.monitor_selected.targets[1].characteristic_uuid[3], 0x02,
+		      "target 1 characteristic mismatch");
+	zassert_equal(ss->steps[0].action.monitor_selected.targets[0].service_uuid[3], 0x01,
+		      "target 0 service mismatch");
+
+	/* The step after the variable-length one lands where the encoder put
+	 * it -- the same role BleUnbond plays in the v12 vector. */
+	zassert_equal(ss->steps[1].action_tag, DBM_ACTION_GATT_MONITOR_STOP,
+		      "step 1 action_tag mismatch");
+	zassert_equal(ss->steps[1].delay_before_ms, 250, "step 1 delay_before_ms mismatch");
+
+	zassert_equal(ss->streams_len, 1, "streams_len mismatch");
+	zassert_true(ss->streams_crc_valid,
+		     "streams_crc must validate -- a Struct encoding walked at the wrong width "
+		     "is what this catches");
+	zassert_equal(ss->streams[0].source_tag, DBM_STREAM_SRC_GATT_NOTIFY, "tap 0 source");
+	/* Decision 55: the characteristic is *kept*, not skipped, because this
+	 * node routes notifications to this tap's id and a notification
+	 * identifies itself by characteristic. */
+	zassert_equal(ss->streams[0].characteristic_uuid[3], 0x03,
+		      "tap 0 must keep the characteristic it routes");
+	zassert_equal(ss->streams[0].characteristic_uuid[0], 0x6e, "tap 0 characteristic[0]");
+	zassert_equal(ss->streams[0].scope_tag, DBM_STREAM_SCOPE_WHOLE_STUDY, "tap 0 scope");
+}
+
+ZTEST(serial_protocol, test_a_non_gatt_notify_tap_keeps_no_routing_uuid)
+{
+	/* A stale UUID left over from a previous study's tap at this index
+	 * would route a notification into a tap that isn't a GattNotify one at
+	 * all -- so the decoder clears it per tap rather than per study. The
+	 * three-tap vector's Signal and PowerFrontEnd taps are the check. */
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(core_study_start_with_taps_frame,
+					     sizeof(core_study_start_with_taps_frame), framed);
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	/* Pre-poison every byte the decoder is supposed to overwrite. */
+	memset(study_start_decoded.study_start.streams, 0xAA,
+	       sizeof(study_start_decoded.study_start.streams));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0, "decode failed");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+	static const uint8_t zeros[16] = {0};
+
+	zassert_equal(ss->streams[0].source_tag, DBM_STREAM_SRC_GATT_NOTIFY, "tap 0 source");
+	zassert_equal(ss->streams[0].characteristic_uuid[3], 0x03,
+		      "a GattNotify tap keeps its characteristic");
+	zassert_mem_equal(ss->streams[1].characteristic_uuid, zeros, 16,
+			  "a Signal tap must carry no routing UUID");
+	zassert_mem_equal(ss->streams[2].characteristic_uuid, zeros, 16,
+			  "a PowerFrontEnd tap must carry no routing UUID");
+}
+
+ZTEST(serial_protocol, test_selective_monitor_round_trips_through_this_encoder)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "monitor");
+	study_start_msg.study_start.steps[0].timeout_ms = 5000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_GATT_MONITOR_SELECTED;
+	study_start_msg.study_start.steps[0].action.monitor_selected.targets_len = 1;
+	memset(study_start_msg.study_start.steps[0].action.monitor_selected.targets[0].service_uuid,
+	       0x11, 16);
+	memset(study_start_msg.study_start.steps[0]
+		       .action.monitor_selected.targets[0]
+		       .characteristic_uuid,
+	       0x22, 16);
+
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0, "decode failed");
+
+	const struct dbm_step *step = &study_start_decoded.study_start.steps[0];
+
+	zassert_equal(step->action_tag, DBM_ACTION_GATT_MONITOR_SELECTED, "action_tag mismatch");
+	zassert_equal(step->action.monitor_selected.targets_len, 1, "targets_len mismatch");
+	zassert_equal(step->action.monitor_selected.targets[0].service_uuid[0], 0x11,
+		      "service_uuid mismatch");
+	zassert_equal(step->action.monitor_selected.targets[0].characteristic_uuid[15], 0x22,
+		      "characteristic_uuid mismatch");
+}
+
+ZTEST(serial_protocol, test_selective_monitor_beyond_the_target_cap_is_refused)
+{
+	/* A truncated subscription list would be a study that silently
+	 * monitored a subset of what it named -- the silently-empty capture
+	 * this whole family of decisions keeps being opened by. */
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "monitor");
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_GATT_MONITOR_SELECTED;
+	study_start_msg.study_start.steps[0].action.monitor_selected.targets_len =
+		DBM_MAX_MONITOR_TARGETS + 1;
+
+	uint8_t frame[DBM_MAX_FRAME_LEN];
+
+	zassert_true(dbm_encode_frame(&study_start_msg, frame, sizeof(frame)) < 0,
+		     "targets_len beyond the array's bound must be rejected, not read OOB");
+}
+
 ZTEST(serial_protocol, test_stream_scope_covers_the_inclusive_range_it_declares)
 {
 	/* Mirrors embarch-study-designer's own `scope_covers_the_inclusive_
@@ -762,12 +934,22 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 {
 	static const uint8_t expected[] = {
 		0x0d, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73,
-		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x01,
+		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01,
 		/* Schema v12's trailing `security_level: Option<SecurityLevel>`
 		 * (embarch-study-designer/design.md §3 decision 50), None here --
 		 * one more COBS zero-run code byte. The populated case is pinned
 		 * separately below; an all-None frame would pass against an
-		 * encoder that wrote the Option byte but not the value. */
+		 * encoder that wrote the Option byte but not the value.
+		 *
+		 * **One 0x01 shorter than it was at v13.** `gatt_activity`'s
+		 * `None` byte sat between `gatt_services` and `security_level`
+		 * and is retired at schema v14
+		 * (embarch-study-designer/design.md §3 decision 54). An encoder
+		 * that kept writing it would put `security_level` one byte late
+		 * and Core would read the *activity* Option byte as the security
+		 * level -- the same class of drift the retired
+		 * `power_samples_ref`/`waveform_ref` bytes caused for a whole
+		 * schema version, which is why this vector exists. */
 		0x01, 0x00,
 	};
 	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
@@ -883,8 +1065,8 @@ ZTEST(serial_protocol, test_study_start_gatt_discover_and_monitor_all_round_trip
 		      "should not flag an unsupported action");
 }
 
-/* design.md §3 decisions 31/32: StepResult.gatt_services/gatt_activity, the
- * new fields GattDiscover/GattMonitorAll populate. */
+/* design.md §3 decisions 31/32: StepResult.gatt_services, the field every
+ * discovering action populates. */
 static struct dev_bench_message gatt_step_result_msg;
 static struct dev_bench_message gatt_step_result_decoded;
 
@@ -919,45 +1101,14 @@ ZTEST(serial_protocol, test_step_result_gatt_services_round_trip)
 		      "service 0 characteristic 0 properties mismatch");
 	zassert_equal(d->gatt_services[1].characteristics_len, 0,
 		      "service 1 characteristics_len mismatch");
-	zassert_false(d->has_gatt_activity, "has_gatt_activity should default false");
 }
 
-ZTEST(serial_protocol, test_step_result_gatt_activity_round_trip)
-{
-	memset(&gatt_step_result_msg, 0, sizeof(gatt_step_result_msg));
-	gatt_step_result_msg.tag = DBM_TAG_STEP_RESULT;
-	gatt_step_result_msg.step_result.step_index = 2;
-	strcpy(gatt_step_result_msg.step_result.result.step_name, "monitor-all");
-	gatt_step_result_msg.step_result.result.outcome.tag = 0; /* Pass */
-
-	struct dbm_step_result_payload *r = &gatt_step_result_msg.step_result.result;
-
-	r->has_gatt_activity = true;
-	r->gatt_activity_len = 2;
-	r->gatt_activity[0].rx_utc_ms = 1753000000123ULL;
-	r->gatt_activity[0].characteristic_index = 3;
-	r->gatt_activity[0].payload[0] = 0x01;
-	r->gatt_activity[0].payload[1] = 0x02;
-	r->gatt_activity[0].payload_len = 2;
-	r->gatt_activity[1].rx_utc_ms = 1753000000456ULL;
-	r->gatt_activity[1].characteristic_index = 7;
-	r->gatt_activity[1].payload_len = 0;
-
-	zassert_equal(round_trip(&gatt_step_result_msg, &gatt_step_result_decoded), 0,
-		      "decode failed");
-	const struct dbm_step_result_payload *d = &gatt_step_result_decoded.step_result.result;
-
-	zassert_true(d->has_gatt_activity, "has_gatt_activity mismatch");
-	zassert_equal(d->gatt_activity_len, 2, "gatt_activity_len mismatch");
-	zassert_equal(d->gatt_activity[0].rx_utc_ms, 1753000000123ULL, "record 0 rx_utc_ms mismatch");
-	zassert_equal(d->gatt_activity[0].characteristic_index, 3,
-		      "record 0 characteristic_index mismatch");
-	zassert_equal(d->gatt_activity[0].payload_len, 2, "record 0 payload_len mismatch");
-	zassert_equal(d->gatt_activity[0].payload[1], 0x02, "record 0 payload[1] mismatch");
-	zassert_equal(d->gatt_activity[1].characteristic_index, 7,
-		      "record 1 characteristic_index mismatch");
-	zassert_false(d->has_gatt_services, "has_gatt_services should stay false");
-}
+/* `test_step_result_gatt_activity_round_trip` was here. Retired with the
+ * field at schema v14 (embarch-study-designer/design.md §3 decision 54): a
+ * capped in-memory copy of a capture the tap pipeline already streams to Core
+ * uncapped. What a monitor step captured is now covered by the GattNotify tap
+ * routing tests instead -- decision 55's own half.
+ */
 
 ZTEST(serial_protocol, test_study_start_rejects_too_many_steps)
 {
@@ -1186,7 +1337,13 @@ ZTEST(serial_protocol, test_step_result_with_security_level_encodes_to_the_pinne
 {
 	static const uint8_t expected[] = {
 		0x0a, 0x07, 0x01, 0x06, 0x73, 0x65, 0x63, 0x75, 0x72, 0x65,
-		0x01, 0x01, 0x01, 0x03, 0x01, 0x03, 0x00,
+		/* One 0x01 shorter than at v13, for the same reason the
+		 * all-None vector above is: `gatt_activity`'s retired `None`
+		 * byte sat immediately before `security_level`, so an encoder
+		 * that kept writing it would put the level one byte late --
+		 * and this is the vector where that shows up as a wrong
+		 * *value* rather than only a wrong length. */
+		0x01, 0x01, 0x03, 0x01, 0x03, 0x00,
 	};
 	struct dbm_step_result_payload *r = &pinned_step_result_msg.step_result.result;
 

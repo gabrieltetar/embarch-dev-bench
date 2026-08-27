@@ -116,6 +116,32 @@ enum action_kind {
 	 * peer whose keys it clears). */
 	ACTION_BLE_SECURITY,
 	ACTION_BLE_UNBOND,
+	/* embarch-study-designer/design.md §3 decision 53 -- the same
+	 * discovery-and-subscribe walk as ACTION_GATT_MONITOR_ALL/START,
+	 * narrowed to the characteristics the study names. The first actions
+	 * here to carry a *list*.
+	 *
+	 * A named characteristic the DUT doesn't have, or one that is neither
+	 * notify- nor indicate-capable, **fails the step naming it** rather
+	 * than being skipped: a study that named a characteristic has said it
+	 * expects one, and a subscribe-to-everything walk's log-and-skip rule
+	 * is right precisely because nothing there was named. */
+	ACTION_GATT_MONITOR_SELECTED,
+	ACTION_GATT_MONITOR_SELECTED_START,
+};
+
+/* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs) -- raw
+ * big-endian UUIDs, this header's convention throughout. */
+#define BLE_MAX_MONITOR_TARGETS 16 /* mirrors limits::MAX_MONITOR_TARGETS */
+
+struct gatt_target {
+	uint8_t service_uuid[16];
+	uint8_t characteristic_uuid[16];
+};
+
+struct gatt_monitor_selected_params {
+	struct gatt_target targets[BLE_MAX_MONITOR_TARGETS];
+	size_t targets_len;
 };
 
 /* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs). Values are
@@ -142,6 +168,7 @@ struct action {
 		struct ble_connect_params connect;
 		struct data_exchange_params data_exchange;
 		struct ble_set_security_params set_security;
+		struct gatt_monitor_selected_params monitor_selected;
 		/* ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL/
 		 * ACTION_GATT_MONITOR_START/ACTION_GATT_MONITOR_STOP/
 		 * ACTION_BLE_UNBOND carry no params. */
@@ -155,7 +182,6 @@ struct action {
  * this header: big-endian, embarch-study-designer's own convention. */
 #define BLE_MAX_DISCOVERED_SERVICES 8 /* mirrors limits::MAX_DISCOVERED_SERVICES */
 #define BLE_MAX_CHARS_PER_SERVICE 16  /* mirrors limits::MAX_CHARS_PER_SERVICE */
-#define BLE_MAX_GATT_ACTIVITY_RECORDS 32 /* mirrors limits::MAX_GATT_ACTIVITY_RECORDS */
 
 struct ble_gatt_characteristic_info {
 	uint8_t uuid[16];
@@ -166,18 +192,6 @@ struct ble_gatt_service_info {
 	uint8_t uuid[16];
 	struct ble_gatt_characteristic_info characteristics[BLE_MAX_CHARS_PER_SERVICE];
 	uint8_t characteristics_len;
-};
-
-/* Mirrors `GattActivityRecord` (src/gatt.rs) -- `characteristic_index` indexes
- * into the same step's `gatt_services`, flattened service-then-characteristic
- * in discovery order (that type's own documented convention); this bridge
- * computes it directly against the `struct ble_gatt_service_info` array below,
- * so there is exactly one place that flattening happens. */
-struct ble_gatt_activity_record {
-	uint64_t rx_utc_ms;
-	uint16_t characteristic_index;
-	uint8_t payload[BLE_MAX_PAYLOAD_LEN];
-	uint16_t payload_len;
 };
 
 enum outcome_kind {
@@ -209,10 +223,14 @@ struct outcome {
 	 * other action kind. */
 	const struct ble_gatt_service_info *gatt_services;
 	size_t gatt_service_count;
-	/* Populated only by ACTION_GATT_MONITOR_ALL, mirroring `StepResult.gatt_activity`.
-	 * NULL/0 for every other action kind, including ACTION_GATT_DISCOVER. */
-	const struct ble_gatt_activity_record *gatt_activity;
-	size_t gatt_activity_count;
+	/* `gatt_activity` was here, mirroring the `StepResult` field of the
+	 * same name. Both are **retired** by
+	 * embarch-study-designer/design.md §3 decision 54: a capped in-memory
+	 * copy of a capture the tap pipeline already streams to Core uncapped.
+	 * What a monitor step captured is now read out of the study's own
+	 * `streams/` files, which is where all of it is rather than the first
+	 * 32 records of it.
+	 */
 
 	/* The link's BLE security level when this action finished, mirroring
 	 * `StepResult.security_level` (embarch-study-designer/src/result.rs,

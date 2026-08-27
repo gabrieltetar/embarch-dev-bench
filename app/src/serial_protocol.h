@@ -61,15 +61,14 @@
  * mirroring the crate's own real ceiling costs no meaningful RAM. */
 #define DBM_MAX_DISCOVERED_SERVICES 8
 #define DBM_MAX_CHARS_PER_SERVICE 16
-/* Mirrors limits::MAX_GATT_ACTIVITY_RECORDS -- the single largest
- * contributor to `struct dbm_step_result_payload`'s size (32 records at up
- * to DBM_MAX_PAYLOAD_LEN bytes each), flagged as a real stack/static-RAM
- * risk from the outset by embarch-study-designer/design.md §3 decision 32's
- * own text -- kept at the crate's full ceiling rather than shrunk further
- * (unlike DBM_MAX_STEPS_PER_STUDY above) so this milestone's own "a normal
- * acquisition window, nothing dropped" validation isn't manufactured into
- * an overflow case by an artificially small dev-bench-side cap. */
-#define DBM_MAX_GATT_ACTIVITY_RECORDS 32
+/* DBM_MAX_GATT_ACTIVITY_RECORDS was here. Retired at schema v14 with the
+ * field it bounded (embarch-study-designer/design.md §3 decision 54): it was
+ * the single largest contributor to `struct dbm_step_result_payload`'s size
+ * (32 records at up to DBM_MAX_PAYLOAD_LEN bytes each) and had been flagged
+ * as a real static-RAM risk from the outset by that doc's decision 32. What
+ * it bounded was a capped in-memory copy of a capture the tap pipeline
+ * already streams to Core uncapped, so the cap bought nothing and cost 16 KB
+ * on a board whose sram0_0_seg has overflowed twice. */
 /* Largest transcript-entry payload this firmware ever *produces* (design.md
  * §3 decision 36) -- one ATT MTU's worth of notification, not the crate's
  * full MAX_PAYLOAD_LEN. See `struct dbm_gatt_transcript_entry`'s own comment
@@ -113,23 +112,23 @@
  * field-less and add only their own action tag varint, cheaper than
  * BleAdvertise, so they don't move this bound.
  *
- * StepResult's own worst case grew independently: `gatt_services` (up to
+ * StepResult's own worst case is `gatt_services` (up to
  * DBM_MAX_DISCOVERED_SERVICES services, each up to DBM_MAX_CHARS_PER_SERVICE
- * characteristics at 17 bytes each) plus `gatt_activity` (up to
- * DBM_MAX_GATT_ACTIVITY_RECORDS records, each up to DBM_MAX_PAYLOAD_LEN
- * bytes) now dominates over `captured_data` alone -- this is what makes
- * StepResult, not StudyStart, this file's actual largest message once both
- * are computed for real (see the constants immediately below).
+ * characteristics at 17 bytes each) plus `captured_data`.
+ *
+ * **StudyStart is the larger message again as of schema v14.** It had not
+ * been since gatt_activity arrived: that field added ~16.6 KB to StepResult's
+ * bound and made it this file's largest by a factor of two. Retiring it
+ * (embarch-study-designer/design.md §3 decision 54) takes all of that back,
+ * which is what shrinks DBM_MAX_RAW_LEN and every buffer sized from it.
  */
 #define DBM_MAX_STUDY_START_LEN \
 	(8 + (DBM_MAX_STEPS_PER_STUDY * (DBM_MAX_PAYLOAD_LEN + 64)) + 8)
 #define DBM_MAX_GATT_SERVICES_LEN \
 	(4 + (DBM_MAX_DISCOVERED_SERVICES * (16 + 4 + (DBM_MAX_CHARS_PER_SERVICE * 17))))
-#define DBM_MAX_GATT_ACTIVITY_LEN \
-	(4 + (DBM_MAX_GATT_ACTIVITY_RECORDS * (8 + 2 + 4 + DBM_MAX_PAYLOAD_LEN)))
 #define DBM_MAX_STEP_RESULT_LEN                                                                  \
 	(24 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN +                  \
-	 DBM_MAX_GATT_SERVICES_LEN + DBM_MAX_GATT_ACTIVITY_LEN)
+	 DBM_MAX_GATT_SERVICES_LEN)
 /* A transcript record is tiny next to either of the two above -- a fixed
  * header plus one bounded payload -- so it never moves DBM_MAX_RAW_LEN.
  * Stated as its own constant anyway so the encoder has something real to
@@ -145,9 +144,10 @@
  * can handle at all (DBM_MAX_FRAME_LEN above).
  *
  * The two are wildly different, and that difference is worth ~10 KB of SRAM on
- * a board that has none to spare. DBM_MAX_RAW_LEN is StepResult's bound --
- * 19808 bytes, dominated by `gatt_activity` -- and StepResult is a message
- * dev-bench only ever *sends*. Core sends dev-bench exactly two messages:
+ * a board that has none to spare. DBM_MAX_RAW_LEN is now StudyStart's bound
+ * (it was StepResult's, 19808 bytes dominated by the retired `gatt_activity`,
+ * until schema v14) -- and both are messages sized for a worst case Core
+ * never sends. Core sends dev-bench exactly two messages:
  * `Hello` (a dozen bytes) and `StudyStart`. So an RX staging buffer sized to
  * DBM_MAX_FRAME_LEN is sized for a frame that cannot arrive.
  *
@@ -391,6 +391,25 @@ struct dbm_stream_tap {
 	/* Both inclusive, and meaningful only for DBM_STREAM_SCOPE_STEPS. */
 	uint32_t scope_from;
 	uint32_t scope_to;
+	/* The characteristic a DBM_STREAM_SRC_GATT_NOTIFY tap routes, raw
+	 * big-endian; meaningless for every other source tag
+	 * (embarch-study-designer/design.md §3 decision 55, schema v14).
+	 * Previously the decoder skipped these 32
+	 * bytes outright.
+	 *
+	 * **This is addressing, not meaning, and the distinction is the whole
+	 * reason it is allowed here.** `encoding` stays deliberately unkept --
+	 * what a payload *means* is the knowledge decision 39 took away from
+	 * this firmware, and it still holds none of it. Which characteristic's
+	 * notifications go to which tap id is routing, exactly like
+	 * `source_tag`: this node has to know it because this node is the one
+	 * that sends the record.
+	 *
+	 * The service UUID is skipped rather than kept: routing matches on the
+	 * characteristic, which is what a notification callback identifies
+	 * itself by, and a second 16-byte array per tap would be 128 bytes of
+	 * static RAM for a comparison nothing makes. */
+	uint8_t characteristic_uuid[16];
 };
 
 /* Mirrors `StreamScope::covers` (embarch-study-designer src/streams.rs) --
@@ -440,7 +459,28 @@ enum dbm_action_tag {
 	 * and every future one. */
 	DBM_ACTION_BLE_SECURITY = 7,
 	DBM_ACTION_BLE_UNBOND = 8,
+	/* embarch-study-designer/design.md §3 decision 53, schema v14 -- the
+	 * same discovery-and-subscribe walk as GATT_MONITOR_ALL/START, narrowed
+	 * to the characteristics the study names.
+	 *
+	 * These are the first Action variants ever to carry a *sequence*, which
+	 * matters more to this decoder than it looks: every monitor action
+	 * before them was field-less, so a decoder that walked one of these as
+	 * field-less would read the target-count varint as the next step's name
+	 * length and produce a step list that still decodes, into nonsense. The
+	 * v14 wire vector in the crate's tests/firmware_test_vectors.rs exists
+	 * for exactly that. */
+	DBM_ACTION_GATT_MONITOR_SELECTED = 9,
+	DBM_ACTION_GATT_MONITOR_SELECTED_START = 10,
 };
+
+/* How many characteristics one selective monitor step may name -- mirrors
+ * embarch-study-designer's limits::MAX_MONITOR_TARGETS. At the crate's full
+ * value: refusing a count Core considers legal would be this firmware
+ * inventing a limit, and this array costs nothing extra in practice because
+ * `struct dbm_step`'s union is already sized by `dbm_data_exchange_action`
+ * (~553 bytes), which is larger than 16 targets (512). */
+#define DBM_MAX_MONITOR_TARGETS 16
 
 /* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs, design.md §3
  * decision 44). Values are postcard discriminants -- the enum's *declaration*
@@ -529,6 +569,24 @@ struct dbm_ble_set_security_action {
 	uint8_t level; /* enum dbm_security_level */
 };
 
+/* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs, design.md §3
+ * decision 53) -- two raw big-endian UUIDs back to back, no length prefixes,
+ * same convention as every other UUID in this header. Both, not the
+ * characteristic alone: subscribing needs the service to discover within,
+ * exactly as DataExchange has always needed both. */
+struct dbm_gatt_target {
+	uint8_t service_uuid[16];
+	uint8_t characteristic_uuid[16];
+};
+
+/* Mirrors `Action::GattMonitorSelected`/`GattMonitorSelectedStart`
+ * (design.md §3 decision 53). One field, a sequence -- so the decoder reads
+ * a length varint and then that many fixed 32-byte targets. */
+struct dbm_gatt_monitor_selected_action {
+	struct dbm_gatt_target targets[DBM_MAX_MONITOR_TARGETS];
+	uint32_t targets_len;
+};
+
 /* Action::GattDiscover/GattMonitorAll (design.md §3 decisions 31/32) are both
  * field-less -- no struct needed; `dbm_step.action_tag` alone identifies
  * them, matching this crate's "simplest possible FFI/wire surface" framing
@@ -551,6 +609,7 @@ struct dbm_step {
 		struct dbm_ble_connect_action connect;
 		struct dbm_data_exchange_action data_exchange;
 		struct dbm_ble_set_security_action set_security;
+		struct dbm_gatt_monitor_selected_action monitor_selected;
 		/* DBM_ACTION_GATT_DISCOVER/DBM_ACTION_GATT_MONITOR_ALL/
 		 * DBM_ACTION_GATT_MONITOR_START/DBM_ACTION_GATT_MONITOR_STOP/
 		 * DBM_ACTION_BLE_UNBOND carry no fields of their own. */
@@ -619,17 +678,6 @@ struct dbm_gatt_service_info {
 	uint32_t characteristics_len;
 };
 
-/* Mirrors `GattActivityRecord` -- `characteristic_index` indexes into this
- * same StepResult's `gatt_services`, flattened service-then-characteristic
- * in discovery order (that type's own documented convention, design.md
- * §4.3a). */
-struct dbm_gatt_activity_record {
-	uint64_t rx_utc_ms;
-	uint16_t characteristic_index;
-	uint8_t payload[DBM_MAX_PAYLOAD_LEN];
-	uint32_t payload_len;
-};
-
 struct dbm_step_result_payload {
 	char step_name[DBM_MAX_NAME_LEN + 1];
 	struct dbm_outcome outcome;
@@ -641,20 +689,22 @@ struct dbm_step_result_payload {
 	 * by design.md §3 decision 39 (schema v8) and the two bytes this file
 	 * kept writing for them are gone at v9 -- see serial_protocol.c's
 	 * StepResult encoder for how they outlived the fields. */
-	/* gatt_services/gatt_activity (design.md §3 decisions 31/32): populated
-	 * by GattDiscover (services only) and GattMonitorAll (both);
-	 * encode_body/decode_body both handle a real Some. */
+	/* gatt_services (design.md §3 decisions 31/32): populated by every
+	 * discovering action; encode_body/decode_body both handle a real Some.
+	 *
+	 * `gatt_activity` was here and is **retired** at schema v14
+	 * (embarch-study-designer/design.md §3 decision 54), taking
+	 * `struct dbm_gatt_activity_record` and DBM_MAX_GATT_ACTIVITY_RECORDS
+	 * with it. It was 32 × 526 bytes of static RAM -- by a wide margin the
+	 * largest single contributor to this struct -- holding a capped copy of
+	 * something the tap pipeline already streams to a file uncapped. */
 	bool has_gatt_services;
 	struct dbm_gatt_service_info gatt_services[DBM_MAX_DISCOVERED_SERVICES];
 	uint32_t gatt_services_len;
-	bool has_gatt_activity;
-	struct dbm_gatt_activity_record gatt_activity[DBM_MAX_GATT_ACTIVITY_RECORDS];
-	uint32_t gatt_activity_len;
 	/* `StepResult.security_level: Option<SecurityLevel>` -- schema v12's
 	 * trailing field (embarch-study-designer/design.md §3 decision 44).
-	 * Encoded last, after gatt_activity, so this is one appended Option
-	 * byte rather than a re-shuffle of a message this firmware sends more
-	 * than any other.
+	 * Encoded last, so this is one appended Option byte rather than a
+	 * re-shuffle of a message this firmware sends more than any other.
 	 *
 	 * Populated for *every* step, not only a security one: whichever level
 	 * the link happened to be at is what makes a later step's failure
