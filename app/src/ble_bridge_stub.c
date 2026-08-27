@@ -46,7 +46,17 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	 * StepResult indistinguishable from a real authenticated pairing --
 	 * the one claim this suite must never manufacture. `has_security_level`
 	 * stays false, which reads as "there was no connection to ask about",
-	 * which is the truth. */
+	 * which is the truth.
+	 *
+	 * And no `protocol` either (embarch-study-designer/design.md §3
+	 * decision 62), for the same reason a third time and the sharpest one
+	 * yet: an ACTION_RUN_PROTOCOL step here runs no state machine, so there
+	 * is no state it stopped in. `has_protocol` stays false, which reads as
+	 * "no protocol ran", which is the truth. Reporting a `done` here would
+	 * let a native_sim run produce a StepResult indistinguishable from a
+	 * real handshake completing against a real DUT -- and the interpreter's
+	 * own semantics are covered where they can be covered honestly, by
+	 * app/tests/serial_protocol driving eap_interp.c directly. */
 	return (struct outcome){.kind = OUTCOME_PASS};
 }
 

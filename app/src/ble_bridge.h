@@ -18,6 +18,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The `.eap` protocol manifest types (embarch-study-designer/design.md §3
+ * decisions 58-62, §4.9). The one include this header has, and it is not the
+ * link protocol's: eap.h is deliberately independent of serial_protocol.h for
+ * exactly the reason BLE_MAX_PAYLOAD_LEN below is a duplicate rather than an
+ * include -- nothing on this side of the boundary knows the wire format. */
+#include "eap.h"
+
 enum ble_role {
 	BLE_ROLE_CENTRAL,
 	BLE_ROLE_PERIPHERAL,
@@ -128,6 +135,17 @@ enum action_kind {
 	 * is right precisely because nothing there was named. */
 	ACTION_GATT_MONITOR_SELECTED,
 	ACTION_GATT_MONITOR_SELECTED_START,
+	/* embarch-study-designer/design.md §3 decision 60 -- hand the link to a
+	 * declared `.eap` state machine for the length of this step.
+	 *
+	 * **The only action here whose behavior is not fixed by this file.**
+	 * Every other kind names a thing this bridge knows how to do; this one
+	 * carries a manifest, and what it writes, what it waits for and when it
+	 * gives up are all that manifest's. The bridge's job is the BLE half --
+	 * discover the declared characteristics, subscribe to the ones frames
+	 * arrive on, perform the writes the interpreter asks for, and feed
+	 * arrivals and timer expiries back in. eap_interp.c owns the decisions. */
+	ACTION_RUN_PROTOCOL,
 };
 
 /* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs) -- raw
@@ -161,6 +179,20 @@ struct ble_set_security_params {
 	uint8_t level; /* enum ble_security_level */
 };
 
+/* Mirrors `Action::RunProtocol { protocol, entry_state }`, with the index
+ * already resolved: the caller (main.c) is the one holding the study, so it
+ * does the `protocols[protocol]` lookup and the range check, and this side
+ * receives the manifest itself.
+ *
+ * `def` is **borrowed** for the duration of one ble_bridge_execute() call,
+ * the same contract `gatt_operation.write.payload` already has. That is
+ * satisfied structurally rather than by care: it points into the decoded
+ * `StudyStart` main.c holds for the whole study. */
+struct run_protocol_params {
+	const struct eap_protocol_def *def;
+	uint8_t entry_state;
+};
+
 struct action {
 	enum action_kind kind;
 	union {
@@ -169,6 +201,7 @@ struct action {
 		struct data_exchange_params data_exchange;
 		struct ble_set_security_params set_security;
 		struct gatt_monitor_selected_params monitor_selected;
+		struct run_protocol_params run_protocol;
 		/* ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL/
 		 * ACTION_GATT_MONITOR_START/ACTION_GATT_MONITOR_STOP/
 		 * ACTION_BLE_UNBOND carry no params. */
@@ -244,6 +277,25 @@ struct outcome {
 	 * looked". */
 	bool has_security_level;
 	uint8_t security_level; /* enum ble_security_level */
+
+	/* What an ACTION_RUN_PROTOCOL step's state machine did, mirroring
+	 * `StepResult.protocol: Option<ProtocolOutcome>`
+	 * (embarch-study-designer/design.md §3 decision 62). `has_protocol ==
+	 * false` for every other action kind, which is every action that
+	 * existed before it.
+	 *
+	 * **Reported even when the step itself failed**, and separately from
+	 * the step's own outcome above. The step can fail for a reason the
+	 * machine never saw -- a dropped link, an exhausted `timeout_ms` -- and
+	 * telling "the protocol reached its `failed` state" apart from "the
+	 * protocol never finished" is the whole diagnostic value of recording a
+	 * final state. There is deliberately no list of decoded values here:
+	 * that is the shape decision 54 retired `gatt_activity` for, and
+	 * decoded bytes reach a reader through the study's declared taps. */
+	bool has_protocol;
+	char protocol_final_state[EAP_MAX_STATE_NAME_LEN + 1];
+	uint8_t protocol_outcome_tag; /* enum eap_outcome_tag */
+	char protocol_fail_reason[OUTCOME_MAX_FAIL_REASON_LEN + 1];
 };
 
 /* Brings up the BLE bridge (Zephyr BT host enable for _real; a no-op for

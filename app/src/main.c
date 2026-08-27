@@ -94,11 +94,22 @@ static K_MUTEX_DEFINE(link_tx_mutex);
  * actually races. */
 static void send_message_locked(const struct dev_bench_message *msg)
 {
-	/* `static`, not a stack local: `struct dev_bench_message`'s union is
-	 * sized by its largest member (`struct dbm_study_start`, several KB —
-	 * see serial_protocol.h), regardless of which tag this particular call
-	 * actually uses. Safe because every writer holds link_tx_mutex. */
-	static uint8_t frame[DBM_MAX_FRAME_LEN];
+	/* `static`, not a stack local: even at the outbound bound this is a
+	 * few KB, more than a small embedded call stack should hold. Safe
+	 * because every writer holds link_tx_mutex.
+	 *
+	 * **Sized by DBM_MAX_OUTBOUND_FRAME_LEN, not DBM_MAX_FRAME_LEN** --
+	 * this is the TX path, and dev-bench never sends a `StudyStart` (Core
+	 * is the only sender), so the general bound was sizing this for a
+	 * message this node cannot produce. That cost ~6.6 KB before schema
+	 * v15 and would have cost ~9.7 KB after it, since
+	 * DBM_MAX_STUDY_START_LEN now carries the `.eap` protocols span too.
+	 * Exactly the same finding as `receive_message`'s RX buffer
+	 * (DBM_MAX_INBOUND_FRAME_LEN, decision 38's SRAM pass), in the other
+	 * direction; the general encoder's own staging buffer is deliberately
+	 * left alone, because the round-trip tests encode a StudyStart through
+	 * it. */
+	static uint8_t frame[DBM_MAX_OUTBOUND_FRAME_LEN];
 	int frame_len = dbm_encode_frame(msg, frame, sizeof(frame));
 
 	if (frame_len < 0) {
@@ -630,6 +641,29 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 	msg->step_result.result.has_security_level = bridge_outcome->has_security_level;
 	msg->step_result.result.security_level = bridge_outcome->security_level;
 
+	/* `protocol` (embarch-study-designer/design.md §3 decision 62) -- set by
+	 * ACTION_RUN_PROTOCOL alone, which is the one action kind that runs a
+	 * state machine at all. Another straight pass-through: the outcome tags
+	 * on both sides are the same `Outcome` discriminants, so there is
+	 * nothing to remap here either.
+	 *
+	 * Copied even when the *step* failed, deliberately. A run cut short by
+	 * a lost link reports a step failure whose protocol half still names
+	 * the state the machine was sitting in, and telling that apart from a
+	 * protocol that reached its own `failed` state is the whole reason
+	 * this field is separate from the one above it. */
+	msg->step_result.result.has_protocol = bridge_outcome->has_protocol;
+	if (bridge_outcome->has_protocol) {
+		strncpy(msg->step_result.result.protocol_final_state,
+			bridge_outcome->protocol_final_state, EAP_MAX_STATE_NAME_LEN);
+		msg->step_result.result.protocol_final_state[EAP_MAX_STATE_NAME_LEN] = '\0';
+		msg->step_result.result.protocol_outcome.tag = bridge_outcome->protocol_outcome_tag;
+		strncpy(msg->step_result.result.protocol_outcome.fail_reason,
+			bridge_outcome->protocol_fail_reason, DBM_MAX_FAIL_REASON_LEN);
+		msg->step_result.result.protocol_outcome.fail_reason[DBM_MAX_FAIL_REASON_LEN] =
+			'\0';
+	}
+
 	send_message_locked(msg);
 	k_mutex_unlock(&link_tx_mutex);
 }
@@ -927,6 +961,37 @@ static bool handle_hello(const struct dbm_hello *hello)
 	return true;
 }
 
+/* Range-checks an `Action::RunProtocol` step's two indices against the study
+ * that carries them, sending a failing `StepResult` naming the specific
+ * problem when either is out of range.
+ *
+ * Split out rather than folded into `step_to_action` because that function
+ * returns a value and this one has to *report*: a step that cannot be
+ * translated has to reach Core as a named failure, not as a silently
+ * mistranslated action. */
+static bool protocol_index_valid(const struct dbm_study_start *study,
+				 const struct dbm_step *step, uint32_t step_index)
+{
+	struct outcome bad = {.kind = OUTCOME_FAIL};
+	uint8_t protocol = step->action.run_protocol.protocol;
+	uint8_t entry_state = step->action.run_protocol.entry_state;
+
+	if (protocol >= study->protocols_len) {
+		snprintk(bad.fail_reason, sizeof(bad.fail_reason),
+			 "step names protocol %u; this study carries %u",
+			 (unsigned int)protocol, (unsigned int)study->protocols_len);
+	} else if (entry_state >= study->protocols[protocol].states_len) {
+		snprintk(bad.fail_reason, sizeof(bad.fail_reason),
+			 "protocol %u has no state %u", (unsigned int)protocol,
+			 (unsigned int)entry_state);
+	} else {
+		return true;
+	}
+
+	send_step_result(step_index, step->name, &bad);
+	return false;
+}
+
 /* Translates one decoded `struct dbm_step`'s action into the `struct action`
  * ble_bridge.h's shared BleAdvertise/BleConnect/DataExchange/GattDiscover/
  * GattMonitorAll/GattMonitorStart/GattMonitorStop/BleSecurity/BleUnbond
@@ -938,7 +1003,8 @@ static bool handle_hello(const struct dbm_hello *hello)
  * design.md §3 decision 16's own implementation note — this is the missing
  * wiring, not new BLE logic).
  */
-static struct action step_to_action(const struct dbm_step *step)
+static struct action step_to_action(const struct dbm_study_start *study,
+				    const struct dbm_step *step)
 {
 	struct action action = {0};
 
@@ -1024,6 +1090,22 @@ static struct action step_to_action(const struct dbm_step *step)
 
 	case DBM_ACTION_BLE_UNBOND:
 		action.kind = ACTION_BLE_UNBOND;
+		break;
+
+	case DBM_ACTION_RUN_PROTOCOL:
+		/* The one translation that resolves an index rather than
+		 * copying a field: `Action::RunProtocol` names a slot in
+		 * `Study.protocols`, and the bridge takes the manifest itself
+		 * (ble_bridge.h's `struct run_protocol_params`). Borrowed, not
+		 * copied -- `study` is the decoded `StudyStart` that outlives
+		 * every step, so a 4 KB copy per step would buy nothing.
+		 *
+		 * Range-checked by `protocol_index_valid` before this runs, so
+		 * the subscript here cannot be the raw one §3 decision 18's
+		 * rule exists to turn into a sentence. */
+		action.kind = ACTION_RUN_PROTOCOL;
+		action.run_protocol.def = &study->protocols[step->action.run_protocol.protocol];
+		action.run_protocol.entry_state = step->action.run_protocol.entry_state;
 		break;
 
 	case DBM_ACTION_GATT_MONITOR_SELECTED:
@@ -1148,7 +1230,23 @@ static void dispatch_study(const struct dbm_study_start *study)
 
 	for (uint32_t i = 0; i < study->steps_len; i++) {
 		const struct dbm_step *step = &study->steps[i];
-		struct action action = step_to_action(step);
+
+		/* **Both indices of a `RunProtocol` step, checked before they
+		 * reach a C array subscript** (embarch-study-designer/design.md
+		 * §3 decision 60, and `embarch-core/design.md` §3 decision 18's
+		 * rule that a failure is named rather than left to fail as a
+		 * raw index). Core's pre-flight already checks both against the
+		 * same `Study`, so reaching this is either drift between the
+		 * two or a corrupt link -- which is exactly why it is checked
+		 * twice and why this one fails the step by name rather than
+		 * trusting the other end. */
+		if (step->action_tag == DBM_ACTION_RUN_PROTOCOL &&
+		    !protocol_index_valid(study, step, i)) {
+			completed = false;
+			break;
+		}
+
+		struct action action = step_to_action(study, step);
 
 		/* At DBG rather than INF: a study that asked for `Debug` is asking
 		 * to follow the run step by step, and one that did not should not

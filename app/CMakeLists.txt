@@ -11,6 +11,11 @@ target_include_directories(app PRIVATE src)
 target_sources(app PRIVATE
   src/main.c
   src/serial_protocol.c
+  # embarch-study-designer/design.md §3 decisions 58-62: the `.eap` protocol
+  # interpreter. Built for every board, including native_sim -- it is pure C
+  # with no BLE and no Zephyr in it, which is what lets the ztest suite drive
+  # the semantics directly (there is no real-vs-stub split to make here).
+  src/eap_interp.c
   # embarch-dev-bench/design.md §3 decision 38: the Zephyr log backend that
   # forwards CONFIG_LOG output to Core as `LogLine`s. Built for every board,
   # including native_sim -- unlike ble_bridge/study_ffi there is no real-vs-stub

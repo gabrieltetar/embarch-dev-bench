@@ -64,6 +64,7 @@
 #include <zephyr/sys/util.h>
 
 #include "ble_bridge.h"
+#include "eap_interp.h"
 
 /* How many characteristics ACTION_GATT_MONITOR_ALL can subscribe to
  * concurrently in one step -- a dev-bench-internal implementation cap, not
@@ -2474,6 +2475,463 @@ int ble_bridge_init(void)
 /* The action switch itself, split out of ble_bridge_execute so the
  * security-level stamp below it runs for every kind without each arm having
  * to remember it. */
+/* ---- Action::RunProtocol (embarch-study-designer/design.md §3 decision 60)
+ *
+ * **The BLE half only.** eap_interp.c owns every decision this loop acts on:
+ * what to write, how long to wait, whether an arriving frame advances the
+ * machine, and what the run ended as. What lives here is the part that
+ * needs a radio -- resolve the manifest's declared characteristics against
+ * the DUT's real GATT table, subscribe to the ones frames arrive on, perform
+ * the writes the interpreter asks for, and hand arrivals and timer expiries
+ * back to it.
+ *
+ * That split is the whole reason the semantics are testable on a host
+ * (app/tests/serial_protocol drives eap_interp.c with no DUT in the room) and
+ * it is also why this function has no protocol knowledge of its own to get
+ * wrong.
+ */
+
+/* One arriving notification, on its way from Zephyr's BT RX thread to the
+ * dispatch thread the interpreter runs on.
+ *
+ * A queue rather than a direct call because the two really are different
+ * threads (ble_bridge.h's own sink contract says a notify callback must not
+ * block) and the interpreter's next step can be a write, which does. Sized to
+ * one ATT MTU per record, the same bound `struct ble_transcript_entry` uses
+ * and for the same reason: this bridge never sees an inbound value larger
+ * than one. */
+struct protocol_notification {
+	uint8_t source;
+	uint16_t len;
+	uint8_t payload[BLE_MAX_TRANSCRIPT_PAYLOAD_LEN];
+};
+
+/* Four slots, matching the transcript queue's own posture: deep enough that a
+ * burst arriving while the interpreter is inside a blocking write is not
+ * lost, shallow enough to cost ~1 KB on a board that has overflowed twice.
+ * An overflow is **counted and reported**, never silently dropped -- a
+ * protocol run that missed a frame reached the wrong state, and a result that
+ * did not say so would be the silently-incomplete capture this suite keeps
+ * arriving at from other directions. */
+#define PROTOCOL_NOTIFY_QUEUE_SLOTS 4
+
+K_MSGQ_DEFINE(protocol_notify_q, sizeof(struct protocol_notification),
+	      PROTOCOL_NOTIFY_QUEUE_SLOTS, 4);
+
+static struct bt_gatt_subscribe_params protocol_subscribe_params[EAP_MAX_SOURCES_PER_PROTOCOL];
+static struct bt_gatt_discover_params protocol_ccc_discover_params[EAP_MAX_SOURCES_PER_PROTOCOL];
+/* Which manifest source each armed subscription belongs to. The notify
+ * callback recovers its slot by pointer arithmetic into
+ * protocol_subscribe_params (the same trick monitor_notify_cb uses), and this
+ * turns that slot back into the index the interpreter speaks in. */
+static uint8_t protocol_subscribe_source[EAP_MAX_SOURCES_PER_PROTOCOL];
+static uint8_t protocol_subscribe_count;
+/* Per-source GATT state, indexed by the manifest's own source index. */
+static uint16_t protocol_source_handle[EAP_MAX_SOURCES_PER_PROTOCOL];
+static uint16_t protocol_source_service_end[EAP_MAX_SOURCES_PER_PROTOCOL];
+static uint8_t protocol_source_props[EAP_MAX_SOURCES_PER_PROTOCOL];
+static uint32_t protocol_notifications_dropped;
+
+static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
+				  const void *data, uint16_t length)
+{
+	ARG_UNUSED(conn);
+
+	if (data == NULL) {
+		/* This one subscription was torn down (disconnect, or the
+		 * server clearing it). Nothing to enqueue; the run's own step
+		 * timeout is what notices that frames stopped arriving. */
+		return BT_GATT_ITER_STOP;
+	}
+
+	ptrdiff_t slot = params - protocol_subscribe_params;
+
+	if (slot < 0 || (size_t)slot >= protocol_subscribe_count) {
+		return BT_GATT_ITER_CONTINUE;
+	}
+
+	static struct protocol_notification note;
+
+	note.source = protocol_subscribe_source[slot];
+	note.len = (length > sizeof(note.payload)) ? (uint16_t)sizeof(note.payload) : length;
+	memcpy(note.payload, data, note.len);
+
+	if (k_msgq_put(&protocol_notify_q, &note, K_NO_WAIT) != 0) {
+		protocol_notifications_dropped++;
+	}
+	return BT_GATT_ITER_CONTINUE;
+}
+
+/* Locate every declared source in the DUT's real GATT table.
+ *
+ * A source the DUT does not have **fails the step naming it**, and is not
+ * skipped: a manifest that declares a characteristic has said it expects one,
+ * which is the same rule a selective monitor's targets follow (§3 decision
+ * 53) and the opposite of the subscribe-to-everything walk's log-and-skip --
+ * right there precisely because nothing was named.
+ */
+static struct outcome protocol_resolve_sources(const struct eap_protocol_def *def,
+					       int64_t deadline)
+{
+	struct outcome discover_result = run_gatt_discovery(deadline);
+
+	if (discover_result.kind != OUTCOME_PASS) {
+		return discover_result;
+	}
+
+	for (uint8_t i = 0; i < def->sources_len; i++) {
+		bool found = false;
+
+		for (uint8_t s = 0; s < discovered_len && !found; s++) {
+			if (memcmp(discovered[s].uuid, def->sources[i].service_uuid, 16) != 0) {
+				continue;
+			}
+			for (uint8_t c = 0; c < discovered[s].characteristics_len; c++) {
+				if (memcmp(discovered[s].characteristics[c].uuid,
+					   def->sources[i].characteristic_uuid, 16) != 0) {
+					continue;
+				}
+				protocol_source_handle[i] = char_value_handles[s][c];
+				protocol_source_service_end[i] = service_ranges[s].end;
+				protocol_source_props[i] =
+					discovered[s].characteristics[c].properties;
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return outcome_fail(
+				"protocol source %u (%02x%02x..%02x%02x) is not on this DUT",
+				(unsigned int)i, def->sources[i].characteristic_uuid[0],
+				def->sources[i].characteristic_uuid[1],
+				def->sources[i].characteristic_uuid[14],
+				def->sources[i].characteristic_uuid[15]);
+		}
+	}
+	return outcome_pass();
+}
+
+/* Whether any frame reads from this source -- i.e. whether the machine can
+ * ever be moved by something arriving on it. A source only ever written to
+ * (a control point) is deliberately not subscribed: subscribing to it would
+ * be this bridge deciding something the manifest did not say. */
+static bool protocol_source_is_read(const struct eap_protocol_def *def, uint8_t source)
+{
+	for (uint8_t f = 0; f < def->frames_len; f++) {
+		if (def->frames[f].source == source) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static struct outcome protocol_subscribe_sources(const struct eap_protocol_def *def,
+						 int64_t deadline)
+{
+	protocol_subscribe_count = 0;
+
+	for (uint8_t i = 0; i < def->sources_len; i++) {
+		if (!protocol_source_is_read(def, i)) {
+			continue;
+		}
+
+		bool notify = (protocol_source_props[i] & BT_GATT_CHRC_NOTIFY) != 0;
+		bool indicate = (protocol_source_props[i] & BT_GATT_CHRC_INDICATE) != 0;
+
+		if (!notify && !indicate) {
+			return outcome_fail(
+				"protocol source %u (%02x%02x..%02x%02x) can neither notify nor indicate",
+				(unsigned int)i, def->sources[i].characteristic_uuid[0],
+				def->sources[i].characteristic_uuid[1],
+				def->sources[i].characteristic_uuid[14],
+				def->sources[i].characteristic_uuid[15]);
+		}
+
+		struct bt_gatt_subscribe_params *sp =
+			&protocol_subscribe_params[protocol_subscribe_count];
+
+		memset(sp, 0, sizeof(*sp));
+		sp->notify = protocol_notify_cb;
+		sp->subscribe = subscribe_cb; /* shared: only logs the ATT result */
+		sp->value_handle = protocol_source_handle[i];
+		sp->value = indicate ? BT_GATT_CCC_INDICATE : BT_GATT_CCC_NOTIFY;
+		sp->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+		sp->end_handle = protocol_source_service_end[i];
+		sp->disc_params = &protocol_ccc_discover_params[protocol_subscribe_count];
+
+		ccc_att_err = 0;
+		ccc_torn_down = false;
+		k_sem_reset(&ccc_sem);
+
+		int err = bt_gatt_subscribe(active_conn, sp);
+
+		if (err != 0 && err != -EALREADY) {
+			return outcome_fail("subscribe to protocol source %u failed (%d)",
+					    (unsigned int)i, err);
+		}
+		if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+			abandon(sp);
+			return outcome_timed_out();
+		}
+		if (ccc_torn_down) {
+			return outcome_fail("protocol source %u has no writable CCC",
+					    (unsigned int)i);
+		}
+		if (ccc_att_err != 0) {
+			return outcome_fail("protocol source %u CCC write rejected (ATT 0x%02x)",
+					    (unsigned int)i, ccc_att_err);
+		}
+
+		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_SUBSCRIBED,
+				def->sources[i].service_uuid,
+				def->sources[i].characteristic_uuid, 0, NULL, 0);
+
+		protocol_subscribe_source[protocol_subscribe_count] = i;
+		protocol_subscribe_count++;
+	}
+	return outcome_pass();
+}
+
+/* Fire-and-forget, the same posture monitor_unsubscribe_all takes and for the
+ * same reason: by the time this runs the step's deadline has usually passed,
+ * so there is no budget left to wait out each CCC-clear write's response.
+ *
+ * Unconditional at the end of a `RunProtocol` step, unlike a monitor
+ * *window*: a protocol run is scoped to one step by construction (§3 decision
+ * 60 -- it "hands the link to a declared state machine for the length of one
+ * step"), so leaving its subscriptions armed would be capturing into nothing
+ * for the rest of the study. */
+static void protocol_unsubscribe_all(const struct eap_protocol_def *def)
+{
+	for (uint8_t i = 0; i < protocol_subscribe_count; i++) {
+		uint8_t src = protocol_subscribe_source[i];
+
+		(void)bt_gatt_unsubscribe(active_conn, &protocol_subscribe_params[i]);
+		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED,
+				def->sources[src].service_uuid,
+				def->sources[src].characteristic_uuid, 0, NULL, 0);
+	}
+	protocol_subscribe_count = 0;
+}
+
+/* One `on_enter` write. `with_response` selects the ATT operation and nothing
+ * else -- **no transition is ever triggered by a write's own response**,
+ * whichever it is (§3 decision 60): on the DUT this was designed against a
+ * control-point write's response confirms only that the write was accepted,
+ * and the authoritative answer arrives later on a different characteristic.
+ * An acknowledged write is still *waited* for here, so two writes are never
+ * in flight at once; notifications arriving during that wait queue up rather
+ * than being lost. */
+static struct outcome protocol_write(const struct eap_protocol_def *def,
+				     const struct eap_step *step, int64_t deadline)
+{
+	uint8_t source = step->source;
+
+	if (source >= def->sources_len) {
+		return outcome_fail("protocol write names source %u, which does not exist",
+				    (unsigned int)source);
+	}
+
+	transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_WRITE_REQUEST,
+			def->sources[source].service_uuid,
+			def->sources[source].characteristic_uuid, 0, step->payload,
+			step->payload_len);
+
+	if (!step->with_response) {
+		int err = bt_gatt_write_without_response(active_conn,
+							 protocol_source_handle[source],
+							 step->payload, (uint16_t)step->payload_len,
+							 false);
+
+		if (err != 0) {
+			return outcome_fail("protocol write failed (%d)", err);
+		}
+		return outcome_pass();
+	}
+
+	write_params.func = write_cb;
+	write_params.handle = protocol_source_handle[source];
+	write_params.offset = 0;
+	write_params.data = step->payload;
+	write_params.length = (uint16_t)step->payload_len;
+
+	att_err = 0;
+	link_lost = false;
+	k_sem_reset(&gatt_sem);
+
+	int err = bt_gatt_write(active_conn, &write_params);
+
+	if (err != 0) {
+		return outcome_fail("protocol write failed (%d)", err);
+	}
+	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+		abandon(&write_params);
+		return outcome_timed_out();
+	}
+	if (link_lost) {
+		return outcome_fail("disconnected during protocol write");
+	}
+	if (att_err != 0) {
+		return outcome_fail("protocol write rejected (ATT 0x%02x)", att_err);
+	}
+	return outcome_pass();
+}
+
+/* Copy an interpreter verdict into the step's own `struct outcome`.
+ *
+ * The step outcome and the protocol outcome are set from the same verdict
+ * here because on a *clean* finish they agree by construction. They are two
+ * fields rather than one precisely for the cases where they do not: a run cut
+ * short by a lost link or an exhausted `timeout_ms` reports a step failure
+ * whose protocol half still names the state the machine was sitting in. */
+static void protocol_outcome_into(struct outcome *out, const struct eap_step *done)
+{
+	out->has_protocol = true;
+	strncpy(out->protocol_final_state, done->final_state,
+		sizeof(out->protocol_final_state) - 1);
+	out->protocol_final_state[sizeof(out->protocol_final_state) - 1] = '\0';
+	out->protocol_outcome_tag = done->outcome.tag;
+	strncpy(out->protocol_fail_reason, done->outcome.fail_reason,
+		sizeof(out->protocol_fail_reason) - 1);
+	out->protocol_fail_reason[sizeof(out->protocol_fail_reason) - 1] = '\0';
+}
+
+/* The state's own deadline, or the step's when the state declared none. A
+ * state with no `on_timeout` is not a state that can hang forever -- the
+ * step's `timeout_ms` still bounds the whole run, which is exactly what
+ * `Run::abandon` reports as `TimedOut`. */
+static int64_t protocol_state_deadline(const struct eap_step *step, int64_t step_deadline)
+{
+	if (!step->has_deadline) {
+		return step_deadline;
+	}
+
+	int64_t state_deadline = deadline_from(step->deadline_ms);
+
+	return (state_deadline < step_deadline) ? state_deadline : step_deadline;
+}
+
+static struct outcome execute_run_protocol(const struct run_protocol_params *params,
+					   int64_t deadline)
+{
+	const struct eap_protocol_def *def = params->def;
+
+	if (active_conn == NULL) {
+		return outcome_fail("no active connection -- run a BleConnect step first");
+	}
+	if (def == NULL || params->entry_state >= def->states_len) {
+		/* Unreachable in practice: `validate_protocol` and Core's
+		 * pre-flight both range-check `entry_state`, and main.c checks
+		 * it again before dispatch. Named here anyway rather than left
+		 * to a raw array subscript, which is §3 decision 18's rule. */
+		return outcome_fail("protocol entry state %u does not exist",
+				    (unsigned int)params->entry_state);
+	}
+
+	struct outcome resolved = protocol_resolve_sources(def, deadline);
+
+	if (resolved.kind != OUTCOME_PASS) {
+		return resolved;
+	}
+
+	k_msgq_purge(&protocol_notify_q);
+	protocol_notifications_dropped = 0;
+
+	struct outcome subscribed_result = protocol_subscribe_sources(def, deadline);
+
+	if (subscribed_result.kind != OUTCOME_PASS) {
+		protocol_unsubscribe_all(def);
+		return subscribed_result;
+	}
+
+	struct eap_run run;
+	struct eap_step step;
+
+	(void)eap_run_start(&run, def, params->entry_state);
+	eap_run_enter(&run, &step);
+
+	struct outcome result = outcome_pass();
+
+	for (;;) {
+		if (step.kind == EAP_STEP_DONE) {
+			if (step.outcome.tag == EAP_OUTCOME_PASS) {
+				result = outcome_pass();
+			} else if (step.outcome.tag == EAP_OUTCOME_TIMED_OUT) {
+				result = outcome_timed_out();
+			} else {
+				result = outcome_fail("%s", step.outcome.fail_reason);
+			}
+			protocol_outcome_into(&result, &step);
+			break;
+		}
+
+		if (step.kind == EAP_STEP_WRITE) {
+			struct outcome write_result = protocol_write(def, &step, deadline);
+
+			if (write_result.kind != OUTCOME_PASS) {
+				/* The BLE half failed, not the machine. Report
+				 * the failure as the step's, and the state the
+				 * machine was sitting in as the protocol's --
+				 * which is the pair that makes "the write was
+				 * rejected in state `pumping`" readable at all. */
+				struct eap_step where;
+
+				eap_run_abandon(&run, &where);
+				result = write_result;
+				protocol_outcome_into(&result, &where);
+				result.protocol_outcome_tag = EAP_OUTCOME_FAIL;
+				break;
+			}
+		}
+
+		/* Wait for whichever comes first: a frame, this state's own
+		 * deadline, or the step's. */
+		int64_t state_deadline = protocol_state_deadline(&step, deadline);
+		struct protocol_notification note;
+
+		if (k_msgq_get(&protocol_notify_q, &note, remaining(state_deadline)) == 0) {
+			struct eap_event ev = {
+				.kind = EAP_EVENT_NOTIFY,
+				.source = note.source,
+				.payload = note.payload,
+				.payload_len = note.len,
+			};
+
+			transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION,
+					def->sources[note.source].service_uuid,
+					def->sources[note.source].characteristic_uuid, 0,
+					note.payload, note.len);
+			eap_run_on_event(&run, &ev, &step);
+			continue;
+		}
+
+		if (k_uptime_get() >= deadline) {
+			/* The **step's** own timeout_ms ran out before the
+			 * machine reached a terminal state -- the one way
+			 * `Outcome::TimedOut` is produced, and the one outcome
+			 * no manifest can declare. */
+			eap_run_abandon(&run, &step);
+			continue;
+		}
+
+		struct eap_event ev = {.kind = EAP_EVENT_TIMEOUT};
+
+		eap_run_on_event(&run, &ev, &step);
+	}
+
+	protocol_unsubscribe_all(def);
+
+	if (protocol_notifications_dropped > 0) {
+		/* A run that missed a frame reached the wrong state, so this is
+		 * said out loud rather than left for a reader to infer from a
+		 * surprising `final_state`. */
+		bridge_log("protocol run dropped %u notifications (queue full) -- its final state "
+			   "is NOT trustworthy",
+			   (unsigned int)protocol_notifications_dropped);
+	}
+	return result;
+}
+
 static struct outcome dispatch_action(const struct action *action, int64_t deadline)
 {
 	switch (action->kind) {
@@ -2499,6 +2957,8 @@ static struct outcome dispatch_action(const struct action *action, int64_t deadl
 		return execute_set_security(&action->set_security, deadline);
 	case ACTION_BLE_UNBOND:
 		return execute_unbond();
+	case ACTION_RUN_PROTOCOL:
+		return execute_run_protocol(&action->run_protocol, deadline);
 	default:
 		return outcome_fail("unknown action kind");
 	}
