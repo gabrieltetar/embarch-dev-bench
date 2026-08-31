@@ -1,0 +1,28 @@
+/*
+ * nRF54L15DK dev-bench board (embarch-dev-bench/design.md §3 decision 26's
+ * successor -- this board is the dev bench again as of 2026-08-31). Auto-
+ * merged by Zephyr's board devicetree overlay convention (flat filename
+ * matching the board target, same as this board's own .conf fragment and as
+ * the ESP32-C5's overlay) -- no extra CMake wiring needed.
+ *
+ * The only thing this file has to say is the baud rate. `zephyr,console` on
+ * this board is already `&uart20` (nrf54l_05_10_15_cpuapp_common.dtsi's own
+ * chosen block), wired through the DK's onboard J-Link OB to VCOM0 -- so
+ * unlike the ESP32-C5, which had to be moved off its native USB-Serial/JTAG
+ * peripheral onto a separate bridge chip, nothing here needs repointing.
+ * What does need overriding is `current-speed`: the board's upstream default
+ * is 115200, and this link must match `embarch-core::dev_bench_link::
+ * DEV_BENCH_BAUD` (1 Mbaud) exactly or Core's very first `Hello` fails to
+ * decode.
+ *
+ * uart30 is left at its own 115200 default and unused. It is a real second
+ * VCOM on this DK (VCOM1) and it is deliberately NOT given a role here:
+ * app/prj.conf's decision-7 block turns off every log backend that would
+ * write raw text, so there is nothing left that wants a second console, and
+ * a second enabled UART would only add a candidate for
+ * `embarch-topology`'s port detection to have to disambiguate.
+ */
+
+&uart20 {
+	current-speed = <1000000>;
+};
