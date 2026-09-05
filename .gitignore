@@ -13,7 +13,7 @@ workspaces/*/test/
 build/
 build-*/
 build_*/
-twister-out/
+twister-out*/
 
 *.pyc
 __pycache__/
