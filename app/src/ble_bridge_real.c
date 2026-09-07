@@ -65,6 +65,7 @@
 
 #include "ble_bridge.h"
 #include "eap_interp.h"
+#include "scan_seen_mfg.h"
 
 /* How many characteristics ACTION_GATT_MONITOR_ALL can subscribe to
  * concurrently in one step -- a dev-bench-internal implementation cap, not
@@ -962,6 +963,10 @@ struct scan_seen_entry {
 	/* Set once this address has sent a connectable advertisement --
 	 * ADV_IND/ADV_DIRECT_IND. A scan response alone doesn't set it. */
 	bool connectable;
+	/* Manufacturer Specific Data, if any advertisement carried the element --
+	 * decision 44. `.present == false` until then; absence is a fact this
+	 * struct can state, not a zeroed-out company ID that reads like one. */
+	struct scan_seen_mfg_data mfg;
 };
 static struct scan_seen_entry scan_seen[SCAN_SEEN_MAX];
 static uint8_t scan_seen_len;
@@ -986,14 +991,23 @@ static struct scan_seen_entry *scan_seen_entry_for(const bt_addr_le_t *addr)
 	bt_addr_le_copy(&entry->addr, addr);
 	entry->name[0] = '\0';
 	entry->connectable = false;
+	entry->mfg = (struct scan_seen_mfg_data){0};
 	return entry;
 }
 
-/* bt_data_parse callback: copies any Local Name AD element into the
- * `struct scan_seen_entry *` passed as user_data. */
-static bool name_ad_record(struct bt_data *data, void *user_data)
+/* bt_data_parse callback: copies the AD elements this census reports -- Local
+ * Name and Manufacturer Specific Data (decision 44) -- into the
+ * `struct scan_seen_entry *` passed as user_data. Everything else `bt_data_parse`
+ * offers is still discarded; widening this list is what decision 44 exists to
+ * make cheap the next time it is worth doing. */
+static bool scan_seen_ad_record(struct bt_data *data, void *user_data)
 {
 	struct scan_seen_entry *entry = user_data;
+
+	if (data->type == BT_DATA_MANUFACTURER_DATA) {
+		scan_seen_mfg_data_parse(&entry->mfg, data->data, data->data_len);
+		return true;
+	}
 
 	if (data->type != BT_DATA_NAME_COMPLETE && data->type != BT_DATA_NAME_SHORTENED) {
 		return true; /* keep parsing the remaining AD elements */
@@ -1020,11 +1034,18 @@ static void report_scan_seen(void)
 		   scan_seen_overflowed ? " (more than this firmware records)" : "");
 	for (uint8_t i = 0; i < scan_seen_len; i++) {
 		char addr_str[BT_ADDR_LE_STR_LEN];
+		/* Sized against scan_seen_mfg_data_render's own worst case (see its
+		 * header comment): 4 bytes of hex payload plus its longest fixed
+		 * text is well under half of this, so the render is never expected
+		 * to hit its own defensive truncation path in practice. */
+		char mfg_str[64];
 
 		bt_addr_le_to_str(&scan_seen[i].addr, addr_str, sizeof(addr_str));
-		bridge_log("  %s %s name=%s", addr_str,
+		(void)scan_seen_mfg_data_render(mfg_str, sizeof(mfg_str), &scan_seen[i].mfg);
+		bridge_log("  %s %s name=%s mfg=%s", addr_str,
 			   scan_seen[i].connectable ? "connectable" : "non-connectable",
-			   scan_seen[i].name[0] != '\0' ? scan_seen[i].name : "(none advertised)");
+			   scan_seen[i].name[0] != '\0' ? scan_seen[i].name : "(none advertised)",
+			   mfg_str);
 	}
 }
 
@@ -1088,7 +1109,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 	if (buf != NULL) {
 		struct net_buf_simple copy = *buf;
 
-		bt_data_parse(&copy, name_ad_record, entry);
+		bt_data_parse(&copy, scan_seen_ad_record, entry);
 	}
 	if (adv_type == BT_GAP_ADV_TYPE_ADV_IND || adv_type == BT_GAP_ADV_TYPE_ADV_DIRECT_IND) {
 		entry->connectable = true;

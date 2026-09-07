@@ -21,6 +21,12 @@ target_sources(app PRIVATE
   # including native_sim -- unlike ble_bridge/study_ffi there is no real-vs-stub
   # split here, since the file itself compiles to no-ops under CONFIG_LOG=n.
   src/dev_bench_log.c
+  # decision 44: the advertiser census's Manufacturer Specific Data parsing and
+  # rendering. Built for every board including native_sim, same reasoning as
+  # eap_interp.c above -- it needs Zephyr's printk/util helpers but nothing
+  # from the BT host, so a ztest can pin its offset arithmetic against a
+  # synthetic payload on a board where ble_bridge_real.c itself never builds.
+  src/scan_seen_mfg.c
 )
 
 # embarch-dev-bench/design.md §3 decision 16: ble_bridge_real.c (real Zephyr BT
