@@ -25,4 +25,27 @@
 
 &uart20 {
 	current-speed = <1000000>;
+	/* **Hardware flow control, because this link silently loses bytes
+	 * without it.** At 1 Mbaud the host driver's default ~4 KB receive
+	 * buffer holds about 40 ms of traffic, so any stall longer than that on
+	 * Core's side drops a contiguous run of bytes mid-frame. COBS resyncs at
+	 * the next delimiter and the frame is simply gone; ordinary
+	 * DevBenchMessages carry no CRC (only `Study` does), so nothing detects
+	 * it except a decode failure. A 10 h PPG drain lost three
+	 * `StreamChunkBatch` frames that way -- 976 bytes, four 244-byte
+	 * notifications, 3 of 598 records damaged -- and the capture was
+	 * reported `truncated: false`.
+	 *
+	 * Core reading on its own thread (embarch-core's `dev_bench_link`)
+	 * removes the stall this firmware was paying for; CTS is what makes the
+	 * loss structurally impossible rather than merely unlikely, since
+	 * `uart_poll_out` then waits for the host instead of writing into a full
+	 * buffer.
+	 *
+	 * The DK already assigns the pins: `uart20_default` carries UART_RTS on
+	 * P1.06 and UART_CTS on P1.07 alongside TX P1.04 / RX P1.05, routed
+	 * through the onboard J-Link OB to VCOM0. Nothing here rewires
+	 * anything -- it only asks the UARTE to honour lines the board file
+	 * already declared. */
+	hw-flow-control;
 };
