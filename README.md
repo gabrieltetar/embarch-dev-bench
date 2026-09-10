@@ -96,3 +96,10 @@ for the full annotated tree. Short version: `app/` is the one shared,
 vendor-agnostic C application; each `workspaces/<vendor>/` directory is an
 independent west topdir with its own manifest, symlinking in `app/` rather
 than copying it.
+
+## License
+
+MIT — see [LICENSE](LICENSE). That covers this repo's own contents
+(`app/` and each `workspaces/<vendor>/` manifest); the west-managed trees
+`west update` fetches into those workspaces are not checked in here and keep
+their upstream licenses.
