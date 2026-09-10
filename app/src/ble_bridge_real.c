@@ -66,6 +66,7 @@
 #include "ble_bridge.h"
 #include "eap_interp.h"
 #include "scan_seen_mfg.h"
+#include "scan_seen_names.h"
 
 /* How many characteristics ACTION_GATT_MONITOR_ALL can subscribe to
  * concurrently in one step -- a dev-bench-internal implementation cap, not
@@ -1049,6 +1050,28 @@ static void report_scan_seen(void)
 	}
 }
 
+/* The two markers `connect_as_central` can append to a `no name match`
+ * `fail_reason`, and why they must stay two: `SCAN_SEEN_TRUNCATED_MARKER`
+ * means the *name list* ran out of the 64-byte `fail_reason` before it ran
+ * out of named advertisers -- reached at three or four names, the common
+ * case. `SCAN_SEEN_OVERFLOW_MARKER` means the *census itself*
+ * (`SCAN_SEEN_MAX` above) dropped advertisers because more than 256 distinct
+ * addresses showed up -- unrelated, and needs 256 advertisers to ever fire.
+ * Collapsing them into one marker would tell a reader something was cut
+ * without saying which of two very different things happened. */
+#define SCAN_SEEN_PREFIX "no name match; on air: "
+#define SCAN_SEEN_TRUNCATED_MARKER " (truncated)"
+#define SCAN_SEEN_OVERFLOW_MARKER " (census full)"
+
+/* However the two markers are worded, there must be room in the 64-byte
+ * `fail_reason` for the longer one *and* at least the prefix -- otherwise a
+ * marker meant to make truncation honest would itself get silently cut. */
+BUILD_ASSERT(sizeof(SCAN_SEEN_PREFIX) - 1 +
+		     MAX(sizeof(SCAN_SEEN_TRUNCATED_MARKER), sizeof(SCAN_SEEN_OVERFLOW_MARKER)) -
+		     1 <
+	     OUTCOME_MAX_FAIL_REASON_LEN,
+	     "no room left for any names");
+
 /* Comma-separated list of the names seen this scan, into a static buffer --
  * the compact form that fits an `Outcome`'s 64-byte `fail_reason`. The full
  * per-advertiser detail goes through `report_scan_seen` instead.
@@ -1057,26 +1080,39 @@ static void report_scan_seen(void)
  * already knows what it asked for, whereas the names actually on the air are
  * the part it cannot get any other way. Echoing both truncated the list
  * exactly where it mattered -- found the first time this ran on a real bench,
- * where the one interesting name got cut in half. */
-static const char *scan_seen_names_summary(void)
+ * where the one interesting name got cut in half.
+ *
+ * `max_len` is the number of bytes the caller can actually spend on this list
+ * once its own prefix and marker suffix are accounted for -- not
+ * `sizeof(summary)`. Budgeting here rather than against the full 65-byte
+ * buffer is what closes the double-truncation this replaced: the old version
+ * filled its own buffer to the brim and then `outcome_fail`'s `vsnprintk` cut
+ * the *combined* string a second time, silently, wherever the 64-byte
+ * `fail_reason` cap actually fell.
+ *
+ * `*truncated` is set when a name existed but did not fit -- distinct from
+ * `scan_seen_overflowed`, which means the 256-entry census itself missed
+ * advertisers. Each is reported through its own marker (see
+ * `connect_as_central`); this function only ever reports the first. */
+static const char *scan_seen_names_summary(size_t max_len, bool *truncated)
 {
 	static char summary[OUTCOME_MAX_FAIL_REASON_LEN + 1];
 	size_t used = 0;
 	uint8_t named = 0;
 
+	*truncated = false;
 	summary[0] = '\0';
+
 	for (uint8_t i = 0; i < scan_seen_len; i++) {
 		if (scan_seen[i].name[0] == '\0') {
 			continue;
 		}
 
-		int written = snprintk(summary + used, sizeof(summary) - used, "%s'%s'",
-				       (named == 0) ? "" : ", ", scan_seen[i].name);
-
-		if (written < 0 || (size_t)written >= sizeof(summary) - used) {
-			break; /* truncated -- the names that fit are still the useful part */
+		if (!scan_seen_names_append(summary, sizeof(summary), max_len, &used,
+					     (named == 0) ? "" : ", ", scan_seen[i].name)) {
+			*truncated = true;
+			break; /* summary holds only complete entries -- no partial fragment */
 		}
-		used += (size_t)written;
 		named++;
 	}
 	if (named == 0) {
@@ -1220,9 +1256,26 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 			 * goes through the log sink, because `fail_reason` is
 			 * 64 bytes and cannot hold it. */
 			report_scan_seen();
-			return outcome_fail("no name match; on air: %s%s",
-					    scan_seen_names_summary(),
-					    scan_seen_overflowed ? ", ..." : "");
+
+			/* Budgeting the name list against `name_budget` (rather
+			 * than the full `fail_reason` size) is what guarantees
+			 * whichever marker applies always has room: the final
+			 * `vsnprintk` in `outcome_fail` never has to truncate the
+			 * combined string, so it can't silently eat the marker
+			 * the way the old unbudgeted version could. */
+			size_t marker_budget = MAX(sizeof(SCAN_SEEN_TRUNCATED_MARKER),
+						    sizeof(SCAN_SEEN_OVERFLOW_MARKER)) -
+						1;
+			size_t name_budget = OUTCOME_MAX_FAIL_REASON_LEN -
+					     (sizeof(SCAN_SEEN_PREFIX) - 1) - marker_budget;
+			bool names_truncated = false;
+			const char *summary = scan_seen_names_summary(name_budget,
+								       &names_truncated);
+
+			return outcome_fail("%s%s%s", SCAN_SEEN_PREFIX, summary,
+					    names_truncated  ? SCAN_SEEN_TRUNCATED_MARKER
+					    : scan_seen_overflowed ? SCAN_SEEN_OVERFLOW_MARKER
+								   : "");
 		}
 		return outcome_timed_out();
 	}
