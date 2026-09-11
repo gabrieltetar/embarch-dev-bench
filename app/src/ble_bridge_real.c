@@ -1056,19 +1056,24 @@ static void report_scan_seen(void)
  * out of named advertisers -- reached at three or four names, the common
  * case. `SCAN_SEEN_OVERFLOW_MARKER` means the *census itself*
  * (`SCAN_SEEN_MAX` above) dropped advertisers because more than 256 distinct
- * addresses showed up -- unrelated, and needs 256 advertisers to ever fire.
- * Collapsing them into one marker would tell a reader something was cut
- * without saying which of two very different things happened. */
+ * addresses showed up -- rare (needs 256 advertisers to ever fire) but not
+ * mutually exclusive with the first: a census that overflowed can *also* be
+ * the one whose name list ran out of room. When both hold, both markers are
+ * written, concatenated (decision 45) -- collapsing them into one marker, or
+ * silently keeping only one, would tell a reader something was cut without
+ * saying which of two very different things happened, in exactly the case
+ * where both happened. */
 #define SCAN_SEEN_PREFIX "no name match; on air: "
 #define SCAN_SEEN_TRUNCATED_MARKER " (truncated)"
 #define SCAN_SEEN_OVERFLOW_MARKER " (census full)"
 
-/* However the two markers are worded, there must be room in the 64-byte
- * `fail_reason` for the longer one *and* at least the prefix -- otherwise a
- * marker meant to make truncation honest would itself get silently cut. */
+/* There must be room in the 64-byte `fail_reason` for *both* markers
+ * concatenated *and* at least the prefix -- otherwise the combined case
+ * above would itself get silently cut, the exact failure this budgeting
+ * exists to prevent. */
 BUILD_ASSERT(sizeof(SCAN_SEEN_PREFIX) - 1 +
-		     MAX(sizeof(SCAN_SEEN_TRUNCATED_MARKER), sizeof(SCAN_SEEN_OVERFLOW_MARKER)) -
-		     1 <
+		     (sizeof(SCAN_SEEN_TRUNCATED_MARKER) - 1) +
+		     (sizeof(SCAN_SEEN_OVERFLOW_MARKER) - 1) <
 	     OUTCOME_MAX_FAIL_REASON_LEN,
 	     "no room left for any names");
 
@@ -1093,7 +1098,9 @@ BUILD_ASSERT(sizeof(SCAN_SEEN_PREFIX) - 1 +
  * `*truncated` is set when a name existed but did not fit -- distinct from
  * `scan_seen_overflowed`, which means the 256-entry census itself missed
  * advertisers. Each is reported through its own marker (see
- * `connect_as_central`); this function only ever reports the first. */
+ * `connect_as_central`), and the two can both be set on the same call --
+ * `connect_as_central` concatenates both markers in that case rather than
+ * reporting only one. */
 static const char *scan_seen_names_summary(size_t max_len, bool *truncated)
 {
 	static char summary[OUTCOME_MAX_FAIL_REASON_LEN + 1];
@@ -1259,23 +1266,31 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 
 			/* Budgeting the name list against `name_budget` (rather
 			 * than the full `fail_reason` size) is what guarantees
-			 * whichever marker applies always has room: the final
+			 * whichever marker(s) apply always have room: the final
 			 * `vsnprintk` in `outcome_fail` never has to truncate the
-			 * combined string, so it can't silently eat the marker
-			 * the way the old unbudgeted version could. */
-			size_t marker_budget = MAX(sizeof(SCAN_SEEN_TRUNCATED_MARKER),
-						    sizeof(SCAN_SEEN_OVERFLOW_MARKER)) -
-						1;
+			 * combined string, so it can't silently eat a marker the
+			 * way the old unbudgeted version could. Both markers are
+			 * reserved unconditionally -- `scan_seen_overflowed` is
+			 * already known at this point, but `names_truncated`
+			 * isn't decided until `scan_seen_names_summary` returns,
+			 * so the budget has to assume the worst case (both fire)
+			 * rather than react to it after the fact. */
+			size_t marker_budget = (sizeof(SCAN_SEEN_TRUNCATED_MARKER) - 1) +
+						(sizeof(SCAN_SEEN_OVERFLOW_MARKER) - 1);
 			size_t name_budget = OUTCOME_MAX_FAIL_REASON_LEN -
 					     (sizeof(SCAN_SEEN_PREFIX) - 1) - marker_budget;
 			bool names_truncated = false;
 			const char *summary = scan_seen_names_summary(name_budget,
 								       &names_truncated);
 
-			return outcome_fail("%s%s%s", SCAN_SEEN_PREFIX, summary,
-					    names_truncated  ? SCAN_SEEN_TRUNCATED_MARKER
-					    : scan_seen_overflowed ? SCAN_SEEN_OVERFLOW_MARKER
-								   : "");
+			/* Both markers are written when both conditions hold --
+			 * decision 45's combined case. Neither marker names the
+			 * other away; a reader who sees only "(truncated)" must
+			 * be able to trust that the census itself did not also
+			 * overflow. */
+			return outcome_fail("%s%s%s%s", SCAN_SEEN_PREFIX, summary,
+					    names_truncated ? SCAN_SEEN_TRUNCATED_MARKER : "",
+					    scan_seen_overflowed ? SCAN_SEEN_OVERFLOW_MARKER : "");
 		}
 		return outcome_timed_out();
 	}
