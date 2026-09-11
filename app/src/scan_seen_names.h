@@ -1,6 +1,6 @@
 /* Bounded, no-partial-fragment append of one "<sep>'<name>'" entry onto a
- * comma-separated advertiser name list (embarch-dev-bench/decisions/ble.md
- * decision 43's failed-name census). Split out of ble_bridge_real.c for the
+ * comma-separated advertiser name list (embarch-dev-bench/decisions/scanning.md
+ * decisions 32 and 45's failed-name census). Split out of ble_bridge_real.c for the
  * same reason scan_seen_mfg.c was (see its own header comment): the bound
  * arithmetic here has nothing to do with the BT host, so a ztest can pin its
  * truncation behaviour under native_sim even though ble_bridge_real.c itself
