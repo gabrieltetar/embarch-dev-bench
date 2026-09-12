@@ -1,6 +1,6 @@
 /* DevBenchMessage wire protocol: COBS framing + postcard-compatible encoding.
  *
- * embarch-dev-bench/design.md §2, §3 decisions 7/10/12/20. Mirrors
+ * Decisions 7/10/12/20. Mirrors
  * embarch-study-designer's `protocol::DevBenchMessage` field-for-field and
  * byte-for-byte (postcard varint/fixint rules) so this hand-written C
  * implementation and the Rust crate's own round-trip tests both describe the
@@ -25,8 +25,8 @@
  * that crate. */
 #define DBM_MAX_FIRMWARE_VERSION_LEN 32
 /* limits::MAX_HARDWARE_ID_LEN — this board's own factory-unique chip ID,
- * hex-encoded (embarch-study-designer/design.md §3 decision 47,
- * embarch-core/design.md §3 decision 35). */
+ * hex-encoded (`embarch-study-designer` decision 47,
+ * `embarch-core` decision 35). */
 #define DBM_MAX_HARDWARE_ID_LEN 32
 #define DBM_MAX_LOG_LINE_LEN 128
 #define DBM_MAX_LOCAL_NAME_LEN 26
@@ -41,8 +41,7 @@
  * union out in full for the first time), a full 64-slot `steps[]` array
  * pushed `struct dev_bench_message`'s union well past what this board's
  * available RAM can hold several static copies of (confirmed empirically --
- * a real build at 64 slots would not fit; see design.md's own changelog for
- * the measured numbers). 16 is sized well above every `Study` this suite
+ * a real build at 64 slots would not fit). 16 is sized well above every `Study` this suite
  * has actually authored so far (the largest is this milestone's own 3-step
  * self-test) with real headroom, not against a proven fuzzing need -- a
  * `StudyStart` claiming more than this many steps is rejected outright by
@@ -56,21 +55,21 @@
 #define DBM_MAX_FAIL_REASON_LEN 64
 #define DBM_MAX_PAYLOAD_LEN 512
 /* Mirrors embarch-study-designer's limits::MAX_DISCOVERED_SERVICES/
- * MAX_CHARS_PER_SERVICE (design.md §3 decisions 31/32/33's update) --
+ * MAX_CHARS_PER_SERVICE (`embarch-study-designer` decisions 31/32/33's update) --
  * these two, unlike DBM_MAX_STEPS_PER_STUDY above, are small enough that
  * mirroring the crate's own real ceiling costs no meaningful RAM. */
 #define DBM_MAX_DISCOVERED_SERVICES 8
 #define DBM_MAX_CHARS_PER_SERVICE 16
 /* DBM_MAX_GATT_ACTIVITY_RECORDS was here. Retired at schema v14 with the
- * field it bounded (embarch-study-designer/design.md §3 decision 54): it was
+ * field it bounded (`embarch-study-designer` decision 54): it was
  * the single largest contributor to `struct dbm_step_result_payload`'s size
  * (32 records at up to DBM_MAX_PAYLOAD_LEN bytes each) and had been flagged
  * as a real static-RAM risk from the outset by that doc's decision 32. What
  * it bounded was a capped in-memory copy of a capture the tap pipeline
  * already streams to Core uncapped, so the cap bought nothing and cost 16 KB
  * on a board whose sram0_0_seg has overflowed twice. */
-/* Largest transcript-entry payload this firmware ever *produces* (design.md
- * §3 decision 36) -- one ATT MTU's worth of notification, not the crate's
+/* Largest transcript-entry payload this firmware ever *produces* (`embarch-study-designer`
+ * decision 36) -- one ATT MTU's worth of notification, not the crate's
  * full MAX_PAYLOAD_LEN. See `struct dbm_gatt_transcript_entry`'s own comment
  * for why the two deliberately differ. Sized to hold a full 247-byte ATT_MTU
  * notification (247 - 3 bytes of ATT header), the value app/prj.conf
@@ -96,11 +95,11 @@
  * `encoding` here would be storing host-side knowledge this firmware is
  * specifically not supposed to hold. Eight of them is under 100 bytes, on a
  * board whose `sram0_0_seg` has already overflowed twice during this
- * decision's implementation (design.md §3 decisions 27, 28). */
+ * decision's implementation (decisions 27, 28). */
 #define DBM_MAX_STREAMS_PER_STUDY 8
 
 /* The `.eap` protocol manifest types a `StudyStart` carries and this file
- * decodes (embarch-study-designer/design.md §3 decisions 58-62, §4.9).
+ * decodes (`embarch-study-designer` decisions 58-62, §4.9).
  * Their own header, because eap_interp.c and ble_bridge also need them and
  * neither needs the link protocol -- see eap.h for what those types drop and
  * why, and for the per-manifest count caps.
@@ -132,7 +131,7 @@
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
  *
  * StudyStart's per-step worst case grew once decode had to cover every
- * `Action` kind, not just BleAdvertise (design.md §3 decisions 31/32):
+ * `Action` kind, not just BleAdvertise (`embarch-study-designer` decisions 31/32):
  * `DataExchange { GattOperation::Write { payload } }` dominates a single
  * step's own encoding now (service_uuid+characteristic_uuid, 16 bytes each,
  * plus a Write payload up to DBM_MAX_PAYLOAD_LEN bytes with its own length
@@ -149,11 +148,11 @@
  * **StudyStart is the larger message again as of schema v14.** It had not
  * been since gatt_activity arrived: that field added ~16.6 KB to StepResult's
  * bound and made it this file's largest by a factor of two. Retiring it
- * (embarch-study-designer/design.md §3 decision 54) takes all of that back,
+ * (`embarch-study-designer` decision 54) takes all of that back,
  * which is what shrinks DBM_MAX_RAW_LEN and every buffer sized from it.
  *
  * `+ DBM_MAX_PROTOCOLS_WIRE_LEN` at schema v15
- * (embarch-study-designer/design.md §3 decision 58): the `protocols` span and
+ * (`embarch-study-designer` decision 58): the `protocols` span and
  * its seal ride at the end of StudyStart, and unlike `streams` they are far
  * too large to hide inside the per-step rounding slack. Counted as one
  * disclosed byte cap rather than as a product of the eleven `.eap` count
@@ -165,8 +164,8 @@
 #define DBM_MAX_GATT_SERVICES_LEN \
 	(4 + (DBM_MAX_DISCOVERED_SERVICES * (16 + 4 + (DBM_MAX_CHARS_PER_SERVICE * 17))))
 /* `+ EAP_MAX_STATE_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + 8` at schema v15:
- * `StepResult.protocol: Option<ProtocolOutcome>` (embarch-study-designer/
- * design.md §3 decision 62) is one trailing Option byte plus, when a
+ * `StepResult.protocol: Option<ProtocolOutcome>` (`embarch-study-designer`
+ * decision 62) is one trailing Option byte plus, when a
  * `RunProtocol` step really ran, a state name and an `Outcome` that can carry
  * its own `fail_reason`. */
 #define DBM_MAX_STEP_RESULT_LEN                                                                  \
@@ -216,7 +215,7 @@
  * `Hello` (a dozen bytes) and `StudyStart`. So an RX staging buffer sized to
  * DBM_MAX_FRAME_LEN is sized for a frame that cannot arrive.
  *
- * Found while making CONFIG_LOG fit on the ESP32-C5 (design.md §3 decision
+ * Found while making CONFIG_LOG fit on the ESP32-C5 (decision
  * 38): that board's `sram0_0_seg` was at 98.5% before the logging subsystem
  * asked for ~11 KB of it, ~5 KB of which is Espressif's linker script forcing
  * log_core/log_output/log_msg/cbprintf into IRAM and therefore not negotiable.
@@ -229,7 +228,7 @@
  * through it precisely to prove encode and decode agree), and narrowing it
  * would trade a real test for RAM. `+ streams + margin` because
  * DBM_MAX_STUDY_START_LEN's own formula predates StudyStart carrying
- * `streams`/`streams_crc` (design.md §3 decision 29(a)) and covers them only
+ * `streams`/`streams_crc` (decision 29(a)) and covers them only
  * out of its per-step rounding slack -- counted explicitly here rather than
  * left to that slack, since this bound now has RAM riding on it.
  */
@@ -241,8 +240,8 @@
 /* Mirrors embarch-study-designer's `DevBenchLogLevel` (src/study.rs) -- these
  * are that enum's postcard discriminants, which are also deliberately its
  * Zephyr severity numbers (`DevBenchLogLevel::zephyr_level`), so no
- * translation table is needed on this side. Schema v13, design.md §3 decision
- * 39.
+ * translation table is needed on this side. Schema v13, `embarch-study-designer`
+ * decision 39.
  *
  * Appended, never reordered, for the same positional-encoding reason every
  * other enum on this wire is. */
@@ -256,8 +255,8 @@
  * as the enum's varint discriminant, so the order here must never drift from
  * the crate's.
  *
- * **Tags 2/3/4 changed meaning at schema v8** (embarch-study-designer/
- * design.md §3 decision 39): the old StreamStart/StreamChunk/StreamEnd trio
+ * **Tags 2/3/4 changed meaning at schema v8** (`embarch-study-designer`
+ * decision 39): the old StreamStart/StreamChunk/StreamEnd trio
  * was retired outright and the generic StreamOpen/StreamChunkBatch/
  * StreamClose trio took their slots. Decision 10's append-only rule is about
  * additions to a shipped protocol; the `Hello`/`HelloAck` version handshake
@@ -276,7 +275,7 @@ enum dbm_tag {
 	DBM_TAG_STEP_RESULT = 7,
 	DBM_TAG_STUDY_DONE = 8,
 	/* `GattTranscriptRecord`, tag 10 -- **retired by schema v8**
-	 * (embarch-study-designer/design.md §3 decision 39) and, as of
+	 * (`embarch-study-designer` decision 39) and, as of
 	 * Milestone 7 Phase B item 3, **no longer sent or encoded**. The
 	 * transcript itself is untouched: its entry type, its both-directions
 	 * coverage, its uncapped streaming and its `gatt.csv` columns are all
@@ -328,7 +327,7 @@ enum dbm_gatt_event_kind {
  * firmware never *produces* an entry larger than one ATT MTU's worth of
  * notification, and a transcript entry lives in a queue with several slots
  * (main.c), where DBM_MAX_PAYLOAD_LEN per slot would cost real RAM this
- * board has already overflowed once (design.md §3 decision 27's own SRAM
+ * board has already overflowed once (decision 27's own SRAM
  * finding). Sending fewer bytes than the receiving type can hold is always
  * wire-legal; the reverse is not. */
 struct dbm_gatt_transcript_entry {
@@ -354,7 +353,7 @@ enum dbm_unit {
 };
 
 /* `Hello` lost `steps_crc` (moved to `StudyStart` — embarch-study-designer
- * schema v3, embarch-study-designer/design.md §3 decisions 24/27). */
+ * schema v3, `embarch-study-designer` decisions 24/27). */
 struct dbm_hello {
 	uint32_t schema_version;
 	uint64_t host_utc_ms;
@@ -366,7 +365,7 @@ struct dbm_hello_ack {
 	/* NUL-terminated; wire form has no NUL, `+1` is this struct's own headroom. */
 	char firmware_version[DBM_MAX_FIRMWARE_VERSION_LEN + 1];
 	/* This board's own chip ID, hex-encoded lowercase (schema v10,
-	 * embarch-study-designer/design.md §3 decision 47). Core compares it
+	 * `embarch-study-designer` decision 47). Core compares it
 	 * against the identity its JTAG probe just read, which is the only
 	 * thing that ties the runtime serial link and the JTAG connection to
 	 * the same silicon -- since the port migration they are physically
@@ -458,7 +457,7 @@ struct dbm_stream_tap {
 	uint32_t scope_to;
 	/* The characteristic a DBM_STREAM_SRC_GATT_NOTIFY tap routes, raw
 	 * big-endian; meaningless for every other source tag
-	 * (embarch-study-designer/design.md §3 decision 55, schema v14).
+	 * (`embarch-study-designer` decision 55, schema v14).
 	 * Previously the decoder skipped these 32
 	 * bytes outright.
 	 *
@@ -501,7 +500,7 @@ struct dbm_log_line {
 };
 
 /* Mirrors embarch-study-designer's `Action` (src/study.rs), one variant per
- * enum tag -- embarch-study-designer/design.md §3 decisions 44/50 added the
+ * enum tag -- `embarch-study-designer` decisions 44/50 added the
  * last two of these.
  * Append-only, same discipline as `enum dbm_tag`: the tag values below match
  * `Action`'s own declared variant order exactly, since postcard encodes an
@@ -512,19 +511,19 @@ enum dbm_action_tag {
 	DBM_ACTION_DATA_EXCHANGE = 2,
 	DBM_ACTION_GATT_DISCOVER = 3,
 	DBM_ACTION_GATT_MONITOR_ALL = 4,
-	/* design.md §3 decision 36 -- a capture window that outlives its own
+	/* `embarch-study-designer` decision 36 -- a capture window that outlives its own
 	 * step, so a stimulus write and a capture can finally overlap. Both
 	 * field-less, same as GattDiscover/GattMonitorAll. */
 	DBM_ACTION_GATT_MONITOR_START = 5,
 	DBM_ACTION_GATT_MONITOR_STOP = 6,
-	/* embarch-study-designer/design.md §3 decisions 44/50, schema v12 --
+	/* `embarch-study-designer` decisions 44/50, schema v12 --
 	 * the first Action variant since BleConnect to carry a field, and one
 	 * that carries none. Appended, never inserted: postcard encodes the
 	 * discriminant positionally, so inserting would shift both of these
 	 * and every future one. */
 	DBM_ACTION_BLE_SECURITY = 7,
 	DBM_ACTION_BLE_UNBOND = 8,
-	/* embarch-study-designer/design.md §3 decision 53, schema v14 -- the
+	/* `embarch-study-designer` decision 53, schema v14 -- the
 	 * same discovery-and-subscribe walk as GATT_MONITOR_ALL/START, narrowed
 	 * to the characteristics the study names.
 	 *
@@ -537,7 +536,7 @@ enum dbm_action_tag {
 	 * for exactly that. */
 	DBM_ACTION_GATT_MONITOR_SELECTED = 9,
 	DBM_ACTION_GATT_MONITOR_SELECTED_START = 10,
-	/* embarch-study-designer/design.md §3 decision 60, schema v15 -- hand
+	/* `embarch-study-designer` decision 60, schema v15 -- hand
 	 * the link to a declared `.eap` state machine for the length of this
 	 * step. Appended, never inserted, same positional-encoding rule as
 	 * every tag above it.
@@ -574,7 +573,7 @@ struct dbm_run_protocol_action {
  * (~553 bytes), which is larger than 16 targets (512). */
 #define DBM_MAX_MONITOR_TARGETS 16
 
-/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs, design.md §3
+/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs,
  * decision 44). Values are postcard discriminants -- the enum's *declaration*
  * order, which is NOT the spec's level number: L1 encodes as 0. That offset
  * is the whole reason this mirror is spelled out rather than assumed, and
@@ -608,7 +607,7 @@ struct dbm_ble_advertise_action {
 };
 
 /* Mirrors `Action::BleConnect` (src/study.rs) -- `target_address` bytes are
- * in embarch-study-designer's own display order (design.md §4.3: most
+ * in embarch-study-designer's own display order (§4.3: most
  * significant byte first), same convention `ble_bridge.h`'s
  * `struct ble_connect_params` already documents. */
 struct dbm_ble_connect_action {
@@ -616,8 +615,8 @@ struct dbm_ble_connect_action {
 	bool has_target_address;
 	uint8_t target_address_kind; /* 0 = Public, 1 = Random (mirrors BleAddressKind) */
 	uint8_t target_address[6];
-	/* Advertised local name to connect to (embarch-study-designer/design.md
-	 * §3 decision 43, schema v7). Encoded last in the BleConnect variant, so
+	/* Advertised local name to connect to (`embarch-study-designer`
+	 * decision 43, schema v7). Encoded last in the BleConnect variant, so
 	 * decoded last here. `has_target_name == false` means no name filter --
 	 * connect to whichever connectable peripheral advertises first, the
 	 * pre-v7 behavior. */
@@ -653,15 +652,15 @@ struct dbm_data_exchange_action {
 };
 
 /* Mirrors `Action::BleSecurity` (embarch-study-designer/src/study.rs,
- * design.md §3 decision 44). One field, encoded as a varint after the action
- * tag. `Action::BleUnbond` (that doc's decision 50) is field-less and needs no
+ * decision 44). One field, encoded as a varint after the action
+ * tag. `Action::BleUnbond` (`embarch-study-designer` decision 50) is field-less and needs no
  * struct,
  * same as the GattDiscover/GattMonitor* family below. */
 struct dbm_ble_set_security_action {
 	uint8_t level; /* enum dbm_security_level */
 };
 
-/* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs, design.md §3
+/* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs,
  * decision 53) -- two raw big-endian UUIDs back to back, no length prefixes,
  * same convention as every other UUID in this header. Both, not the
  * characteristic alone: subscribing needs the service to discover within,
@@ -672,14 +671,14 @@ struct dbm_gatt_target {
 };
 
 /* Mirrors `Action::GattMonitorSelected`/`GattMonitorSelectedStart`
- * (design.md §3 decision 53). One field, a sequence -- so the decoder reads
+ * (`embarch-study-designer` decision 53). One field, a sequence -- so the decoder reads
  * a length varint and then that many fixed 32-byte targets. */
 struct dbm_gatt_monitor_selected_action {
 	struct dbm_gatt_target targets[DBM_MAX_MONITOR_TARGETS];
 	uint32_t targets_len;
 };
 
-/* Action::GattDiscover/GattMonitorAll (design.md §3 decisions 31/32) are both
+/* Action::GattDiscover/GattMonitorAll (`embarch-study-designer` decisions 31/32) are both
  * field-less -- no struct needed; `dbm_step.action_tag` alone identifies
  * them, matching this crate's "simplest possible FFI/wire surface" framing
  * for both. */
@@ -689,7 +688,7 @@ struct dbm_step {
 	uint32_t timeout_ms;
 	bool continue_on_fail;
 	/* How long to wait before starting this step's action
-	 * (embarch-study-designer/design.md §3 decision 42, schema v6). Encoded
+	 * (`embarch-study-designer` decision 42, schema v6). Encoded
 	 * last in `Step`, so it is read last here too -- see the crate's own
 	 * `Step::delay_before_ms` doc comment for why it was appended rather
 	 * than inserted. Distinct from `timeout_ms`, which still bounds only
@@ -714,13 +713,13 @@ struct dbm_study_start {
 	struct dbm_step steps[DBM_MAX_STEPS_PER_STUDY];
 	uint32_t steps_crc;
 	/* Not part of the wire format -- set by dbm_decode_frame itself
-	 * (design.md §3 decision 17/19): whether the just-decoded `steps`
+	 * (`embarch-study-designer` decision 17/19): whether the just-decoded `steps`
 	 * recompute to `steps_crc`. `false` on a genuine mismatch; also `false`
 	 * (with `steps_len` left at 0) when decoding stopped early because a
 	 * step's action wasn't BleAdvertise -- see dbm_decode_frame's own doc
 	 * comment for why CRC can't be computed in that case. */
 	bool steps_crc_valid;
-	/* The declared `StreamTap`s (schema v9, design.md §3 decision 39 and
+	/* The declared `StreamTap`s (schema v9, `embarch-study-designer` decision 39 and
 	 * its 2026-08-25 amendment), as much of each as this node acts on --
 	 * see `struct dbm_stream_tap` for what is deliberately not kept.
 	 *
@@ -745,13 +744,13 @@ struct dbm_study_start {
 	 * but the caller must not dispatch it. */
 	bool has_unsupported_action;
 	/* How loud this firmware should be while this study runs -- schema v13
-	 * (design.md §3 decision 39), one of DBM_LOG_LEVEL_*. Appended after
+	 * (`embarch-study-designer` decision 39), one of DBM_LOG_LEVEL_*. Appended after
 	 * `streams_crc` on the wire, and covered by **neither** seal: the two
 	 * CRCs cover what dev-bench executes and what it captures, and how
 	 * verbose it is about doing so changes neither. */
 	uint8_t dev_bench_log_level;
 	/* The `.eap` protocol manifests this study resolved at build time --
-	 * schema v15 (embarch-study-designer/design.md §3 decision 58, §4.9),
+	 * schema v15 (`embarch-study-designer` decision 58, §4.9),
 	 * appended after `dev_bench_log_level` on the wire.
 	 *
 	 * Unlike `streams`, which this node stores 12 bytes of and walks past
@@ -777,7 +776,7 @@ struct dbm_outcome {
 };
 
 /* Mirrors `GattCharacteristicInfo`/`GattServiceInfo` (embarch-study-designer/
- * src/gatt.rs, design.md §4.3a) -- `properties` is the raw ATT
+ * src/gatt.rs, §4.3a) -- `properties` is the raw ATT
  * characteristic-properties byte, passed through unchanged. */
 struct dbm_gatt_characteristic_info {
 	uint8_t uuid[16];
@@ -798,14 +797,14 @@ struct dbm_step_result_payload {
 	uint32_t captured_data_len;
 	/* `power_samples_ref`/`waveform_ref` were described here as two
 	 * permanently-None wire fields. They are **retired** from `StepResult`
-	 * by design.md §3 decision 39 (schema v8) and the two bytes this file
+	 * by `embarch-study-designer` decision 39 (schema v8) and the two bytes this file
 	 * kept writing for them are gone at v9 -- see serial_protocol.c's
 	 * StepResult encoder for how they outlived the fields. */
-	/* gatt_services (design.md §3 decisions 31/32): populated by every
+	/* gatt_services (`embarch-study-designer` decisions 31/32): populated by every
 	 * discovering action; encode_body/decode_body both handle a real Some.
 	 *
 	 * `gatt_activity` was here and is **retired** at schema v14
-	 * (embarch-study-designer/design.md §3 decision 54), taking
+	 * (`embarch-study-designer` decision 54), taking
 	 * `struct dbm_gatt_activity_record` and DBM_MAX_GATT_ACTIVITY_RECORDS
 	 * with it. It was 32 × 526 bytes of static RAM -- by a wide margin the
 	 * largest single contributor to this struct -- holding a capped copy of
@@ -814,7 +813,7 @@ struct dbm_step_result_payload {
 	struct dbm_gatt_service_info gatt_services[DBM_MAX_DISCOVERED_SERVICES];
 	uint32_t gatt_services_len;
 	/* `StepResult.security_level: Option<SecurityLevel>` -- schema v12's
-	 * trailing field (embarch-study-designer/design.md §3 decision 44).
+	 * trailing field (`embarch-study-designer` decision 44).
 	 * Encoded last, so this is one appended Option byte rather than a
 	 * re-shuffle of a message this firmware sends more than any other.
 	 *
@@ -825,7 +824,7 @@ struct dbm_step_result_payload {
 	bool has_security_level;
 	uint8_t security_level; /* enum dbm_security_level */
 	/* `StepResult.protocol: Option<ProtocolOutcome>` -- schema v15's
-	 * trailing field (embarch-study-designer/design.md §3 decision 62),
+	 * trailing field (`embarch-study-designer` decision 62),
 	 * and now the last field of StepResult. Appended, so this is one more
 	 * Option byte on the message this firmware sends most rather than a
 	 * re-shuffle of it.
@@ -878,7 +877,7 @@ struct dev_bench_message {
  * step index. Writes at most `out_cap` bytes to `out` and returns the length
  * written, or a negative value if it wouldn't fit.
  *
- * Split out at schema v8 (design.md §3 decision 39): these are exactly the
+ * Split out at schema v8 (`embarch-study-designer` decision 39): these are exactly the
  * bytes a `StreamChunkBatch` record's payload carries on a tap declared
  * `StreamEncoding::GattTranscript`, which is what the transcript became once
  * its own message class was retired. Exposed (rather than left static)
@@ -899,8 +898,8 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
  * success; a negative value on a malformed frame, unknown tag, truncated
  * message, or a string field too long for its buffer.
  *
- * For DBM_TAG_STUDY_START specifically (embarch-study-designer/design.md §3
- * decisions 17/19/31/32, embarch-dev-bench/design.md §3 decision 21): every
+ * For DBM_TAG_STUDY_START specifically (`embarch-study-designer`
+ * decisions 17/19/31/32, decision 21): every
  * step's Action kind this crate defines is decodable now
  * (BleAdvertise/BleConnect/DataExchange/GattDiscover/GattMonitorAll) —
  * decision 21's original BleAdvertise-only scope is closed. `steps_len`
