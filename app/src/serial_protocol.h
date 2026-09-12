@@ -240,8 +240,12 @@
 /* Mirrors embarch-study-designer's `DevBenchLogLevel` (src/study.rs) -- these
  * are that enum's postcard discriminants, which are also deliberately its
  * Zephyr severity numbers (`DevBenchLogLevel::zephyr_level`), so no
- * translation table is needed on this side. Schema v13, `embarch-study-designer`
- * decision 39.
+ * translation table is needed on this side. Schema v13, decision 39 -- this
+ * repo's own (`decisions/logging.md`, a study says how loud the bench should
+ * be), NOT `embarch-study-designer`'s decision 39, which is the inbound
+ * stream-pipeline unification and says nothing about log levels. The two
+ * repos' decision 39s collide by number and this comment names both repos,
+ * which is how dev-bench/020 got it wrong on the first pass.
  *
  * Appended, never reordered, for the same positional-encoding reason every
  * other enum on this wire is. */
