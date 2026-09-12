@@ -1,5 +1,5 @@
-/* The `.eap` protocol interpreter -- embarch-study-designer/design.md §3
- * decisions 58-62, §4.9.
+/* The `.eap` protocol interpreter -- `embarch-study-designer` decisions
+ * 58-62, §4.9.
  *
  * See eap_interp.h for what this is and what it deliberately is not. The
  * short version: `embarch-study-designer/src/eap_interp.rs` is the executable
@@ -325,8 +325,8 @@ static bool select_frame(const struct eap_protocol_def *def, uint8_t source,
 	return false;
 }
 
-/* Assemble a `write` payload from its typed fields (design.md §3 decision
- * 61).
+/* Assemble a `write` payload from its typed fields (`embarch-study-designer`
+ * decision 61).
  *
  * Returns false if any operand fails to resolve -- the write is **not** sent
  * with a zero substituted in, because a control-point opcode carrying a
