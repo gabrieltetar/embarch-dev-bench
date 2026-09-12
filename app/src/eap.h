@@ -1,5 +1,4 @@
-/* The `.eap` protocol manifest wire types -- embarch-study-designer/design.md
- * §3 decisions 58-62, §4.9.
+/* The `.eap` protocol manifest wire types -- `embarch-study-designer` decisions 58-62, §4.9.
  *
  * Mirrors `embarch-study-designer/src/eap.rs` field for field, and is a
  * separate header for the reason that crate keeps `eap.rs` separate from
@@ -40,8 +39,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* ---- `.eap` protocol manifests (embarch-study-designer/design.md §3
- *      decisions 58-62, §4.9) ----------------------------------------------
+/* ---- `.eap` protocol manifests (`embarch-study-designer` decisions 58-62,
+ *      §4.9) ---------------------------------------------------------------
  *
  * **These bound a value this firmware executes, not one it walks past**, and
  * that is what makes them different from every other constant this firmware
@@ -191,7 +190,7 @@ struct eap_guarded_goto {
  *
  * **`has_otherwise == false` is not the same as `otherwise` pointing at this
  * state, and getting that wrong is the one mistake this type exists to make
- * hard** (embarch-study-designer/design.md §3 decision 60, and
+ * hard** (`embarch-study-designer` decision 60, and
  * embarch-decision-reversals.md row 66). With no `otherwise`, the frame is
  * consumed, its `remember`s stand, and the machine stays put *without
  * re-entering*: no `on_enter` re-send, and the timeout keeps counting from
@@ -209,7 +208,7 @@ struct eap_event_arm {
 	bool has_otherwise;
 };
 
-/* `WriteField`/`WriteAction` (design.md §3 decision 61) -- a write's payload
+/* `WriteField`/`WriteAction` (`embarch-study-designer` decision 61) -- a write's payload
  * is assembled from the same typed vocabulary a decode reads, so it can carry
  * a session variable or a field of the frame that triggered this event.
  * `ty` is a `ScalarType` discriminant (embarch-study-designer/src/decoder.rs),
@@ -227,7 +226,7 @@ struct eap_write {
 	 * **Never a transition trigger either way** -- a control-point write's
 	 * response confirms only that the write was accepted, and the
 	 * authoritative answer arrives later on a different characteristic
-	 * (design.md §3 decision 60). This selects the ATT operation, nothing
+	 * (`embarch-study-designer` decision 60). This selects the ATT operation, nothing
 	 * more. */
 	bool with_response;
 };
@@ -318,7 +317,7 @@ struct eap_protocol_def {
 	struct eap_state states[EAP_MAX_STATES_PER_PROTOCOL];
 	struct eap_frame frames[EAP_MAX_FRAMES_PER_PROTOCOL];
 	struct eap_source sources[EAP_MAX_SOURCES_PER_PROTOCOL];
-	/* Session variables are integers only (design.md §3 decision 60): the
+	/* Session variables are integers only (`embarch-study-designer` decision 60): the
 	 * draft's byte-span accumulator is gone with `++`, because on this
 	 * bench there is nowhere to put those bytes and nowhere they are
 	 * needed -- the chunks stream out on their own tap as they arrive, so

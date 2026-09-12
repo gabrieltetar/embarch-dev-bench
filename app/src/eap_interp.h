@@ -1,5 +1,5 @@
-/* The `.eap` protocol interpreter -- embarch-study-designer/design.md §3
- * decisions 58-62, §4.9.
+/* The `.eap` protocol interpreter -- `embarch-study-designer` decisions
+ * 58-62, §4.9.
  *
  * # This is the executor, and the Rust one is the specification
  *
@@ -90,7 +90,7 @@ enum eap_step_kind {
 /* One instruction.
  *
  * **A write's own ATT response is never fed back in.** There is no event for
- * one, deliberately (design.md §3 decision 60): on the DUT this was designed
+ * one, deliberately (`embarch-study-designer` decision 60): on the DUT this was designed
  * against, a control-point write's response confirms only that the write was
  * *accepted*, and the authoritative answer arrives later as an independent
  * notification on a different characteristic. This says what to send; only a
@@ -157,7 +157,7 @@ uint8_t eap_run_state(const struct eap_run *run);
 /* Session variables, in declaration order.
  *
  * Exposed for tests and for offline replay, and **not** reported in
- * `ProtocolOutcome` -- design.md §3 decision 62 kept decoded values out of a
+ * `ProtocolOutcome` -- `embarch-study-designer` decision 62 kept decoded values out of a
  * result on purpose, and a session variable is a decoded value that survived.
  * Mirrors `Run::session()` in the Rust reference, which exists for the same
  * two callers and neither of them is the wire. */
