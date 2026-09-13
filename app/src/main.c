@@ -1282,8 +1282,8 @@ static struct action step_to_action(const struct dbm_study_start *study,
 		 * every step, so a 4 KB copy per step would buy nothing.
 		 *
 		 * Range-checked by `protocol_index_valid` before this runs, so
-		 * the subscript here cannot be the raw one §3 decision 18's
-		 * rule exists to turn into a sentence. */
+		 * the subscript here cannot be the raw one `embarch-study-designer`
+		 * decision 18's rule exists to turn into a sentence. */
 		action.kind = ACTION_RUN_PROTOCOL;
 		action.run_protocol.def = &study->protocols[step->action.run_protocol.protocol];
 		action.run_protocol.entry_state = step->action.run_protocol.entry_state;
