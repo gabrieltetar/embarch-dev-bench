@@ -118,7 +118,7 @@
  * ever send: at the crate's ceilings a single `ProtocolDef` can encode to
  * ~7.4 KB, almost all of it names this firmware discards, and sizing three
  * staging buffers for two of those would cost ~30 KB for a span whose real
- * worked example (the BDS batch download) is **398 bytes** including
+ * worked example (the BDS batch download, `decision 41`) is **398 bytes** including
  * the whole rest of the StudyStart. A byte cap says the true thing -- "this
  * bench accepts a manifest up to this big" -- where a product of eleven
  * ceilings says a false one.

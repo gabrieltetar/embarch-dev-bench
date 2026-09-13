@@ -81,8 +81,8 @@
  * each carrying operands -- and it is multiplied by
  * EAP_MAX_STATES_PER_PROTOCOL, by DBM_MAX_PROTOCOLS_PER_STUDY, and again by
  * the two `struct dev_bench_message` statics, so the crate's 4 costs ~9 KB of
- * SRAM more than 2 does. Both worked protocols use **one**
- * arm per state; two is double the largest real case, and a study declaring
+ * SRAM more than 2 does. `decision 41` records that both worked protocols use
+ * **one** arm per state; two is double the largest real case, and a study declaring
  * more is refused by name at decode rather than quietly losing a transition
  * (which would be a state machine that runs and branches wrongly -- strictly
  * worse than one that does not run). Revisit this number, not the crate's own
