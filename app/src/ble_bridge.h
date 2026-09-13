@@ -4,7 +4,7 @@
  *   - ble_bridge_real.c: real Zephyr BT host calls (workspaces/nordic/)
  *   - ble_bridge_stub.c: canned Outcomes, no BLE host (workspaces/native_sim/)
  *
- * embarch-dev-bench/design.md §1, §3 decision 16. Field-level Study/Step
+ * Decision 16. Field-level Study/Step
  * decoding doesn't exist yet (study_ffi.c is a stub, decision 20) — nothing
  * currently constructs a `struct action` from real wire data. This header
  * exists so main.c's fixed bring-up demo sequence (decision 20's "even
@@ -18,7 +18,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* The `.eap` protocol manifest types (embarch-study-designer/design.md §3
+/* The `.eap` protocol manifest types (`embarch-study-designer`
  * decisions 58-62, §4.9). The one include this header has, and it is not the
  * link protocol's: eap.h is deliberately independent of serial_protocol.h for
  * exactly the reason BLE_MAX_PAYLOAD_LEN below is a duplicate rather than an
@@ -79,14 +79,14 @@ struct ble_advertise_params {
  * same display order (AA:BB:CC:DD:EE:FF, most significant byte first). Zephyr's
  * `bt_uuid_create`/`bt_addr_le_t` both want little-endian, so ble_bridge_real.c
  * reverses on the way in — the crate's own docs state this explicitly for
- * `Uuid` but not for `BleAddress` (embarch-dev-bench/design.md §4). */
+ * `Uuid` but not for `BleAddress` (§4). */
 struct ble_connect_params {
 	enum ble_role role;
 	bool has_target_address;
 	enum ble_address_kind target_address_kind;
 	uint8_t target_address[6];
 	/* Connect only to an advertiser whose advertised local name equals
-	 * this exactly (embarch-study-designer/design.md §3 decision 43).
+	 * this exactly (`embarch-study-designer` decision 43).
 	 * `has_target_name == false` restores the pre-v7 "first connectable
 	 * advertiser wins" behavior. Combined with `has_target_address` by AND:
 	 * if both are set, both must match. */
@@ -105,25 +105,25 @@ enum action_kind {
 	ACTION_BLE_CONNECT,
 	ACTION_DATA_EXCHANGE,
 	/* Both field-less (embarch-study-designer/src/study.rs's `Action::GattDiscover {}`/
-	 * `Action::GattMonitorAll {}`) -- no params struct needed, matching design.md §3
+	 * `Action::GattMonitorAll {}`) -- no params struct needed, matching `embarch-study-designer`
 	 * decisions 31/32's own "simplest possible" framing. */
 	ACTION_GATT_DISCOVER,
 	ACTION_GATT_MONITOR_ALL,
-	/* design.md §3 decision 36 -- also field-less. Unlike
+	/* `embarch-study-designer` decision 36 -- also field-less. Unlike
 	 * ACTION_GATT_MONITOR_ALL, which subscribes and tears down inside one
 	 * step, these two open and close a capture window that spans the steps
 	 * between them, so a DataExchange write can stimulate the DUT while the
 	 * capture is live. */
 	ACTION_GATT_MONITOR_START,
 	ACTION_GATT_MONITOR_STOP,
-	/* embarch-study-designer/design.md §3 decisions 44/50. The first is
+	/* `embarch-study-designer` decisions 44/50. The first is
 	 * the only action here that carries a field and does no GATT at all;
 	 * the second is field-less and, uniquely among these, *drops the
 	 * link* as a documented consequence (Zephyr's bt_unpair disconnects a
 	 * peer whose keys it clears). */
 	ACTION_BLE_SECURITY,
 	ACTION_BLE_UNBOND,
-	/* embarch-study-designer/design.md §3 decision 53 -- the same
+	/* `embarch-study-designer` decision 53 -- the same
 	 * discovery-and-subscribe walk as ACTION_GATT_MONITOR_ALL/START,
 	 * narrowed to the characteristics the study names. The first actions
 	 * here to carry a *list*.
@@ -135,7 +135,7 @@ enum action_kind {
 	 * is right precisely because nothing there was named. */
 	ACTION_GATT_MONITOR_SELECTED,
 	ACTION_GATT_MONITOR_SELECTED_START,
-	/* embarch-study-designer/design.md §3 decision 60 -- hand the link to a
+	/* `embarch-study-designer` decision 60 -- hand the link to a
 	 * declared `.eap` state machine for the length of this step.
 	 *
 	 * **The only action here whose behavior is not fixed by this file.**
@@ -209,7 +209,7 @@ struct action {
 };
 
 /* Mirrors embarch-study-designer's `GattCharacteristicInfo`/`GattServiceInfo`
- * (src/gatt.rs, design.md §4.3a) -- `properties` is the raw ATT
+ * (src/gatt.rs, §4.3a) -- `properties` is the raw ATT
  * characteristic-properties byte, passed through unchanged (that decision's
  * "raw, not symbolic" stance). UUID byte order matches every other UUID in
  * this header: big-endian, embarch-study-designer's own convention. */
@@ -250,15 +250,15 @@ struct outcome {
 	size_t captured_len;
 
 	/* Populated by ACTION_GATT_DISCOVER/ACTION_GATT_MONITOR_ALL, mirroring
-	 * `StepResult.gatt_services` (embarch-study-designer/src/result.rs, design.md
-	 * §3 decisions 31/32) -- a borrow into a bridge-owned static buffer, same
+	 * `StepResult.gatt_services` (embarch-study-designer/src/result.rs,
+	 * `embarch-study-designer` decisions 31/32) -- a borrow into a bridge-owned static buffer, same
 	 * posture and same lifetime rule as `captured_data` above. NULL/0 for every
 	 * other action kind. */
 	const struct ble_gatt_service_info *gatt_services;
 	size_t gatt_service_count;
 	/* `gatt_activity` was here, mirroring the `StepResult` field of the
 	 * same name. Both are **retired** by
-	 * embarch-study-designer/design.md §3 decision 54: a capped in-memory
+	 * `embarch-study-designer` decision 54: a capped in-memory
 	 * copy of a capture the tap pipeline already streams to Core uncapped.
 	 * What a monitor step captured is now read out of the study's own
 	 * `streams/` files, which is where all of it is rather than the first
@@ -267,7 +267,7 @@ struct outcome {
 
 	/* The link's BLE security level when this action finished, mirroring
 	 * `StepResult.security_level` (embarch-study-designer/src/result.rs,
-	 * embarch-study-designer/design.md §3 decision 44).
+	 * `embarch-study-designer` decision 44).
 	 *
 	 * Set for **every** action kind, not just ACTION_BLE_SECURITY:
 	 * whichever level the link was at is what makes a later step's failure
@@ -280,7 +280,7 @@ struct outcome {
 
 	/* What an ACTION_RUN_PROTOCOL step's state machine did, mirroring
 	 * `StepResult.protocol: Option<ProtocolOutcome>`
-	 * (embarch-study-designer/design.md §3 decision 62). `has_protocol ==
+	 * (`embarch-study-designer` decision 62). `has_protocol ==
 	 * false` for every other action kind, which is every action that
 	 * existed before it.
 	 *
@@ -302,8 +302,8 @@ struct outcome {
  * _stub). Returns 0 on success. Call once at boot, before ble_bridge_execute. */
 int ble_bridge_init(void);
 
-/* Executes one action synchronously, bounded by timeout_ms (embarch-dev-bench/design.md
- * §1's Step.timeout_ms), returning its device-observed Outcome. */
+/* Executes one action synchronously, bounded by timeout_ms (§1's
+ * Step.timeout_ms), returning its device-observed Outcome. */
 struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_ms);
 
 /* Sink for GATT_OP_STREAM_CAPTURE's continuous notifications, which — unlike
@@ -316,12 +316,12 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
  * thread called ble_bridge_execute — a handler must not block. No handler
  * registered (the current default: nothing wires one up yet, since how raw
  * notification bytes map onto `Sample.value`'s single f32 is still open,
- * embarch-dev-bench/design.md §4) means captured samples are counted and
+ * §4) means captured samples are counted and
  * dropped, not buffered. */
 typedef void (*ble_stream_sample_handler)(const uint8_t *data, size_t len, void *user_data);
 void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data);
 
-/* ---- GATT transcript (design.md §3 decision 36) ------------------------ */
+/* ---- GATT transcript (`embarch-study-designer` decision 36) ------------------------ */
 
 /* Largest payload this bridge ever puts in a transcript entry -- one full ATT
  * MTU notification. Mirrors serial_protocol.h's
@@ -378,7 +378,7 @@ struct ble_transcript_entry {
  * for anything inbound, the caller's own thread for anything this bridge
  * initiated -- so a sink **must not block** and must not write to the link
  * UART directly (main.c's own sink enqueues instead, and a dedicated thread
- * drains it; see design.md §3 decision 36). With no sink registered, events
+ * drains it; see `embarch-study-designer` decision 36). With no sink registered, events
  * are simply not recorded: the transcript is an observability feature, never
  * a precondition for a step running. */
 typedef void (*ble_transcript_sink)(const struct ble_transcript_entry *entry, void *user_data);
@@ -438,11 +438,11 @@ void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data);
 
 /* True while a window opened by ACTION_GATT_MONITOR_START is still open --
  * main.c uses it to close an implicitly-left-open window when a study ends
- * (design.md §3 decision 36). */
+ * (`embarch-study-designer` decision 36). */
 bool ble_bridge_monitor_window_open(void);
 
 /* Clears every bond in dev-bench's in-RAM BT bonding table
- * (embarch-dev-bench/design.md §3 decision 37 -- **a study is the bond's
+ * (decision 37 -- **a study is the bond's
  * lifetime**). main.c calls this at the end of every study so a second run
  * of a study behaves like the first, which is the failure mode study-scoped
  * bonding exists to avoid; ble_bridge_reset() below calls it too, since a
@@ -458,7 +458,7 @@ bool ble_bridge_monitor_window_open(void);
  * this adds is a *bounded* lifetime within one power cycle. */
 void ble_bridge_clear_bonds(void);
 
-/* embarch-dev-bench/design.md §3 decision 11: a fresh Hello unconditionally
+/* Decision 11: a fresh Hello unconditionally
  * clears dev-bench's in-RAM BT bonding table (never persisted to flash — not
  * enabling CONFIG_BT_SETTINGS already keeps bonds RAM-only; this clears them
  * explicitly rather than letting them accumulate across a session's repeated

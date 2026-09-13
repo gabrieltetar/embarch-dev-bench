@@ -107,7 +107,7 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 }
 
 /* Reads one postcard-encoded `StreamTap` (embarch-study-designer
- * src/streams.rs, design.md §4.8), advancing *pos past it and filling `out`
+ * src/streams.rs, §4.8), advancing *pos past it and filling `out`
  * with the part this node acts on. Returns 0 on success, -1 on a malformed
  * or unrecognized shape.
  *
@@ -157,8 +157,8 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 		}
 		/* The service UUID is walked past; the characteristic is kept,
 		 * because this node routes notifications to this tap's id and
-		 * a notification identifies itself by characteristic (design.md
-		 * §3 decision 55). Addressing, not meaning -- see `struct
+		 * a notification identifies itself by characteristic (`embarch-study-designer`
+		 * decision 55). Addressing, not meaning -- see `struct
 		 * dbm_stream_tap`. */
 		memcpy(out->characteristic_uuid, raw + *pos + 16, 16);
 		*pos += 32;
@@ -244,7 +244,7 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 	return 0;
 }
 
-/* ---- `.eap` protocol manifests (embarch-study-designer/design.md §3
+/* ---- `.eap` protocol manifests (`embarch-study-designer`
  *      decisions 58-62, §4.9) ----------------------------------------------
  *
  * The reference these have to agree with is `embarch-study-designer/src/eap.rs`
@@ -315,7 +315,7 @@ static int pc_read_eap_operand(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return 0;
 	default:
 		/* A fifth operand form is a decision with a firmware reflash
-		 * attached (design.md §3 decision 60), so a tag this build has
+		 * attached (`embarch-study-designer` decision 60), so a tag this build has
 		 * no name for cannot be walked past and is a hard error. */
 		return -1;
 	}
@@ -366,7 +366,7 @@ static int pc_read_eap_condition(const uint8_t *raw, size_t raw_len, size_t *pos
 	return pc_read_eap_operand(raw, raw_len, pos, &out->rhs);
 }
 
-/* `ActiveState.on_enter: Option<WriteAction>` (design.md §3 decision 61). */
+/* `ActiveState.on_enter: Option<WriteAction>` (`embarch-study-designer` decision 61). */
 static int pc_read_eap_write(const uint8_t *raw, size_t raw_len, size_t *pos,
 			     struct eap_write *out)
 {
@@ -490,7 +490,7 @@ static int pc_read_eap_state(const uint8_t *raw, size_t raw_len, size_t *pos,
 		}
 		if (outcome > EAP_TERMINAL_FAIL) {
 			/* `Outcome::TimedOut` is not declarable by a manifest
-			 * (design.md §3 decision 62); only a run produces it.
+			 * (`embarch-study-designer` decision 62); only a run produces it.
 			 * A third discriminant here is drift, not a new
 			 * outcome. */
 			return -1;
@@ -649,7 +649,7 @@ static int pc_read_eap_frame(const uint8_t *raw, size_t raw_len, size_t *pos,
  *
  * Every count checked here is checked because the value behind it reaches a
  * C array subscript. `validate_protocol` and Core's pre-flight already
- * range-check the *indices* inside a protocol host-side (design.md §3
+ * range-check the *indices* inside a protocol host-side (`embarch-study-designer`
  * decision 18's rule), and this is the other half: the *capacities* are this
  * firmware's own, so this is the only place that can refuse them.
  */
@@ -698,7 +698,7 @@ static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
 		}
 	}
 
-	/* session -- integers only (design.md §3 decision 60) */
+	/* session -- integers only (`embarch-study-designer` decision 60) */
 	if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
 		return -1;
 	}
@@ -753,8 +753,8 @@ static uint32_t dbm_crc32(const uint8_t *data, size_t len)
 
 /* ---- COBS -----------------------------------------------------------------
  *
- * Standard Consistent Overhead Byte Stuffing (embarch-study-designer/design.md
- * §3 decision 10). `cobs_encode` does not append the trailing 0x00 frame
+ * Standard Consistent Overhead Byte Stuffing (`embarch-study-designer`
+ * decision 10). `cobs_encode` does not append the trailing 0x00 frame
  * delimiter itself — `dbm_encode_frame` does, once, after calling this.
  */
 
@@ -827,7 +827,7 @@ static size_t cobs_decode(const uint8_t *input, size_t length, uint8_t *output, 
  * fixed-array encoding DataExchange's own UUIDs already use.
  *
  * At schema v8 these bytes are a stream record's payload rather than a
- * message body of their own (design.md §3 decision 39), which is why this is
+ * message body of their own (`embarch-study-designer` decision 39), which is why this is
  * a function instead of an inlined `encode_body` case. */
 static int encode_transcript_entry_at(const struct dbm_gatt_transcript_entry *e, uint8_t *out,
 				       size_t out_cap, size_t *pos)
@@ -926,7 +926,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 				   pos) != 0) {
 			return -1;
 		}
-		/* schema v10 (embarch-study-designer/design.md §3 decision 47).
+		/* schema v10 (`embarch-study-designer` decision 47).
 		 * An empty hardware_id still writes its length prefix -- an
 		 * absent field and a zero-length one are different bytes, and
 		 * only the latter leaves the frame walkable. */
@@ -1026,7 +1026,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 					WRITE_VARINT(step->action.connect.target_address_kind);
 				}
 				/* target_name: Option<String> -- schema v7's trailing
-				 * field on this variant (design.md §3 decision 43). */
+				 * field on this variant (`embarch-study-designer` decision 43). */
 				if (*pos + 1 > out_cap) {
 					return -1;
 				}
@@ -1070,7 +1070,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 
 			case DBM_ACTION_BLE_SECURITY:
 				/* One varint, the SecurityLevel discriminant
-				 * (embarch-study-designer/design.md §3
+				 * (`embarch-study-designer`
 				 * decision 44, schema v12). */
 				WRITE_VARINT(step->action.set_security.level);
 				break;
@@ -1079,7 +1079,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			case DBM_ACTION_GATT_MONITOR_SELECTED_START: {
 				/* A sequence: length varint, then that many
 				 * fixed 32-byte targets, no per-element length
-				 * prefix (embarch-study-designer/design.md §3
+				 * prefix (`embarch-study-designer`
 				 * decision 53, schema v14). */
 				const struct dbm_gatt_monitor_selected_action *ms =
 					&step->action.monitor_selected;
@@ -1123,7 +1123,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			WRITE_VARINT(step->timeout_ms);
 			/* `Step::power_sample` was encoded here as a permanent
 			 * `None` byte and is **retired** at schema v9
-			 * (embarch-study-designer/design.md §3 decision 39's
+			 * (`embarch-study-designer` decision 39's
 			 * 2026-08-25 amendment): a `StreamSource::PowerFrontEnd`
 			 * tap is the only way to author a power capture now.
 			 * Nothing ever read the field -- this encoder wrote None
@@ -1135,11 +1135,11 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 			}
 			out[(*pos)++] = step->continue_on_fail ? 1 : 0;
 			/* Step::delay_before_ms -- schema v6's trailing field
-			 * (embarch-study-designer/design.md §3 decision 42). */
+			 * (`embarch-study-designer` decision 42). */
 			WRITE_VARINT(step->delay_before_ms);
 		}
 		WRITE_VARINT(msg->study_start.steps_crc);
-		/* `streams` + `streams_crc` (schema v9, design.md §3 decision 39
+		/* `streams` + `streams_crc` (schema v9, `embarch-study-designer` decision 39
 		 * and its 2026-08-25 amendment). This firmware never *sends* a
 		 * StudyStart -- Core does -- so this encoder exists only for the
 		 * round-trip tests, and it has no taps of its own to write: an
@@ -1153,12 +1153,12 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * write, these fields really do exist on the Rust type. */
 		WRITE_VARINT(0); /* streams: Vec<StreamTap>, empty */
 		WRITE_VARINT(0); /* streams_crc: CRC-32 of nothing */
-		/* dev_bench_log_level -- schema v13 (design.md §3 decision 39).
+		/* dev_bench_log_level -- schema v13 (decision 39).
 		 * Round-tripped from the struct rather than written as a fixed
 		 * value, which is what lets this file's own round-trip test prove
 		 * the field survives both directions. */
 		WRITE_VARINT(msg->study_start.dev_bench_log_level);
-		/* protocols + protocols_crc -- schema v15 (design.md §3
+		/* protocols + protocols_crc -- schema v15 (`embarch-study-designer`
 		 * decision 58). Written as an **empty list**, exactly as
 		 * `streams` above and for the identical reason: this encoder
 		 * exists only for this file's own round-trip tests, and a
@@ -1204,7 +1204,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		}
 		/* `power_samples_ref`/`waveform_ref` were encoded here as two
 		 * permanent `None` bytes. They are **retired** from `StepResult`
-		 * by design.md §3 decision 39 (schema v8) -- a capture belongs to
+		 * by `embarch-study-designer` decision 39 (schema v8) -- a capture belongs to
 		 * the study's declared taps, reported once as
 		 * `StudyResult.streams`, not to one step -- and this file kept
 		 * writing them anyway. Removed at v9, alongside `power_sample`:
@@ -1218,7 +1218,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * pass adds that pin (app/tests/serial_protocol) so the gap
 		 * cannot reopen.
 		 *
-		 * gatt_services (design.md §3 decisions 31/32) -- unlike those
+		 * gatt_services (`embarch-study-designer` decisions 31/32) -- unlike those
 		 * two, this firmware populates it for real. */
 		if (*pos + 1 > out_cap) {
 			return -1;
@@ -1257,7 +1257,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 
 		/* `gatt_activity`'s `Option` byte and its records were encoded
 		 * here. **Retired at schema v14**
-		 * (embarch-study-designer/design.md §3 decision 54): the field
+		 * (`embarch-study-designer` decision 54): the field
 		 * is gone from the Rust `StepResult`, so writing even the `None`
 		 * byte for it would shift `security_level` by one and decode as
 		 * a security level that was never reported -- the precise
@@ -1266,7 +1266,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		 * vector pins the 21-byte frame that proves it doesn't. */
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
-		 * trailing field (embarch-study-designer/design.md §3 decision
+		 * trailing field (`embarch-study-designer` decision
 		 * 50), and the last field of `StepResult` since v14. */
 		if (*pos + 1 > out_cap) {
 			return -1;
@@ -1277,7 +1277,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		}
 
 		/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
-		 * field (embarch-study-designer/design.md §3 decision 62), and
+		 * field (`embarch-study-designer` decision 62), and
 		 * the last field of `StepResult` since v15.
 		 *
 		 * `None` for every action but `RunProtocol`, which is every
@@ -1327,7 +1327,7 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
 	 * a small embedded call stack, especially with dbm_decode_frame's own
 	 * same-size scratch buffer potentially live in a caller's frame at the
 	 * same time (e.g. main.c's send_message_locked). Safe because every
-	 * caller holds main.c's link_tx_mutex -- which, as of design.md §3
+	 * caller holds main.c's link_tx_mutex -- which, as of `embarch-study-designer`
 	 * decision 36, is what serializes this static, not the old
 	 * single-threaded-link assumption: the transcript TX thread is a
 	 * second sender, and it has to keep draining while the dispatch loop
@@ -1389,7 +1389,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				 sizeof(msg->hello_ack.firmware_version)) != 0) {
 			return -1;
 		}
-		/* schema v10 (embarch-study-designer/design.md §3 decision 47).
+		/* schema v10 (`embarch-study-designer` decision 47).
 		 * dev-bench never receives a HelloAck in service -- this arm
 		 * exists so the round-trip tests can walk what the encoder above
 		 * wrote, which is precisely what caught the stale-Option drift
@@ -1505,7 +1505,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 					step->action.connect.target_address_kind = 0;
 				}
 
-				/* target_name: Option<String> -- schema v7 (design.md §3
+				/* target_name: Option<String> -- schema v7 (`embarch-study-designer`
 				 * decision 43). Read unconditionally: the Hello/HelloAck
 				 * schema-version handshake has already refused any peer
 				 * that wouldn't have sent it. */
@@ -1706,7 +1706,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			step->timeout_ms = (uint32_t)timeout_ms;
 
 			/* `power_sample` was read-and-discarded here and is
-			 * **retired** at schema v9 (design.md §3 decision 39's
+			 * **retired** at schema v9 (`embarch-study-designer` decision 39's
 			 * 2026-08-25 amendment). `continue_on_fail` now follows
 			 * `timeout_ms` directly. */
 			if (pos >= raw_len) {
@@ -1715,7 +1715,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			step->continue_on_fail = raw[pos++] != 0;
 
 			/* Step::delay_before_ms -- schema v6's trailing field
-			 * (embarch-study-designer/design.md §3 decision 42). Reading it
+			 * (`embarch-study-designer` decision 42). Reading it
 			 * is unconditional: the Hello/HelloAck schema-version handshake
 			 * has already refused any peer that wouldn't have sent it, so a
 			 * missing varint here is a genuine truncated frame, not an old
@@ -1750,7 +1750,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		ss->steps_crc_valid =
 			dbm_crc32(raw + steps_start_pos, steps_end_pos - steps_start_pos) == ss->steps_crc;
 
-		/* streams + streams_crc -- schema v9 (design.md §3 decision 39's
+		/* streams + streams_crc -- schema v9 (`embarch-study-designer` decision 39's
 		 * 2026-08-25 amendment). A **sibling** seal, checked independently
 		 * of steps_crc above, which is the whole point of there being two:
 		 * a mismatch says which half is corrupt.
@@ -1793,7 +1793,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			dbm_crc32(raw + streams_start_pos, streams_end_pos - streams_start_pos) ==
 			ss->streams_crc;
 
-		/* dev_bench_log_level -- schema v13 (design.md §3 decision 39).
+		/* dev_bench_log_level -- schema v13 (decision 39).
 		 * Read *after* the streams_crc span above, so it is outside both
 		 * seals by construction rather than by remembering to exclude it.
 		 *
@@ -1812,7 +1812,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		ss->dev_bench_log_level = (uint8_t)log_level;
 
 		/* protocols + protocols_crc -- schema v15
-		 * (embarch-study-designer/design.md §3 decision 58, §4.9). The
+		 * (`embarch-study-designer` decision 58, §4.9). The
 		 * study's **third** seal, and a sibling of the two above rather
 		 * than a widening of either: each covers one contiguous span and
 		 * is carried immediately after it, so this hand-written C
@@ -1925,11 +1925,11 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		}
 
 		/* `power_samples_ref`/`waveform_ref` were skipped here; both are
-		 * retired from `StepResult` (design.md §3 decision 39) and the
+		 * retired from `StepResult` (`embarch-study-designer` decision 39) and the
 		 * skip is removed at v9 -- see this file's encoder for the full
 		 * account of why it outlived the fields. */
 
-		/* gatt_services (design.md §3 decisions 31/32) --
+		/* gatt_services (`embarch-study-designer` decisions 31/32) --
 		 * this firmware only ever encodes these (see encode_body), but
 		 * decode is exercised by this file's own round-trip tests too. */
 		if (pos >= raw_len) {
@@ -1981,11 +1981,11 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		}
 
 		/* `gatt_activity` was read here. Retired at schema v14
-		 * (embarch-study-designer/design.md §3 decision 54) -- see the
+		 * (`embarch-study-designer` decision 54) -- see the
 		 * matching note in the encoder above. */
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
-		 * trailing field (embarch-study-designer/design.md §3 decision
+		 * trailing field (`embarch-study-designer` decision
 		 * 50). Read unconditionally: the Hello/HelloAck schema-version
 		 * handshake has already refused any peer that wouldn't have
 		 * sent it. */
@@ -2008,7 +2008,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		}
 
 		/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
-		 * field (embarch-study-designer/design.md §3 decision 62). */
+		 * field (`embarch-study-designer` decision 62). */
 		if (pos >= raw_len) {
 			return -1;
 		}

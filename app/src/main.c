@@ -1,6 +1,6 @@
 /* embarch-dev-bench firmware entry point.
  *
- * embarch-dev-bench/design.md §1, §2, §3 decisions 6/7/12/19/20/21. Shared
+ * Decisions 6/7/12/19/20/21. Shared
  * across both workspaces (nordic/native_sim) — only ble_bridge_real.c vs
  * ble_bridge_stub.c differs per workspace (decision 16).
  *
@@ -68,7 +68,7 @@ static const struct device *const link_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_con
  * `static struct dev_bench_message` -- harmless while `struct
  * dev_bench_message`'s union was a few KB (decision 21's own `StudyStart`
  * bump), but once `StepResult` had to grow to also hold `gatt_services`/
- * `gatt_activity` (design.md §3 decisions 31/32), four separate copies of
+ * `gatt_activity` (`embarch-study-designer` decisions 31/32), four separate copies of
  * that much larger union pushed a real ESP32-C5 build past this board's
  * available RAM at link time -- confirmed empirically, not assumed (a real
  * `west build` failed with `region 'sram0_0_seg' overflowed`). Consolidating
@@ -79,7 +79,7 @@ static struct dev_bench_message tx_scratch;
 
 /* Guards the link UART and send_message's own `frame` static.
  *
- * Until design.md §3 decision 36 there was exactly one writer (this file's
+ * Until `embarch-study-designer` decision 36 there was exactly one writer (this file's
  * RX/dispatch loop) and no lock was needed. The GATT transcript adds a second
  * one: the transcript TX thread below, which must keep draining while the
  * dispatch loop is blocked inside a long ble_bridge_execute() -- that's the
@@ -120,7 +120,7 @@ static void send_message_locked(const struct dev_bench_message *msg)
 	}
 }
 
-/* ---- GATT transcript plumbing (design.md §3 decision 36) ---------------- */
+/* ---- GATT transcript plumbing (`embarch-study-designer` decision 36) ---------------- */
 
 /* Depth chosen against what a burst actually looks like on this link rather
  * than a round number: at 1 Mbaud a full 244-byte entry clears the wire in
@@ -128,7 +128,7 @@ static void send_message_locked(const struct dev_bench_message *msg)
  * several notifications landing back-to-back in one connection interval and
  * the TX thread being scheduled. 16 slots is roughly 4.7 KB of static RAM --
  * deliberately modest on a board whose SRAM has already overflowed once
- * (design.md §3 decision 27's own finding). */
+ * (decision 27's own finding). */
 #define TRANSCRIPT_QUEUE_DEPTH 16
 
 struct transcript_item {
@@ -138,7 +138,7 @@ struct transcript_item {
 
 K_MSGQ_DEFINE(transcript_q, sizeof(struct transcript_item), TRANSCRIPT_QUEUE_DEPTH, 4);
 
-/* ---- declared stream taps (schema v9, design.md §3 decision 29(a)) ------
+/* ---- declared stream taps (schema v9, decision 29(a)) ------
  *
  * Copied out of the decoded `StudyStart` at dispatch, rather than read
  * through a pointer into the rx message buffer: that buffer is reused by the
@@ -219,7 +219,7 @@ static void send_log_line(const char *text);
 
 /* ble_bridge.h's `ble_log_sink`: forwards a bridge diagnostic as a `LogLine`
  * DevBenchMessage, the same channel dev-bench's own log output already uses
- * (design.md §3 decision 7). */
+ * (decision 7). */
 static void log_sink_cb(const char *line, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -227,7 +227,7 @@ static void log_sink_cb(const char *line, void *user_data)
 }
 
 /* Whether any open DBM_STREAM_SRC_GATT_NOTIFY tap named this entry's
- * characteristic -- embarch-study-designer/design.md §3 decision 55.
+ * characteristic -- `embarch-study-designer` decision 55.
  *
  * Read from the BT RX thread. `tap_open[]` is written only by the dispatch
  * thread and `study_taps[]` only between studies, so a stale read here costs
@@ -352,7 +352,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 	 * own. Not a style preference: that union is sized by its largest
 	 * member (`dbm_study_start`, ~10 KB), and a second instance overflowed
 	 * this board's SRAM by 2720 bytes at link time -- measured, not
-	 * predicted, exactly the way design.md §3 decision 27's own SRAM
+	 * predicted, exactly the way decision 27's own SRAM
 	 * finding was. The mutex is what makes one buffer safe for two
 	 * threads. */
 	struct transcript_item item;
@@ -373,7 +373,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 		bool want_transcript = tap_index >= 0 && tap_open[tap_index];
 
 		/* Fan-out to every open GattNotify tap that named this
-		 * characteristic (embarch-study-designer/design.md §3 decision 55). One captured
+		 * characteristic (`embarch-study-designer` decision 55). One captured
 		 * notification can legitimately land in two files: the
 		 * transcript, which is the complete story of the connection,
 		 * and the characteristic's own tap, which is its data on its
@@ -443,7 +443,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 
 		/* One entry, encoded to bare postcard bytes, carried as the
 		 * payload of a single-record StreamChunkBatch on the declared
-		 * transcript tap (design.md §3 decision 29(a)). The entry's
+		 * transcript tap (decision 29(a)). The entry's
 		 * own `rx_utc_ms` and the record's are the same value from
 		 * the same clock -- kept both places so the transcript row
 		 * shape decision 36 pinned stays byte-for-byte what it was.
@@ -532,7 +532,7 @@ static void send_log_line(const char *text)
  * same `LogLine` channel decision 7 established for hand-written diagnostics.
  * Deliberately the same channel and not a new message variant -- it costs no
  * wire schema version, and Core has to store both kinds in the same place
- * anyway (embarch-core/design.md §3 decision 37).
+ * anyway (`embarch-core` decision 37).
  *
  * Runs on the log processing thread (deferred mode), except on the fatal path
  * where it runs in the faulting context and `panic` is true. */
@@ -541,7 +541,7 @@ static void log_backend_sink(const char *line, bool panic)
 	send_log_line_ex(line, panic);
 }
 
-/* ---- stream tap open/close (design.md §3 decision 29(a)) ---------------- */
+/* ---- stream tap open/close (decision 29(a)) ---------------- */
 
 /* Sends StreamOpen/StreamClose for `study_taps[index]` and records the new
  * state. `dropped` is only meaningful on close.
@@ -679,7 +679,7 @@ static void send_study_done(bool completed)
 /* Builds and sends one `StepResult` from a step's device-observed `struct
  * outcome` (ble_bridge.h) — the C-side `Outcome`/`captured_data` shapes
  * mirror embarch-study-designer's `result::Outcome`/`StepResult` closely
- * enough (design.md §4.5) that this is a direct field-by-field translation,
+ * enough (§4.5) that this is a direct field-by-field translation,
  * not a reinterpretation. `power_samples_ref`/`waveform_ref` are never set
  * (encoded as `None` by serial_protocol.c's own encode_body): this pass has
  * no power/waveform capture yet (decision 21's scope). */
@@ -722,7 +722,7 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 		msg->step_result.result.has_captured_data = true;
 	}
 
-	/* gatt_services (design.md §3 decisions 31/32) -- populated by every
+	/* gatt_services (`embarch-study-designer` decisions 31/32) -- populated by every
 	 * discovering action; NULL/0 from ble_bridge_execute() for every other
 	 * action kind, same borrowed-pointer lifetime as captured_data above.
 	 *
@@ -754,7 +754,7 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 		msg->step_result.result.has_gatt_services = true;
 	}
 
-	/* `security_level` (embarch-study-designer/design.md §3 decision 44) --
+	/* `security_level` (`embarch-study-designer` decision 44) --
 	 * the bridge stamps this for every action kind, so this is a straight
 	 * pass-through and not a per-action-kind decision. `enum
 	 * ble_security_level` and `enum dbm_security_level` carry the same
@@ -762,7 +762,7 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 	msg->step_result.result.has_security_level = bridge_outcome->has_security_level;
 	msg->step_result.result.security_level = bridge_outcome->security_level;
 
-	/* `protocol` (embarch-study-designer/design.md §3 decision 62) -- set by
+	/* `protocol` (`embarch-study-designer` decision 62) -- set by
 	 * ACTION_RUN_PROTOCOL alone, which is the one action kind that runs a
 	 * state machine at all. Another straight pass-through: the outcome tags
 	 * on both sides are the same `Outcome` discriminants, so there is
@@ -789,7 +789,7 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 	k_mutex_unlock(&link_tx_mutex);
 }
 
-/* ---- Inbound link RX (embarch-dev-bench/design.md §3 decision 29) -------
+/* ---- Inbound link RX (decision 29) -------
  *
  * The hardware FIFO is drained by an ISR into this ring buffer, and the
  * dispatch loop parses frames out of the ring buffer. Those two jobs used to
@@ -815,14 +815,14 @@ static void send_step_result(uint32_t step_index, const char *step_name,
  * Sized to cover *scheduling latency*, not a whole frame. It deliberately
  * isn't `DBM_MAX_FRAME_LEN`-sized: that constant is the worst-case 64-step
  * `StudyStart` (~10 KB, see serial_protocol.h), which this board cannot
- * spare -- its SRAM has already overflowed once (design.md §3 decision 27)
+ * spare -- its SRAM has already overflowed once (decision 27)
  * and sits at ~95% used. It doesn't need to: `receive_message` drains this
  * buffer continuously into `rx_buf` as bytes arrive, so the buffer only has
  * to hold what accumulates while the dispatch loop isn't running, not the
  * whole frame at once. At 1 Mbaud, 2 KB is ~20 ms of wire time -- far more
  * slack than a 1 ms sleep needs, and nothing else competes: Core sends
- * exactly Hello then StudyStart and then waits (embarch-study-designer/
- * design.md §3 decision 24), so there is no inbound traffic at all during
+ * exactly Hello then StudyStart and then waits (`embarch-study-designer`
+ * decision 24), so there is no inbound traffic at all during
  * the long `ble_bridge_execute` calls this loop blocks in.
  *
  * Overruns are counted and reported rather than silently dropped -- the
@@ -876,7 +876,7 @@ static int link_rx_byte(uint8_t *byte)
 /* Blocks until one full COBS frame has been read off the link UART and
  * decoded. Malformed frames are dropped silently and the reader resyncs on
  * the next 0x00 delimiter, per COBS's own resync property
- * (embarch-study-designer/design.md §3 decision 10). */
+ * (`embarch-study-designer` decision 10). */
 static int receive_message(struct dev_bench_message *out)
 {
 	/* DBM_MAX_INBOUND_FRAME_LEN, not DBM_MAX_FRAME_LEN: Core sends dev-bench
@@ -937,13 +937,13 @@ static int receive_message(struct dev_bench_message *out)
 	}
 }
 
-/* `Hello` doubles as a hard reset (embarch-study-designer/design.md §3
+/* `Hello` doubles as a hard reset (`embarch-study-designer`
  * decision 12 / embarch-dev-bench decision 11) and a schema-compatibility
  * handshake. Returns whether dev-bench should now wait for a `StudyStart`
  * (i.e. the schema versions matched) — `false` on a mismatch, matching the
  * previous bring-up behavior of not running anything in that case. */
 /* This board's own factory-unique chip ID, hex-encoded lowercase into `out`
- * (embarch-study-designer/design.md §3 decision 47, embarch-core/design.md §3
+ * (`embarch-study-designer` decision 47, `embarch-core`
  * decision 35). Core compares it against the identity its JTAG probe just
  * read -- the only thing that ties the runtime serial link and the JTAG
  * connection to the same silicon, since the port migration made them
@@ -1082,7 +1082,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 {
 	ble_bridge_reset();
 
-	/* `Hello` is a hard reset (embarch-study-designer/design.md §3 decision
+	/* `Hello` is a hard reset (`embarch-study-designer` decision
 	 * 12), and since decision 39 verbosity is study state like any other:
 	 * a study that died mid-run without reaching dispatch_study's own revert
 	 * must not leave the next one running at its level. */
@@ -1106,7 +1106,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 
 	/* Deliberately here -- after `HelloAck` is on the wire, before anything
 	 * else. Core's handshake tolerates a `LogLine` arriving ahead of the ack
-	 * (embarch-core/design.md §3 decision 37) so a bench that has already
+	 * (`embarch-core` decision 37) so a bench that has already
 	 * handshaked once and is logging live cannot break a later handshake,
 	 * but on a freshly booted bench the ack still comes first. Installing
 	 * the sink flushes whatever the boot backlog holds, so the *first* thing
@@ -1181,7 +1181,7 @@ static bool protocol_index_valid(const struct dbm_study_start *study,
  * decisions 31/32's two new kinds and the BleConnect/DataExchange dispatch
  * that had never actually been wired up to a real decoded `Study` before
  * this pass (`ble_bridge_real.c` itself has implemented both since
- * design.md §3 decision 16's own implementation note — this is the missing
+ * decision 16's own implementation note — this is the missing
  * wiring, not new BLE logic).
  */
 static struct action step_to_action(const struct dbm_study_start *study,
@@ -1328,7 +1328,7 @@ static struct action step_to_action(const struct dbm_study_start *study,
 	return action;
 }
 
-/* Real per-`Study` dispatch (embarch-dev-bench/design.md §3 decision 21) —
+/* Real per-`Study` dispatch (decision 21) —
  * every `Action` kind embarch-study-designer defines is dispatched now
  * (decisions 31/32 closed the BleAdvertise-only scope this originally
  * shipped with; embarch-study-designer decisions 44/50 added the security
@@ -1359,7 +1359,7 @@ static void dispatch_study(const struct dbm_study_start *study)
 		send_study_done(false);
 		return;
 	}
-	/* The sibling seal over `streams` (embarch-study-designer/design.md §3
+	/* The sibling seal over `streams` (`embarch-study-designer`
 	 * decision 39's 2026-08-25 amendment). Checked separately and reported
 	 * separately, which is the point of there being two: the log line names
 	 * which half of the Study arrived corrupt.
@@ -1413,8 +1413,8 @@ static void dispatch_study(const struct dbm_study_start *study)
 		const struct dbm_step *step = &study->steps[i];
 
 		/* **Both indices of a `RunProtocol` step, checked before they
-		 * reach a C array subscript** (embarch-study-designer/design.md
-		 * §3 decision 60, and `embarch-core/design.md` §3 decision 18's
+		 * reach a C array subscript** (`embarch-study-designer`
+		 * decisions 60 and 18's
 		 * rule that a failure is named rather than left to fail as a
 		 * raw index). Core's pre-flight already checks both against the
 		 * same `Study`, so reaching this is either drift between the
@@ -1440,7 +1440,7 @@ static void dispatch_study(const struct dbm_study_start *study)
 		/* Stamped before the step runs, so every transcript entry it
 		 * produces -- including notifications arriving inside a capture
 		 * window opened by an *earlier* step -- is attributed to the
-		 * step actually executing (design.md §3 decision 36). */
+		 * step actually executing (`embarch-study-designer` decision 36). */
 		transcript_step_index = i;
 
 		/* Windows that start or end at this step, applied before the
@@ -1450,7 +1450,7 @@ static void dispatch_study(const struct dbm_study_start *study)
 		sync_taps_for_step(i);
 
 		/* Step::delay_before_ms -- the study's authored "when"
-		 * (embarch-study-designer/design.md §3 decision 42). Deliberately
+		 * (`embarch-study-designer` decision 42). Deliberately
 		 * *inside* the loop and *after* transcript_step_index is stamped:
 		 * anything the DUT sends unprompted during the wait belongs to this
 		 * step in the transcript, which is what makes a delay useful for
@@ -1475,7 +1475,7 @@ static void dispatch_study(const struct dbm_study_start *study)
 	 * because its author left the GattMonitorStop off, or because an
 	 * earlier step aborted the run before reaching it -- gets it closed
 	 * here rather than leaving subscriptions armed into the next study
-	 * (design.md §3 decision 36). */
+	 * (`embarch-study-designer` decision 36). */
 	if (ble_bridge_monitor_window_open()) {
 		struct action close = {.kind = ACTION_GATT_MONITOR_STOP};
 
@@ -1499,11 +1499,11 @@ static void dispatch_study(const struct dbm_study_start *study)
 	 * same reason. */
 	close_all_taps();
 
-	/* **A study is a bond's lifetime** (embarch-dev-bench/design.md §3
-	 * decision 37). Cleared here so a second run of a study behaves like
-	 * the first -- a bench that silently pairs differently on the second
-	 * run is the failure study-scoped bonding exists to avoid, and it is
-	 * the reading the repo owner asked for by name.
+	/* **A study is a bond's lifetime** (decision 37). Cleared here so a
+	 * second run of a study behaves like the first -- a bench that
+	 * silently pairs differently on the second run is the failure
+	 * study-scoped bonding exists to avoid, and it is the reading the
+	 * repo owner asked for by name.
 	 *
 	 * Before the transcript drain below rather than after it: clearing a
 	 * bond disconnects the peer (Zephyr's bt_unpair does), and the
@@ -1579,7 +1579,7 @@ int main(void)
 
 	/* Whether the most recent Hello/HelloAck handshake was schema-compatible
 	 * and dev-bench is now expecting the StudyStart that follows it
-	 * (embarch-study-designer/design.md §3 decision 24: Core sends it exactly
+	 * (`embarch-study-designer` decision 24: Core sends it exactly
 	 * once, immediately after that handshake completes). A fresh Hello
 	 * arriving before a StudyStart does (Core resetting again) is handled
 	 * like any other Hello rather than being dropped as "unexpected" here —
@@ -1610,7 +1610,7 @@ int main(void)
 			break;
 		default:
 			/* Core only ever sends Hello then StudyStart on this link
-			 * (embarch-study-designer/design.md §3 decisions 12/24) —
+			 * (`embarch-study-designer` decisions 12/24) —
 			 * anything else here is unexpected; ignore rather than
 			 * misbehave. */
 			break;
