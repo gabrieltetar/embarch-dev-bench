@@ -85,7 +85,7 @@ static int pc_read_str(const uint8_t *in, size_t in_len, size_t *pos, char *out,
 }
 
 /* `pc_write_f32`/`pc_read_f32` were here, for the retired `Sample`-carrying
- * stream messages (embarch-study-designer schema v8, that doc's §3 decision
+ * stream messages (schema v8, `embarch-study-designer` decision
  * 39). Removed with them: the wire now carries arrival-stamped bytes, and
  * this firmware assigns no meaning -- and no numeric type -- to a stream
  * payload at all.
@@ -107,7 +107,7 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 }
 
 /* Reads one postcard-encoded `StreamTap` (embarch-study-designer
- * src/streams.rs, §4.8), advancing *pos past it and filling `out`
+ * src/streams.rs), advancing *pos past it and filling `out`
  * with the part this node acts on. Returns 0 on success, -1 on a malformed
  * or unrecognized shape.
  *
@@ -245,7 +245,7 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 }
 
 /* ---- `.eap` protocol manifests (`embarch-study-designer`
- *      decisions 58-62, §4.9) ----------------------------------------------
+ *      decisions 58-62) ----------------------------------------------
  *
  * The reference these have to agree with is `embarch-study-designer/src/eap.rs`
  * (the wire types) and `src/eap_interp.rs` (the semantics). Nothing here
@@ -820,7 +820,7 @@ static size_t cobs_decode(const uint8_t *input, size_t length, uint8_t *output, 
 
 /* ---- DevBenchMessage encode/decode ---------------------------------------- */
 
-/* One `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, §4.3b) as
+/* One `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, decision 36) as
  * bare postcard bytes, appended at `*pos`. Mirrors that type's field order
  * exactly: the two Option<Uuid>s are postcard's 0/1 discriminant followed,
  * when present, by the UUID's 16 raw bytes -- the same unprefixed
@@ -939,7 +939,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		out[(*pos)++] = msg->stream_open.id; /* u8: raw byte, not varint */
 		return 0;
 	case DBM_TAG_STREAM_CHUNK_BATCH: {
-		/* embarch-study-designer schema v8, that doc's §3 decision 39.
+		/* embarch-study-designer schema v8, `embarch-study-designer` decision 39.
 		 * Arrival-stamped bytes, never decoded values -- this firmware
 		 * assigns no meaning to a record's payload at all; the tap's
 		 * declared `StreamEncoding` does that, host-side. */
@@ -1812,7 +1812,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		ss->dev_bench_log_level = (uint8_t)log_level;
 
 		/* protocols + protocols_crc -- schema v15
-		 * (`embarch-study-designer` decision 58, §4.9). The
+		 * (`embarch-study-designer` decision 58). The
 		 * study's **third** seal, and a sibling of the two above rather
 		 * than a widening of either: each covers one contiguous span and
 		 * is carried immediately after it, so this hand-written C

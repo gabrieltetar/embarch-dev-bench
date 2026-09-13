@@ -1,5 +1,5 @@
 /* The `.eap` protocol interpreter -- `embarch-study-designer` decisions
- * 58-62, §4.9.
+ * 58-62.
  *
  * See eap_interp.h for what this is and what it deliberately is not. The
  * short version: `embarch-study-designer/src/eap_interp.rs` is the executable

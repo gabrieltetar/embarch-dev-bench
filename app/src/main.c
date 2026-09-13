@@ -679,7 +679,7 @@ static void send_study_done(bool completed)
 /* Builds and sends one `StepResult` from a step's device-observed `struct
  * outcome` (ble_bridge.h) — the C-side `Outcome`/`captured_data` shapes
  * mirror embarch-study-designer's `result::Outcome`/`StepResult` closely
- * enough (§4.5) that this is a direct field-by-field translation,
+ * enough that this is a direct field-by-field translation,
  * not a reinterpretation. `power_samples_ref`/`waveform_ref` are never set
  * (encoded as `None` by serial_protocol.c's own encode_body): this pass has
  * no power/waveform capture yet (decision 21's scope). */
@@ -967,7 +967,7 @@ static int receive_message(struct dev_bench_message *out)
  * bitmask has no bit that can express them. So the zero means "the SoC named a
  * cause Zephyr's enum cannot carry", which is nearly the opposite of nothing,
  * and `ESP_RST_PWR_GLITCH` sitting in that set is directly relevant to the
- * open question about why this bench resets (§4).
+ * open question about why this bench resets (open.md).
  *
  * Reported alongside the mapped value rather than instead of it: the mapped one
  * is the portable number every other board answers in, and this is the one that
@@ -1030,7 +1030,7 @@ static void send_reset_diagnostics(void)
 	send_log_line(line);
 
 	/* **Decision 38's fatal-error path, deliberately provoked — the one part
-	 * of it never exercised (§4).** `log_panic()` switching to synchronous,
+	 * of it never exercised (open.md).** `log_panic()` switching to synchronous,
 	 * lock-free writing is what would carry a Zephyr crash dump to Core, and
 	 * nothing has crashed this firmware on purpose since it was written. The
 	 * open question this answers is narrow and worth an option: when
@@ -1132,7 +1132,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 	 *
 	 * A `LogLine` rather than a `HelloAck` field on purpose: this is a
 	 * diagnostic, not something Core acts on, and it costs no wire version
-	 * (§3 decision 7 already routes dev-bench's log output here). */
+	 * (decision 7 already routes dev-bench's log output here). */
 	send_reset_diagnostics();
 
 	if (!compatible) {

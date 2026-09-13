@@ -1,5 +1,5 @@
 /* The `.eap` protocol interpreter -- `embarch-study-designer` decisions
- * 58-62, §4.9.
+ * 58-62.
  *
  * # This is the executor, and the Rust one is the specification
  *
@@ -11,7 +11,7 @@
  * a cross-language test can pin them. Where the two disagree, that crate is
  * right, exactly as it is for the wire encoding.
  *
- * The division is the one §3 decisions 31/32 already set: the wire types and
+ * The division is the one `embarch-study-designer` decisions 59/60 already set: the wire types and
  * the reference semantics live in the crate, live BLE dispatch lives here.
  *
  * # Events in, instructions out -- and no radio anywhere
