@@ -76,7 +76,7 @@
  * configures CONFIG_BT_L2CAP_TX_MTU/CONFIG_BT_BUF_ACL_RX_SIZE for. */
 #define DBM_MAX_TRANSCRIPT_PAYLOAD_LEN 244
 /* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES /
- * MAX_STREAM_RECORDS_PER_BATCH (schema v8, that doc's §3 decision 39, §4.8).
+ * MAX_STREAM_RECORDS_PER_BATCH (schema v8, `embarch-study-designer` decision 39).
  * Deliberately *smaller* than the crate's own 512/4 for the same reason
  * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is smaller than DBM_MAX_PAYLOAD_LEN: this
  * firmware never produces a record larger than one ATT MTU's worth of
@@ -99,7 +99,7 @@
 #define DBM_MAX_STREAMS_PER_STUDY 8
 
 /* The `.eap` protocol manifest types a `StudyStart` carries and this file
- * decodes (`embarch-study-designer` decisions 58-62, §4.9).
+ * decodes (`embarch-study-designer` decisions 58-62).
  * Their own header, because eap_interp.c and ble_bridge also need them and
  * neither needs the link protocol -- see eap.h for what those types drop and
  * why, and for the per-manifest count caps.
@@ -118,7 +118,7 @@
  * ever send: at the crate's ceilings a single `ProtocolDef` can encode to
  * ~7.4 KB, almost all of it names this firmware discards, and sizing three
  * staging buffers for two of those would cost ~30 KB for a span whose real
- * worked example (the BDS batch download, §4.9) is **398 bytes** including
+ * worked example (the BDS batch download) is **398 bytes** including
  * the whole rest of the StudyStart. A byte cap says the true thing -- "this
  * bench accepts a manifest up to this big" -- where a product of eleven
  * ceilings says a false one.
@@ -324,7 +324,7 @@ enum dbm_gatt_event_kind {
 	DBM_GATT_EVT_ERROR = 13,
 };
 
-/* Mirrors `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, §4.3b).
+/* Mirrors `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, decision 36).
  *
  * `payload` is sized by DBM_MAX_TRANSCRIPT_PAYLOAD_LEN rather than
  * DBM_MAX_PAYLOAD_LEN: the Rust type accepts up to MAX_PAYLOAD_LEN, but this
@@ -398,7 +398,7 @@ struct dbm_stream_close {
 	uint32_t dropped;
 };
 
-/* Mirrors `StreamRecord` (embarch-study-designer src/streams.rs, §4.8): one
+/* Mirrors `StreamRecord` (embarch-study-designer src/streams.rs): one
  * arrival-stamped run of bytes, **never a decoded value**. What the bytes
  * mean is declared once by the tap's `StreamEncoding` and resolved
  * host-side; nothing in this firmware interprets them. */
@@ -431,7 +431,7 @@ enum dbm_stream_scope_tag {
 };
 
 /* One declared tap, as much of it as **this node acts on** -- schema v9's
- * `StreamTap` (embarch-study-designer src/streams.rs, §4.8), deliberately
+ * `StreamTap` (embarch-study-designer src/streams.rs), deliberately
  * not mirrored in full.
  *
  * `StreamTap` declares four things: where the bytes come from, how long the
@@ -562,8 +562,8 @@ enum dbm_action_tag {
  * never names. Both reach a C array subscript here, which is why
  * `embarch_study_designer::eap::validate_protocol` and Core's own pre-flight
  * range-check them before a `Study` is ever submitted -- and why this
- * firmware re-checks them anyway at dispatch (§3 decision 18's rule: name the
- * specific failure rather than letting a raw index fail). */
+ * firmware re-checks them anyway at dispatch (`embarch-study-designer` decision
+ * 18's rule: name the specific failure rather than letting a raw index fail). */
 struct dbm_run_protocol_action {
 	uint8_t protocol;
 	uint8_t entry_state;
@@ -611,7 +611,7 @@ struct dbm_ble_advertise_action {
 };
 
 /* Mirrors `Action::BleConnect` (src/study.rs) -- `target_address` bytes are
- * in embarch-study-designer's own display order (§4.3: most
+ * in embarch-study-designer's own display order (most
  * significant byte first), same convention `ble_bridge.h`'s
  * `struct ble_connect_params` already documents. */
 struct dbm_ble_connect_action {
@@ -754,7 +754,7 @@ struct dbm_study_start {
 	 * verbose it is about doing so changes neither. */
 	uint8_t dev_bench_log_level;
 	/* The `.eap` protocol manifests this study resolved at build time --
-	 * schema v15 (`embarch-study-designer` decision 58, §4.9),
+	 * schema v15 (`embarch-study-designer` decision 58),
 	 * appended after `dev_bench_log_level` on the wire.
 	 *
 	 * Unlike `streams`, which this node stores 12 bytes of and walks past
@@ -780,7 +780,7 @@ struct dbm_outcome {
 };
 
 /* Mirrors `GattCharacteristicInfo`/`GattServiceInfo` (embarch-study-designer/
- * src/gatt.rs, §4.3a) -- `properties` is the raw ATT
+ * src/gatt.rs, `embarch-study-designer` decisions 31/32) -- `properties` is the raw ATT
  * characteristic-properties byte, passed through unchanged. */
 struct dbm_gatt_characteristic_info {
 	uint8_t uuid[16];
@@ -877,7 +877,7 @@ struct dev_bench_message {
 };
 
 /* Encodes one `GattTranscriptEntry` (embarch-study-designer src/gatt.rs,
- * §4.3b) as bare postcard bytes -- no message tag, no COBS framing, no
+ * decision 36) as bare postcard bytes -- no message tag, no COBS framing, no
  * step index. Writes at most `out_cap` bytes to `out` and returns the length
  * written, or a negative value if it wouldn't fit.
  *

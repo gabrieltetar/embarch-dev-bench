@@ -19,7 +19,7 @@
 #include <stdint.h>
 
 /* The `.eap` protocol manifest types (`embarch-study-designer`
- * decisions 58-62, §4.9). The one include this header has, and it is not the
+ * decisions 58-62). The one include this header has, and it is not the
  * link protocol's: eap.h is deliberately independent of serial_protocol.h for
  * exactly the reason BLE_MAX_PAYLOAD_LEN below is a duplicate rather than an
  * include -- nothing on this side of the boundary knows the wire format. */
@@ -79,7 +79,7 @@ struct ble_advertise_params {
  * same display order (AA:BB:CC:DD:EE:FF, most significant byte first). Zephyr's
  * `bt_uuid_create`/`bt_addr_le_t` both want little-endian, so ble_bridge_real.c
  * reverses on the way in — the crate's own docs state this explicitly for
- * `Uuid` but not for `BleAddress` (§4). */
+ * `Uuid` but not for `BleAddress`. */
 struct ble_connect_params {
 	enum ble_role role;
 	bool has_target_address;
@@ -209,7 +209,7 @@ struct action {
 };
 
 /* Mirrors embarch-study-designer's `GattCharacteristicInfo`/`GattServiceInfo`
- * (src/gatt.rs, §4.3a) -- `properties` is the raw ATT
+ * (src/gatt.rs, `embarch-study-designer` decisions 31/32) -- `properties` is the raw ATT
  * characteristic-properties byte, passed through unchanged (that decision's
  * "raw, not symbolic" stance). UUID byte order matches every other UUID in
  * this header: big-endian, embarch-study-designer's own convention. */
@@ -302,8 +302,8 @@ struct outcome {
  * _stub). Returns 0 on success. Call once at boot, before ble_bridge_execute. */
 int ble_bridge_init(void);
 
-/* Executes one action synchronously, bounded by timeout_ms (§1's
- * Step.timeout_ms), returning its device-observed Outcome. */
+/* Executes one action synchronously, bounded by timeout_ms
+ * (`embarch-study-designer`'s `Step.timeout_ms`), returning its device-observed Outcome. */
 struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_ms);
 
 /* Sink for GATT_OP_STREAM_CAPTURE's continuous notifications, which — unlike
@@ -315,8 +315,8 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
  * of the call only. Invoked from Zephyr's BT RX thread, not from whichever
  * thread called ble_bridge_execute — a handler must not block. No handler
  * registered (the current default: nothing wires one up yet, since how raw
- * notification bytes map onto `Sample.value`'s single f32 is still open,
- * §4) means captured samples are counted and
+ * notification bytes map onto `Sample.value`'s single f32 is still open)
+ * means captured samples are counted and
  * dropped, not buffered. */
 typedef void (*ble_stream_sample_handler)(const uint8_t *data, size_t len, void *user_data);
 void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data);
@@ -356,7 +356,7 @@ enum ble_gatt_event_kind {
 	BLE_GATT_EVT_ERROR = 13,
 };
 
-/* One transcript entry, mirroring `GattTranscriptEntry` (src/gatt.rs, §4.3b).
+/* One transcript entry, mirroring `GattTranscriptEntry` (src/gatt.rs, `embarch-study-designer` decision 36).
  * Passed by pointer to the sink and copied there -- the bridge does not keep
  * it alive past the call. */
 struct ble_transcript_entry {

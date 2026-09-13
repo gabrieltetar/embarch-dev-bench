@@ -119,7 +119,7 @@ ZTEST(serial_protocol, test_hello_ack_encodes_to_the_pinned_wire_bytes)
 	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
-/* ---- Stream taps (embarch-study-designer schema v8, that doc's §3
+/* ---- Stream taps (embarch-study-designer schema v8, `embarch-study-designer`
  * decision 39) --------------------------------------------------------
  *
  * All three of these are pinned as literal COBS frames rather than
@@ -1576,7 +1576,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
 }
 
 /* ---- `.eap` protocol manifests (`embarch-study-designer`
- *      decisions 58-62, §4.9) ----------------------------------------------
+ *      decisions 58-62) ----------------------------------------------
  *
  * Two kinds of test here, and the split is deliberate.
  *
@@ -1591,7 +1591,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
  * The second drives `eap_interp.c` directly. Those tests are the C half of
  * `embarch-study-designer/tests/eap_worked_protocols.rs`: the same worked BDS
  * download, the same sequences, the same expected transitions. They exist
- * because §3 decision 60 put the **executor** on this side while leaving the
+ * because `embarch-study-designer` decision 60 put the **executor** on this side while leaving the
  * **specification** in that crate, and the only way that division is safe is
  * if both are exercised against the same cases.
  */
@@ -1869,7 +1869,7 @@ ZTEST(serial_protocol, test_step_result_with_a_protocol_outcome_encodes_to_the_p
  *
  * These are the C half of `embarch-study-designer/tests/eap_worked_protocols.rs`
  * -- the same worked BDS download, the same sequences, the same expected
- * transitions. §3 decision 60 put the executor on this side and left the
+ * transitions. `embarch-study-designer` decision 60 put the executor on this side and left the
  * specification in that crate, and the only thing that makes that division
  * safe is both being driven through the same cases.
  *
@@ -2126,8 +2126,8 @@ ZTEST(serial_protocol, test_an_out_of_range_entry_state_is_refused)
 
 	/* Belt and braces -- `validate_protocol`, Core's pre-flight and
 	 * main.c's own check all range-check this first. Refused here anyway
-	 * rather than left to a raw array subscript, which is §3 decision 18's
-	 * rule. */
+	 * rather than left to a raw array subscript, which is `embarch-study-designer`
+	 * decision 18's rule. */
 	zassert_equal(eap_run_start(&run, def, def->states_len), -1,
 		      "an entry state past the end must be refused");
 }

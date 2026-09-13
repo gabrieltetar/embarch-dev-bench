@@ -470,7 +470,7 @@ static void to_bt_uuid(const uint8_t be_bytes[16], struct bt_uuid_128 *out)
  * (`embarch-study-designer` decisions 31/32): a discovered attribute's
  * `bt_uuid` may be a 16-, 32-, or 128-bit type (Zephyr's own GAP/GATT
  * services are 16-bit; a DUT's own custom services are typically 128-bit,
- * per this crate's "UUIDs are raw, not symbolic" stance, §4.3) -- expanded
+ * per this crate's "UUIDs are raw, not symbolic" stance) -- expanded
  * here into the Bluetooth Base UUID form
  * (`0000xxxx-0000-1000-8000-00805F9B34FB`) for 16-/32-bit types, matching
  * Zephyr's own BT_UUID_16_TO_UUID_128 convention,
@@ -1634,8 +1634,8 @@ static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_
 }
 
 /* Walks every primary service, then every characteristic within each,
- * populating `discovered`/`discovered_len` (§4.3a's "GattDiscover"/
- * "GattMonitorAll share one discovery walk" framing). Two
+ * populating `discovered`/`discovered_len` (`embarch-study-designer` decisions
+ * 31/32's "GattDiscover"/"GattMonitorAll share one discovery walk" framing). Two
  * discovery passes per service is unavoidable: Zephyr can't be told
  * "discover primary services AND their characteristics" in one procedure,
  * and a nested bt_gatt_discover() call from inside a discovery callback
@@ -1716,8 +1716,8 @@ static struct outcome execute_gatt_discover(int64_t deadline)
 }
 
 /* service/characteristic index, flattened service-then-characteristic in
- * discovery order -- the exact convention §4.3a documents for
- * `GattActivityRecord.characteristic_index`, computed here in the one place
+ * discovery order -- the exact convention `embarch-study-designer` decision 32
+ * documents for `GattActivityRecord.characteristic_index`, computed here in the one place
  * both this bridge and any consumer need to agree on it. */
 static uint16_t flat_characteristic_index(uint8_t service_idx, uint8_t char_idx)
 {
@@ -2806,8 +2806,8 @@ static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe
  *
  * A source the DUT does not have **fails the step naming it**, and is not
  * skipped: a manifest that declares a characteristic has said it expects one,
- * which is the same rule a selective monitor's targets follow (§3 decision
- * 53) and the opposite of the subscribe-to-everything walk's log-and-skip --
+ * which is the same rule a selective monitor's targets follow (`embarch-study-designer`
+ * decision 53) and the opposite of the subscribe-to-everything walk's log-and-skip --
  * right there precisely because nothing was named.
  */
 static struct outcome protocol_resolve_sources(const struct eap_protocol_def *def,
@@ -2939,8 +2939,8 @@ static struct outcome protocol_subscribe_sources(const struct eap_protocol_def *
  * so there is no budget left to wait out each CCC-clear write's response.
  *
  * Unconditional at the end of a `RunProtocol` step, unlike a monitor
- * *window*: a protocol run is scoped to one step by construction (§3 decision
- * 60 -- it "hands the link to a declared state machine for the length of one
+ * *window*: a protocol run is scoped to one step by construction (`embarch-study-designer`
+ * decision 60 -- it "hands the link to a declared state machine for the length of one
  * step"), so leaving its subscriptions armed would be capturing into nothing
  * for the rest of the study. */
 static void protocol_unsubscribe_all(const struct eap_protocol_def *def)
@@ -2958,7 +2958,7 @@ static void protocol_unsubscribe_all(const struct eap_protocol_def *def)
 
 /* One `on_enter` write. `with_response` selects the ATT operation and nothing
  * else -- **no transition is ever triggered by a write's own response**,
- * whichever it is (§3 decision 60): on the DUT this was designed against a
+ * whichever it is (`embarch-study-designer` decision 60): on the DUT this was designed against a
  * control-point write's response confirms only that the write was accepted,
  * and the authoritative answer arrives later on a different characteristic.
  * An acknowledged write is still *waited* for here, so two writes are never
@@ -3065,7 +3065,7 @@ static struct outcome execute_run_protocol(const struct run_protocol_params *par
 		/* Unreachable in practice: `validate_protocol` and Core's
 		 * pre-flight both range-check `entry_state`, and main.c checks
 		 * it again before dispatch. Named here anyway rather than left
-		 * to a raw array subscript, which is §3 decision 18's rule. */
+		 * to a raw array subscript, which is `embarch-study-designer` decision 18's rule. */
 		return outcome_fail("protocol entry state %u does not exist",
 				    (unsigned int)params->entry_state);
 	}
