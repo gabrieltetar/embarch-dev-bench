@@ -76,10 +76,10 @@ struct ble_advertise_params {
 /* `target_address`/`service_uuid`/`characteristic_uuid` bytes are in
  * embarch-study-designer's own order (src/ids.rs): UUIDs big-endian, matching
  * the Bluetooth SIG's on-the-wire base-UUID byte order, and addresses in the
- * same display order (AA:BB:CC:DD:EE:FF, most significant byte first). Zephyr's
- * `bt_uuid_create`/`bt_addr_le_t` both want little-endian, so ble_bridge_real.c
- * reverses on the way in — the crate's own docs state this explicitly for
- * `Uuid` but not for `BleAddress`. */
+ * same display order (AA:BB:CC:DD:EE:FF, most significant byte first,
+ * `decision 23`). Zephyr's `bt_uuid_create`/`bt_addr_le_t` both want
+ * little-endian, so ble_bridge_real.c reverses on the way in -- the crate's
+ * own docs state this explicitly for both `Uuid` and `BleAddress`. */
 struct ble_connect_params {
 	enum ble_role role;
 	bool has_target_address;
