@@ -1,6 +1,6 @@
 /* Unit tests for serial_protocol.c's hand-written COBS+postcard implementation.
  *
- * embarch-dev-bench/design.md §3 decision 16: this is NOT re-deriving whether
+ * Decision 16: this is NOT re-deriving whether
  * COBS/postcard as a *format* is sound -- embarch-study-designer's own
  * round-trip tests already cover that for the Rust side. This C
  * implementation is new, independently hand-written code describing the same
@@ -84,7 +84,7 @@ ZTEST(serial_protocol, test_hello_ack_with_no_hardware_id_round_trips)
 }
 
 /* `HelloAck`'s wire bytes, pinned across both languages for the first time at
- * schema v10 (embarch-study-designer/design.md §3 decision 47). Like
+ * schema v10 (`embarch-study-designer` decision 47). Like
  * `StepResult` below, this frame predates decision 36's both-languages rule
  * and so was never covered -- and `StepResult`'s own history is the argument
  * for pinning it now: this file's encoder wrote two stale `Option` bytes for
@@ -327,7 +327,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 		      "adv_interval_ms mismatch");
 	zassert_equal(study_start_decoded.study_start.steps_crc, 0x889FAF61, "steps_crc mismatch");
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
-	/* Schema v9's sibling seal (design.md §3 decision 39's 2026-08-25
+	/* Schema v9's sibling seal (`embarch-study-designer` decision 39's 2026-08-25
 	 * amendment). This encoder writes no taps, so the seal here is the CRC
 	 * of nothing, which really is 0 -- see the encoder's own comment. What
 	 * this asserts is only that the two seals are *independent*: an empty
@@ -388,7 +388,7 @@ ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
 	zassert_true(study_start_decoded.study_start.steps_crc_valid, "steps_crc_valid should be true");
 }
 
-/* Schema v6 (embarch-study-designer/design.md §3 decision 42): Step's
+/* Schema v6 (`embarch-study-designer` decision 42): Step's
  * delay_before_ms is a *trailing* varint, which is exactly the shape that
  * round-trips convincingly while actually being misaligned -- a decoder that
  * forgot to read it, or read it one field early, still produces plausible
@@ -466,7 +466,7 @@ static const uint8_t core_study_start_frame[] = {
 	0xb5, 0xa8, 0xc3, 0xcb, 0x09,
 	/* Schema v9's two trailing fields on StudyStart: `streams` -- an empty
 	 * `Vec<StreamTap, _>`, one zero-length varint -- followed by
-	 * `streams_crc` (design.md §3 decision 39's 2026-08-25 amendment).
+	 * `streams_crc` (`embarch-study-designer` decision 39's 2026-08-25 amendment).
 	 *
 	 * `streams_crc` is 0 here, and that is the *correct* value rather than
 	 * an unset one: CRC-32/ISO-HDLC over zero bytes is 0, because its init
@@ -476,13 +476,13 @@ static const uint8_t core_study_start_frame[] = {
 	 * and carries three real taps. */
 	0x00, 0x00,
 	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
-	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * decision 39. Deliberately not the default (Warn = 2):
 	 * the vector generator picks a value the C struct would not contain by
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
 	/* protocols + protocols_crc -- schema v15
-	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * (`embarch-study-designer` decision 58), an empty list and,
 	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
 	 * rather than unset ones, the same way the empty-`streams` pair is:
 	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
@@ -549,7 +549,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_study_start_bytes)
 	zassert_equal(ss->steps[0].action_tag, DBM_ACTION_BLE_CONNECT, "step 0 action");
 	zassert_equal(ss->steps[0].timeout_ms, 20000, "step 0 timeout");
 	zassert_equal(ss->steps[0].delay_before_ms, 0, "step 0 delay");
-	/* Schema v7's trailing field on the BleConnect variant (design.md §3
+	/* Schema v7's trailing field on the BleConnect variant (`embarch-study-designer`
 	 * decision 43). It sits *before* the step's own timeout/delay on the
 	 * wire, so getting its length wrong shifts everything after it -- which
 	 * is exactly what the two assertions above would then catch. */
@@ -579,7 +579,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_study_start_bytes)
 	zassert_equal(ss->steps[3].action_tag, DBM_ACTION_GATT_MONITOR_STOP, "step 3 action");
 	zassert_equal(ss->steps[3].delay_before_ms, 8000, "step 3 delay");
 
-	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	/* Schema v13 (decision 39): the level the study asked for,
 	 * decoded from bytes this firmware did not produce. The generator picks
 	 * `Debug` rather than the `Warn` default precisely so a decoder that
 	 * ignored this trailing byte -- which would still decode the frame and
@@ -632,13 +632,13 @@ static const uint8_t core_study_start_with_taps_frame[] = {
 	0x74, 0x72, 0x61, 0x63, 0x65, 0x04, 0x00, 0x02, 0x05, 0x70, 0x6f, 0x77, 0x65, 0x72,
 	0x01, 0xe8, 0x07, 0x00, 0x01, 0x00, 0x00, 0xd2, 0xab, 0xc6, 0x8e, 0x09,
 	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
-	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * decision 39. Deliberately not the default (Warn = 2):
 	 * the vector generator picks a value the C struct would not contain by
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
 	/* protocols + protocols_crc -- schema v15
-	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * (`embarch-study-designer` decision 58), an empty list and,
 	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
 	 * rather than unset ones, the same way the empty-`streams` pair is:
 	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
@@ -695,7 +695,7 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 	zassert_false(dbm_stream_tap_is_ours(&ss->streams[1]), "a Signal tap is Core's");
 	zassert_true(dbm_stream_tap_is_ours(&ss->streams[2]), "a PowerFrontEnd tap is dev-bench's");
 
-	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	/* Schema v13 (decision 39): the level the study asked for,
 	 * decoded from bytes this firmware did not produce. The generator picks
 	 * `Debug` rather than the `Warn` default precisely so a decoder that
 	 * ignored this trailing byte -- which would still decode the frame and
@@ -706,7 +706,7 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 
 }
 
-/* Schema v14's own cross-language pin (embarch-study-designer/design.md §3
+/* Schema v14's own cross-language pin (`embarch-study-designer`
  * decisions 52/53): a `StudyStart` whose first step is a
  * `GattMonitorSelectedStart` carrying two targets, whose second is a
  * field-less `GattMonitorStop`, and whose one tap is a `GattNotify` source
@@ -746,7 +746,7 @@ static const uint8_t core_study_start_selective_monitor_frame[] = {
 	0xe5, 0x0e, 0x24, 0xdc, 0xca, 0x9e, 0x05, 0x01, 0x00, 0xa7, 0xaf, 0xc4,
 	0xec, 0x0d, 0x04,
 	/* protocols + protocols_crc -- schema v15
-	 * (embarch-study-designer/design.md §3 decision 58), an empty list and,
+	 * (`embarch-study-designer` decision 58), an empty list and,
 	 * correspondingly, the CRC of nothing. Both zeros are *correct* values
 	 * rather than unset ones, the same way the empty-`streams` pair is:
 	 * CRC-32/ISO-HDLC over zero bytes is 0. A decoder that stopped at
@@ -978,7 +978,7 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 		0x0d, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73,
 		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01,
 		/* Schema v12's trailing `security_level: Option<SecurityLevel>`
-		 * (embarch-study-designer/design.md §3 decision 50), None here --
+		 * (`embarch-study-designer` decision 50), None here --
 		 * one more COBS zero-run code byte. The populated case is pinned
 		 * separately below; an all-None frame would pass against an
 		 * encoder that wrote the Option byte but not the value.
@@ -986,7 +986,7 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 		 * **One 0x01 shorter than it was at v13.** `gatt_activity`'s
 		 * `None` byte sat between `gatt_services` and `security_level`
 		 * and is retired at schema v14
-		 * (embarch-study-designer/design.md §3 decision 54). An encoder
+		 * (`embarch-study-designer` decision 54). An encoder
 		 * that kept writing it would put `security_level` one byte late
 		 * and Core would read the *activity* Option byte as the security
 		 * level -- the same class of drift the retired
@@ -994,7 +994,7 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 		 * schema version, which is why this vector exists. */
 		0x01,
 		/* Schema v15's own trailing `protocol: Option<ProtocolOutcome>`
-		 * (embarch-study-designer/design.md §3 decision 62), None here
+		 * (`embarch-study-designer` decision 62), None here
 		 * -- and None on every step but a `RunProtocol` one, which is
 		 * every step this firmware has produced to date. One more COBS
 		 * zero-run code byte, which is exactly what "appended, not
@@ -1025,7 +1025,7 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
-/* design.md §3 decisions 31/32: every Action kind this crate defines must
+/* `embarch-study-designer` decisions 31/32: every Action kind this crate defines must
  * round-trip through a StudyStart, not just BleAdvertise. These don't assert
  * steps_crc_valid -- the hardcoded steps_crc values above are real, crate-
  * confirmed CRCs for their own exact content, and computing a new one by
@@ -1117,7 +1117,7 @@ ZTEST(serial_protocol, test_study_start_gatt_discover_and_monitor_all_round_trip
 		      "should not flag an unsupported action");
 }
 
-/* design.md §3 decisions 31/32: StepResult.gatt_services, the field every
+/* `embarch-study-designer` decisions 31/32: StepResult.gatt_services, the field every
  * discovering action populates. */
 static struct dev_bench_message gatt_step_result_msg;
 static struct dev_bench_message gatt_step_result_decoded;
@@ -1156,7 +1156,7 @@ ZTEST(serial_protocol, test_step_result_gatt_services_round_trip)
 }
 
 /* `test_step_result_gatt_activity_round_trip` was here. Retired with the
- * field at schema v14 (embarch-study-designer/design.md §3 decision 54): a
+ * field at schema v14 (`embarch-study-designer` decision 54): a
  * capped in-memory copy of a capture the tap pipeline already streams to Core
  * uncapped. What a monitor step captured is now covered by the GattNotify tap
  * routing tests instead -- decision 55's own half.
@@ -1233,13 +1233,13 @@ ZTEST(serial_protocol, test_study_done_round_trip)
 	zassert_false(decoded.study_done.completed, "completed mismatch");
 }
 
-/* ---- GATT transcript (embarch-dev-bench/design.md §3 decision 36) -------- */
+/* ---- GATT transcript (`embarch-study-designer` decision 36) -------- */
 
 /* The exact bytes `dbm_encode_transcript_entry` must produce for one
  * `GattTranscriptEntry`.
  *
  * These used to be pinned as a whole DBM_TAG_GATT_TRANSCRIPT_RECORD frame.
- * That message is retired at schema v8 (embarch-study-designer/design.md §3
+ * That message is retired at schema v8 (`embarch-study-designer`
  * decision 39): the entry itself, its both-directions coverage, its uncapped
  * streaming and its `gatt.csv` columns are all unchanged, but it now rides as
  * the byte payload of a DBM_TAG_STREAM_CHUNK_BATCH record on a tap declared
@@ -1343,7 +1343,7 @@ ZTEST(serial_protocol, test_gatt_transcript_entry_with_no_uuids_encodes_to_the_p
 
 ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
 {
-	/* design.md §3 decision 36's two new Action tags must decode as
+	/* `embarch-study-designer` decision 36's two new Action tags must decode as
 	 * field-less, and must not trip `has_unsupported_action` -- the check
 	 * that would otherwise make a whole Study abort before running. */
 	static struct dev_bench_message msg;
@@ -1373,7 +1373,7 @@ ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
 }
 
 
-/* ---- schema v12: security (embarch-study-designer/design.md §3 decisions
+/* ---- schema v12: security (`embarch-study-designer` decisions
  * 50/51) ------------------------------------------------------------------ */
 
 /* The populated half of `StepResult.security_level`. The None case above
@@ -1525,13 +1525,13 @@ static const uint8_t core_study_start_with_security_frame[] = {
 	/* steps_crc = 0x613DB010, then an empty `streams` + its CRC of nothing. */
 	0x90, 0xe0, 0xf6, 0x89, 0x06, 0x00, 0x00,
 	/* dev_bench_log_level = DevBenchLogLevel::Debug (4) -- schema v13,
-	 * design.md §3 decision 39. Deliberately not the default (Warn = 2):
+	 * decision 39. Deliberately not the default (Warn = 2):
 	 * the vector generator picks a value the C struct would not contain by
 	 * accident, so an off-by-one in walking the streams_crc that precedes
 	 * it cannot pass. */
 	0x04,
 	/* protocols + protocols_crc -- schema v15
-	 * (embarch-study-designer/design.md §3 decision 58): an empty list and
+	 * (`embarch-study-designer` decision 58): an empty list and
 	 * the CRC of nothing, both correct values rather than unset ones. */
 	0x00, 0x00,
 };
@@ -1564,7 +1564,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
 	zassert_equal(ss->steps[2].action_tag, DBM_ACTION_BLE_UNBOND, "step 2 action");
 	zassert_equal(ss->steps[2].timeout_ms, 5000, "step 2 timeout");
 
-	/* Schema v13 (design.md §3 decision 39): the level the study asked for,
+	/* Schema v13 (decision 39): the level the study asked for,
 	 * decoded from bytes this firmware did not produce. The generator picks
 	 * `Debug` rather than the `Warn` default precisely so a decoder that
 	 * ignored this trailing byte -- which would still decode the frame and
@@ -1575,7 +1575,7 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
 
 }
 
-/* ---- `.eap` protocol manifests (embarch-study-designer/design.md §3
+/* ---- `.eap` protocol manifests (`embarch-study-designer`
  *      decisions 58-62, §4.9) ----------------------------------------------
  *
  * Two kinds of test here, and the split is deliberate.
