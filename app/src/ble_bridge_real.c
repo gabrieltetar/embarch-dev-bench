@@ -1,6 +1,6 @@
-/* Real Zephyr BT host calls, built by workspaces/nordic/ (embarch-dev-bench/design.md
- * §3 decision 16). Only calls stable, vendor-neutral Zephyr Bluetooth host
- * APIs (`bt_*`) per decision 3 -- nothing NCS-proprietary.
+/* Real Zephyr BT host calls, built by workspaces/nordic/ (decision 16). Only
+ * calls stable, vendor-neutral Zephyr Bluetooth host APIs (`bt_*`) per
+ * decision 3 -- nothing NCS-proprietary.
  *
  * Every ble_bridge_execute() call is synchronous from the caller's point of
  * view but asynchronous underneath: Zephyr's BT host reports connections, GATT
@@ -30,9 +30,9 @@
  * -- so no bt_conn_set_security(BT_SECURITY_L4) against that posture could
  * ever have succeeded, duplicate or not.
  *
- * What runs now (embarch-study-designer/design.md §3 decision 44,
- * embarch-dev-bench/design.md §3 decisions 34 and 37): auth callbacks that make this
- * bridge a DisplayYesNo-class device and auto-confirm the comparison value,
+ * What runs now (`embarch-study-designer` decision 44, decisions 34 and 37):
+ * auth callbacks that make this bridge a DisplayYesNo-class device and
+ * auto-confirm the comparison value,
  * so LE Secure Connections Numeric Comparison gets selected and the
  * resulting key is authenticated. ACTION_BLE_SECURITY then asks for a
  * level and reports the level actually reached; ACTION_BLE_UNBOND drops the
@@ -71,9 +71,9 @@
 /* How many characteristics ACTION_GATT_MONITOR_ALL can subscribe to
  * concurrently in one step -- a dev-bench-internal implementation cap, not
  * part of embarch-study-designer's own wire-type limits (those bound
- * `gatt_services`/`gatt_activity`'s *content*, design.md §3 decision 15's
- * update, not how many live subscriptions this bridge itself can juggle at
- * once). Sized to comfortably exceed any real DUT seen so far
+ * `gatt_services`/`gatt_activity`'s *content*, `embarch-study-designer`
+ * decision 15's update, not how many live subscriptions this bridge itself
+ * can juggle at once). Sized to comfortably exceed any real DUT seen so far
  * (`reference-dut-fw` has 10 notify/indicate-capable characteristics
  * across its two services) with headroom, same placeholder-but-concrete
  * posture as every other size constant in this codebase -- not
@@ -81,8 +81,8 @@
  * worst case (128), which would cost several extra KB of static RAM for a
  * count no real firmware plausibly reaches. A DUT that does exceed this is
  * handled the same way BLE_MAX_GATT_ACTIVITY_RECORDS' own overflow is
- * (design.md §3 decision 32's addendum): further characteristics are simply
- * not subscribed, not a hard failure. */
+ * (`embarch-study-designer` decision 32's addendum): further characteristics
+ * are simply not subscribed, not a hard failure. */
 #define BLE_MAX_MONITOR_SUBSCRIPTIONS 32
 
 /* ---- state ------------------------------------------------------------- */
@@ -139,7 +139,7 @@ static uint8_t ccc_att_err;
  * that through the subscribe callback. */
 static bool ccc_torn_down;
 
-/* ---- security (design.md §3 decision 34) -------------------------------- */
+/* ---- security (decision 34) ---------------------------------------- */
 
 /* What security_changed_cb last reported. `sec_level` is Zephyr's own
  * bt_security_t, not the wire enum -- the translation happens once, at the
@@ -196,7 +196,7 @@ static uint16_t found_service_end;
 static uint16_t found_value_handle;
 
 /* ---- wildcard GATT discovery state (Action::GattDiscover/GattMonitorAll,
- * design.md §3 decisions 31/32) -------------------------------------------
+ * `embarch-study-designer` decisions 31/32) --------------------------------
  *
  * `discovered`/`discovered_len` mirror StepResult.gatt_services exactly
  * (ble_bridge.h's struct ble_gatt_service_info) -- `struct outcome` borrows
@@ -232,12 +232,12 @@ static uint8_t monitor_subscribe_count;
 
 /* `activity[]`/`activity_len` were here -- the fixed-size inline summary
  * `StepResult.gatt_activity` carried. Retired with that field
- * (embarch-study-designer/design.md §3 decision 54): 32 × 528 bytes of
+ * (`embarch-study-designer` decision 54): 32 × 528 bytes of
  * static RAM holding the first 32 records of a capture the transcript tap
  * already streams to Core in full. Nothing read the truncated copy that
  * couldn't read the complete one. */
 
-/* ---- GATT transcript (design.md §3 decision 36) ------------------------- */
+/* ---- GATT transcript (`embarch-study-designer` decision 36) -------------- */
 
 static ble_transcript_sink transcript_sink;
 static void *transcript_user_data;
@@ -467,12 +467,13 @@ static void to_bt_uuid(const uint8_t be_bytes[16], struct bt_uuid_128 *out)
 }
 
 /* The reverse of to_bt_uuid, for GattDiscover/GattMonitorAll's live results
- * (design.md §3 decisions 31/32): a discovered attribute's `bt_uuid` may be a
- * 16-, 32-, or 128-bit type (Zephyr's own GAP/GATT services are 16-bit; a
- * DUT's own custom services are typically 128-bit, per this crate's
- * "UUIDs are raw, not symbolic" stance, design.md §4.3) -- expanded here into
- * the Bluetooth Base UUID form (`0000xxxx-0000-1000-8000-00805F9B34FB`) for
- * 16-/32-bit types, matching Zephyr's own BT_UUID_16_TO_UUID_128 convention,
+ * (`embarch-study-designer` decisions 31/32): a discovered attribute's
+ * `bt_uuid` may be a 16-, 32-, or 128-bit type (Zephyr's own GAP/GATT
+ * services are 16-bit; a DUT's own custom services are typically 128-bit,
+ * per this crate's "UUIDs are raw, not symbolic" stance, §4.3) -- expanded
+ * here into the Bluetooth Base UUID form
+ * (`0000xxxx-0000-1000-8000-00805F9B34FB`) for 16-/32-bit types, matching
+ * Zephyr's own BT_UUID_16_TO_UUID_128 convention,
  * so `GattServiceInfo.uuid`/`GattCharacteristicInfo.uuid` are always a full
  * 16-byte value regardless of what the DUT actually declared on the wire. */
 static void from_bt_uuid(const struct bt_uuid *uuid, uint8_t out_be[16])
@@ -611,7 +612,7 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 }
 
 /* Reports the level the link actually settled at, whether or not that is the
- * level anything asked for (design.md §3 decision 34). `err` non-zero means
+ * level anything asked for (decision 34). `err` non-zero means
  * the elevation failed outright; `level` is then whatever the link kept. */
 static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
 				enum bt_security_err err)
@@ -629,7 +630,7 @@ static struct bt_conn_cb conn_callbacks = {
 	.security_changed = security_changed_cb,
 };
 
-/* ---- pairing callbacks (design.md §3 decision 34) ----------------------- */
+/* ---- pairing callbacks (decision 34) -------------------------------- */
 
 /* **Every callback below runs on Zephyr's BT RX thread, so not one of them
  * logs.** ble_bridge.h's `ble_log_sink` contract is explicit that a log line
@@ -921,7 +922,7 @@ static void bridge_log(const char *fmt, ...)
 	log_sink(line, log_sink_user);
 }
 
-/* Advertised-name filter (embarch-study-designer/design.md §3 decision 43).
+/* Advertised-name filter (`embarch-study-designer` decision 43).
  * `scan_name[0] == '\0'` means no name filter. */
 static char scan_name[BLE_MAX_LOCAL_NAME_LEN + 1];
 
@@ -1254,7 +1255,7 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 	/* Deliberately NOT BT_LE_SCAN_ACTIVE: that macro sets
 	 * BT_LE_SCAN_OPT_FILTER_DUPLICATE, which reports each advertiser at most
 	 * once per scan. That is fine for "connect to the first thing you see",
-	 * but it breaks the name filter (design.md §3 decision 32): a name that
+	 * but it breaks the name filter (decision 32): a name that
 	 * arrives in a scan response has to be matched against a *connectable*
 	 * advertisement from the same address, and with duplicate filtering
 	 * there is no second advertisement to match it against -- the name is
@@ -1568,8 +1569,9 @@ static uint8_t discover_all_services_cb(struct bt_conn *conn, const struct bt_ga
 	}
 	if (discovered_len >= BLE_MAX_DISCOVERED_SERVICES) {
 		/* Capacity reached -- stop discovering further services; what's
-		 * already found stands (mirrors design.md §3 decision 32's own
-		 * "log and skip rather than corrupt" precedent for gatt_activity). */
+		 * already found stands (mirrors `embarch-study-designer` decision
+		 * 32's own "log and skip rather than corrupt" precedent for
+		 * gatt_activity). */
 		k_sem_give(&gatt_sem);
 		return BT_GATT_ITER_STOP;
 	}
@@ -1632,8 +1634,8 @@ static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_
 }
 
 /* Walks every primary service, then every characteristic within each,
- * populating `discovered`/`discovered_len` (design.md §4.3a's
- * "GattDiscover"/"GattMonitorAll share one discovery walk" framing). Two
+ * populating `discovered`/`discovered_len` (§4.3a's "GattDiscover"/
+ * "GattMonitorAll share one discovery walk" framing). Two
  * discovery passes per service is unavoidable: Zephyr can't be told
  * "discover primary services AND their characteristics" in one procedure,
  * and a nested bt_gatt_discover() call from inside a discovery callback
@@ -1714,7 +1716,7 @@ static struct outcome execute_gatt_discover(int64_t deadline)
 }
 
 /* service/characteristic index, flattened service-then-characteristic in
- * discovery order -- the exact convention design.md §4.3a documents for
+ * discovery order -- the exact convention §4.3a documents for
  * `GattActivityRecord.characteristic_index`, computed here in the one place
  * both this bridge and any consumer need to agree on it. */
 static uint16_t flat_characteristic_index(uint8_t service_idx, uint8_t char_idx)
@@ -1755,11 +1757,11 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 	(void)uuids_for_flat_index(flat_for_transcript, &tr_service_uuid, &tr_char_uuid);
 	/* **The only sink for a captured notification, as of schema v14.** It
 	 * used to be one of two, the other being a 32-record inline summary
-	 * that stopped growing mid-capture (design.md §3 decision 54 retired
-	 * it). The transcript is bounded only by the study's own duration, and
-	 * main.c fans one entry out to the declared transcript tap and to any
-	 * GattNotify tap that named this characteristic
-	 * (embarch-study-designer/design.md §3 decision 55) -- so
+	 * that stopped growing mid-capture (`embarch-study-designer` decision 54
+	 * retired it). The transcript is bounded only by the study's own
+	 * duration, and main.c fans one entry out to the declared transcript
+	 * tap and to any GattNotify tap that named this characteristic
+	 * (`embarch-study-designer` decision 55) -- so
 	 * "exhaustive" is now true of every route a record can take, rather
 	 * than of one of two. */
 	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, tr_service_uuid,
@@ -1787,11 +1789,11 @@ static int target_index_for(const struct gatt_monitor_selected_params *params,
 }
 
 /* Discovery + subscribe, shared by all four monitor actions -- the
- * unfiltered pair (design.md §3 decision 36) pass `params == NULL`, the
- * selective pair (that doc's decision 53) pass their target list. Leaves
- * every subscription armed; the caller decides whether to tear them down at
- * the end of its own step (MonitorAll/Selected) or leave them live across
- * the steps that follow (MonitorStart/SelectedStart).
+ * unfiltered pair (`embarch-study-designer` decision 36) pass
+ * `params == NULL`, the selective pair (that doc's decision 53) pass their
+ * target list. Leaves every subscription armed; the caller decides whether
+ * to tear them down at the end of its own step (MonitorAll/Selected) or
+ * leave them live across the steps that follow (MonitorStart/SelectedStart).
  *
  * **The two differ in what a characteristic that isn't subscribed means.**
  * Unfiltered, skipping one is routine -- nothing named it. Filtered, every
@@ -1947,7 +1949,7 @@ static void monitor_unsubscribe_all(void)
 /* Fills in the discovery field every monitor action reports.
  *
  * It used to fill two -- `gatt_activity` was the other, retired at schema
- * v14 (embarch-study-designer/design.md §3 decision 54). What a monitor step
+ * v14 (`embarch-study-designer` decision 54). What a monitor step
  * captured is read out of the study's `streams/` files now, which is where
  * all of it is rather than the first 32 records of it. */
 static struct outcome monitor_result(void)
@@ -1961,8 +1963,8 @@ static struct outcome monitor_result(void)
 
 /* Shared by ACTION_GATT_MONITOR_ALL and ACTION_GATT_MONITOR_SELECTED --
  * `params` is NULL for the first and the step's target list for the second,
- * and that is the *only* difference between them (design.md §3 decision
- * 53). */
+ * and that is the *only* difference between them
+ * (`embarch-study-designer` decision 53). */
 static struct outcome execute_gatt_monitor_window(
 	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
@@ -1975,8 +1977,8 @@ static struct outcome execute_gatt_monitor_window(
 	/* Capture window: whatever's left of the step's own timeout_ms after
 	 * discovery+subscribe -- no separate duration field, same "the step's
 	 * own budget is the window" precedent as GATT_OP_STREAM_CAPTURE
-	 * (design.md §3 decisions 20/21). Ends on the deadline (the normal
-	 * case) or early if the DUT drops the link. */
+	 * (`embarch-study-designer` decisions 20/21). Ends on the deadline (the
+	 * normal case) or early if the DUT drops the link. */
 	link_lost = false;
 	k_sem_reset(&disconn_sem);
 	bool dropped = k_sem_take(&disconn_sem, remaining(deadline)) == 0;
@@ -1984,7 +1986,7 @@ static struct outcome execute_gatt_monitor_window(
 	/* Unsubscribe everything this step subscribed, regardless of outcome --
 	 * a later step shouldn't keep receiving this step's notifications.
 	 * This is exactly the behaviour ACTION_GATT_MONITOR_START exists to
-	 * opt out of (design.md §3 decision 36). */
+	 * opt out of (`embarch-study-designer` decision 36). */
 	monitor_unsubscribe_all();
 
 	if (dropped) {
@@ -1994,10 +1996,11 @@ static struct outcome execute_gatt_monitor_window(
 	return monitor_result();
 }
 
-/* design.md §3 decision 36 (and 53's selective half). Subscribes and returns
- * immediately, leaving the window open: the step costs only
- * discovery+subscribe time, not its whole timeout_ms, because the capture
- * happens during the steps that follow rather than during this one. */
+/* `embarch-study-designer` decision 36 (and 53's selective half).
+ * Subscribes and returns immediately, leaving the window open: the step
+ * costs only discovery+subscribe time, not its whole timeout_ms, because
+ * the capture happens during the steps that follow rather than during this
+ * one. */
 static struct outcome execute_gatt_monitor_window_start(
 	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
@@ -2026,10 +2029,10 @@ static struct outcome execute_gatt_monitor_window_start(
 	return result;
 }
 
-/* design.md §3 decision 36. A Stop with no open window is a no-op Pass, not a
- * Fail: a study that ends without one still has its window closed for it
- * (main.c), so an explicit-but-redundant Stop is a harmless authoring
- * pattern, not an error worth aborting a study over. */
+/* `embarch-study-designer` decision 36. A Stop with no open window is a
+ * no-op Pass, not a Fail: a study that ends without one still has its
+ * window closed for it (main.c), so an explicit-but-redundant Stop is a
+ * harmless authoring pattern, not an error worth aborting a study over. */
 static struct outcome execute_gatt_monitor_stop(void)
 {
 	if (!monitor_window_open) {
@@ -2177,10 +2180,10 @@ static struct outcome execute_write(uint16_t value_handle, const uint8_t *payloa
 	capture_reset();
 	k_sem_reset(&gatt_sem);
 
-	/* The stimulus itself, recorded before it goes out -- design.md §3
-	 * decision 36's "record what dev-bench sent, not only what it
-	 * received". Without this a transcript shows a DUT's response with
-	 * nothing explaining what provoked it. */
+	/* The stimulus itself, recorded before it goes out --
+	 * `embarch-study-designer` decision 36's "record what dev-bench sent,
+	 * not only what it received". Without this a transcript shows a DUT's
+	 * response with nothing explaining what provoked it. */
 	transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_WRITE_REQUEST, cached_service_uuid(),
 			cached_characteristic_uuid(), 0, payload, payload_len);
 
@@ -2380,7 +2383,7 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 		}
 		/* Running the window to completion is the outcome; whether any
 		 * samples arrived is a host-side question
-		 * (embarch-study-designer/design.md §3 decision 19). */
+		 * (`embarch-study-designer` decision 19). */
 		return outcome_pass();
 	}
 
@@ -2389,7 +2392,7 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 	}
 }
 
-/* ---- security (design.md §3 decisions 34/37) ---------------------------- */
+/* ---- security (decisions 34/37) -------------------------------------- */
 
 /* Translates the wire's SecurityLevel discriminant into Zephyr's own
  * bt_security_t. Two enums with the same *order* and different *bases*, so
@@ -2477,7 +2480,7 @@ static const char *pairing_method_name(void)
  * authorable with no new timing field.
  *
  * **BLE_SECURITY_L1 needs no special case**, and deliberately gets none.
- * embarch-study-designer/design.md §3 decision 44 makes L1 the honest way
+ * `embarch-study-designer` decision 44 makes L1 the honest way
  * for a study to say "this DUT needs no security" rather than omitting the
  * step; a connected LE link is already at L1, so the already-at-or-above
  * check below passes it on the first iteration without a branch of its own.
@@ -2617,8 +2620,8 @@ static struct outcome execute_set_security(const struct ble_set_security_params 
 			     (unsigned int)bt_conn_get_security(active_conn), (unsigned int)want);
 }
 
-/* Drops the bond, inside the study (embarch-study-designer/design.md §3
- * decision 50; this firmware's half is design.md §3 decision 37).
+/* Drops the bond, inside the study (`embarch-study-designer` decision 50;
+ * this firmware's half is decision 37).
  *
  * **This disconnects.** Zephyr's bt_unpair disconnects a peer whose keys it
  * clears -- dev-bench does not choose that, and it is right: a link whose
@@ -2628,7 +2631,7 @@ static struct outcome execute_set_security(const struct ble_set_security_params 
  * failing with "already connected to a different peer", passing on retry).
  *
  * Clears *every* bond rather than only the connected peer's: dev-bench holds
- * one connection at a time (design.md §3 decision 15), so the two are the
+ * one connection at a time (decision 15), so the two are the
  * same set in practice, and "clear the table" is the thing a study author
  * actually means by "drop the bond". */
 static struct outcome execute_unbond(void)
@@ -2680,7 +2683,7 @@ int ble_bridge_init(void)
 	 * needs a capability, and a peer that connected and initiated pairing
 	 * before this ran would have latched NULL -- NoInputNoOutput, Just
 	 * Works, unauthenticated, with nothing in the resulting failure
-	 * pointing at registration order (design.md §3 decision 34). */
+	 * pointing at registration order (decision 34). */
 	err = bt_conn_auth_cb_register(&auth_callbacks);
 	if (err != 0) {
 		return err;
@@ -2696,7 +2699,7 @@ int ble_bridge_init(void)
 /* The action switch itself, split out of ble_bridge_execute so the
  * security-level stamp below it runs for every kind without each arm having
  * to remember it. */
-/* ---- Action::RunProtocol (embarch-study-designer/design.md §3 decision 60)
+/* ---- Action::RunProtocol (`embarch-study-designer` decision 60)
  *
  * **The BLE half only.** eap_interp.c owns every decision this loop acts on:
  * what to write, how long to wait, whether an arriving frame advances the
@@ -3211,8 +3214,8 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	 * no already-pending notification carry over from a previous step.
 	 * Note what is deliberately *not* reset here: the monitor
 	 * subscriptions, which by design span steps once a window is open
-	 * (design.md §3 decision 36) -- monitor_subscribe_matching clears them
-	 * when a new window opens instead. */
+	 * (`embarch-study-designer` decision 36) -- monitor_subscribe_matching
+	 * clears them when a new window opens instead. */
 	capture_reset();
 	link_lost = false;
 	k_sem_reset(&notify_sem);
@@ -3279,17 +3282,17 @@ void ble_bridge_reset(void)
 	subscribed = false;
 	memset(&subscribe_params, 0, sizeof(subscribe_params));
 
-	/* GattMonitorAll's own subscription set (design.md §3 decision 32) --
-	 * torn down here too, before the disconnect below, same reasoning as
-	 * the single subscribe_params case just above. */
+	/* GattMonitorAll's own subscription set (`embarch-study-designer`
+	 * decision 32) -- torn down here too, before the disconnect below,
+	 * same reasoning as the single subscribe_params case just above. */
 	if (active_conn != NULL) {
 		for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
 			(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
 		}
 	}
 	monitor_subscribe_count = 0;
-	/* A Hello is a hard reset (design.md §3 decision 12/16) -- any window
-	 * left open by a previous study dies with it. */
+	/* A Hello is a hard reset (`embarch-study-designer` decisions 12/16) --
+	 * any window left open by a previous study dies with it. */
 	monitor_window_open = false;
 	discovered_len = 0;
 
