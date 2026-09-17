@@ -952,13 +952,15 @@ static char scan_name[BLE_MAX_LOCAL_NAME_LEN + 1];
  * to mean "not on the air", not "list was full".
  *
  * 256 is a deliberate over-provision at ~9 KB of static RAM on a board that
- * has already overflowed SRAM by 25 KB once (decision 27) and by a further
- * 37 KB later (decision 40) -- affordable only because this is a flat table
- * of 35-byte entries rather than anything frame-sized (contrast decision
- * 30's ring buffer, which explicitly could not be sized to a worst-case
- * frame). The lookup is a linear scan per advertisement, which
- * is fine: it runs a few hundred byte-comparisons per packet, against a step
- * timeout measured in seconds. */
+ * has already overflowed SRAM twice -- by 25 KB from a from-scratch build
+ * (decision 27) and by 2,720 bytes at link time (decision 28) -- affordable
+ * only because this is a flat table of 35-byte entries rather than anything
+ * frame-sized (contrast decision 30's ring buffer, which explicitly could
+ * not be sized to a worst-case frame). Decision 40 later gave ~37 KB back,
+ * 90.87% -> 81.12%, by deleting the inline activity buffer; that is headroom
+ * this table does not depend on. The lookup is a linear scan per
+ * advertisement, which is fine: it runs a few hundred byte-comparisons per
+ * packet, against a step timeout measured in seconds. */
 #define SCAN_SEEN_MAX 256
 struct scan_seen_entry {
 	bt_addr_le_t addr;
