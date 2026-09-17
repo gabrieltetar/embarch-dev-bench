@@ -290,7 +290,8 @@ struct outcome {
 	 * telling "the protocol reached its `failed` state" apart from "the
 	 * protocol never finished" is the whole diagnostic value of recording a
 	 * final state. There is deliberately no list of decoded values here:
-	 * that is the shape decision 54 retired `gatt_activity` for, and
+	 * that is the shape `embarch-study-designer` decision 54 retired
+	 * `gatt_activity` for, and
 	 * decoded bytes reach a reader through the study's declared taps. */
 	bool has_protocol;
 	char protocol_final_state[EAP_MAX_STATE_NAME_LEN + 1];
