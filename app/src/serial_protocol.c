@@ -1267,7 +1267,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
 		 * trailing field (`embarch-study-designer` decision
-		 * 50), and the last field of `StepResult` since v14. */
+		 * 44), and the last field of `StepResult` since v14. */
 		if (*pos + 1 > out_cap) {
 			return -1;
 		}
@@ -1986,7 +1986,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 
 		/* `security_level: Option<SecurityLevel>` -- schema v12's
 		 * trailing field (`embarch-study-designer` decision
-		 * 50). Read unconditionally: the Hello/HelloAck schema-version
+		 * 44). Read unconditionally: the Hello/HelloAck schema-version
 		 * handshake has already refused any peer that wouldn't have
 		 * sent it. */
 		if (pos >= raw_len) {

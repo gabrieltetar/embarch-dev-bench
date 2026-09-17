@@ -1,6 +1,7 @@
-/* Real Zephyr BT host calls, built by workspaces/nordic/ (decision 16). Only
- * calls stable, vendor-neutral Zephyr Bluetooth host APIs (`bt_*`) per
- * decision 3 -- nothing NCS-proprietary.
+/* Real Zephyr BT host calls, built by every hardware workspace -- currently
+ * workspaces/nordic/ and workspaces/espressif/ -- rather than native_sim's
+ * stub (decision 16's split). Only calls stable, vendor-neutral Zephyr
+ * Bluetooth host APIs (`bt_*`) per decision 3 -- nothing NCS-proprietary.
  *
  * Every ble_bridge_execute() call is synchronous from the caller's point of
  * view but asynchronous underneath: Zephyr's BT host reports connections, GATT
@@ -950,11 +951,12 @@ static char scan_name[BLE_MAX_LOCAL_NAME_LEN + 1];
  * the advertiser that matters can be any of them, and "not in the list" has
  * to mean "not on the air", not "list was full".
  *
- * 256 is a deliberate over-provision at ~9 KB of static RAM on a board
- * already at ~96% SRAM (decision 27's own finding) -- affordable only because
- * this is a flat table of 35-byte entries rather than anything frame-sized
- * (contrast decision 29's ring buffer, which explicitly could not be sized to
- * a worst-case frame). The lookup is a linear scan per advertisement, which
+ * 256 is a deliberate over-provision at ~9 KB of static RAM on a board that
+ * has already overflowed SRAM by 25 KB once (decision 27) and by a further
+ * 37 KB later (decision 40) -- affordable only because this is a flat table
+ * of 35-byte entries rather than anything frame-sized (contrast decision
+ * 30's ring buffer, which explicitly could not be sized to a worst-case
+ * frame). The lookup is a linear scan per advertisement, which
  * is fine: it runs a few hundred byte-comparisons per packet, against a step
  * timeout measured in seconds. */
 #define SCAN_SEEN_MAX 256
@@ -1202,7 +1204,7 @@ static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
 	}
 	/* Both filters are ANDed: with a name set, only an address that
 	 * advertised exactly that name is connected to. Exact match -- a loose
-	 * one would reintroduce the failure decision 43 exists to remove, just
+	 * one would reintroduce the failure decision 32 exists to remove, just
 	 * less visibly. */
 	if (scan_name[0] != '\0' && strcmp(entry->name, scan_name) != 0) {
 		return;
@@ -1641,8 +1643,8 @@ static uint8_t discover_all_chars_cb(struct bt_conn *conn, const struct bt_gatt_
  * and a nested bt_gatt_discover() call from inside a discovery callback
  * isn't safe -- so this runs the wildcard service pass to completion first,
  * then a wildcard characteristic pass per discovered service afterward,
- * bounded throughout by the same `deadline` decision 16's own doc comment
- * already establishes for every action in this file. */
+ * bounded throughout by the same `deadline` this file's own header comment
+ * already establishes for every action here. */
 static struct outcome run_gatt_discovery(int64_t deadline)
 {
 	transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_DISCOVERY_STARTED, NULL, NULL, 0, NULL,
@@ -1800,8 +1802,9 @@ static int target_index_for(const struct gatt_monitor_selected_params *params,
  * target is something the study said it expects, so a target that matched no
  * discovered characteristic, or matched one that can neither notify nor
  * indicate, fails the step naming it. Left as a skip it would be a study
- * that passes having captured nothing, which is the failure decisions 34, 36,
- * 53 and 54 were each opened by. */
+ * that passes having captured nothing, which is the failure
+ * `embarch-study-designer` decisions 36, 53 and 54, and this repo's own
+ * decision 42, were each opened by. */
 static struct outcome monitor_subscribe_matching(int64_t deadline,
 						  const struct gatt_monitor_selected_params *params)
 {
