@@ -357,7 +357,7 @@ enum dbm_unit {
 };
 
 /* `Hello` lost `steps_crc` (moved to `StudyStart` — embarch-study-designer
- * schema v3, `embarch-study-designer` decisions 24/27). */
+ * schema v3, `embarch-study-designer` decision 24). */
 struct dbm_hello {
 	uint32_t schema_version;
 	uint64_t host_utc_ms;

@@ -789,7 +789,7 @@ static void send_step_result(uint32_t step_index, const char *step_name,
 	k_mutex_unlock(&link_tx_mutex);
 }
 
-/* ---- Inbound link RX (decision 29) -------
+/* ---- Inbound link RX (decision 30) -------
  *
  * The hardware FIFO is drained by an ISR into this ring buffer, and the
  * dispatch loop parses frames out of the ring buffer. Those two jobs used to
