@@ -262,8 +262,10 @@ static void dev_bench_log_dropped(const struct log_backend *const backend, uint3
 	ARG_UNUSED(backend);
 
 	/* Reported, never swallowed -- the same discipline the GATT
-	 * transcript's own drop counter follows (`embarch-study-designer`
-	 * decision 36).
+	 * transcript's own drop counter follows (decision 28: "a dropped entry
+	 * is counted and reported rather than leaving a transcript silently
+	 * claiming to be exhaustive"). That is this firmware's own decision, so
+	 * it takes no repo label.
 	 * Hand-prefixed `<wrn>` so Core's level classifier reads it as the
 	 * warning it is, since this line has no log record behind it. */
 	char note[DBM_MAX_LOG_LINE_LEN + 1];
