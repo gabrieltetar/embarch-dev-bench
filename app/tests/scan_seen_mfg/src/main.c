@@ -1,4 +1,4 @@
-/* scan_seen_mfg.c's own tests (embarch-dev-bench/decisions/ble.md decision
+/* scan_seen_mfg.c's own tests (embarch-dev-bench/decisions/scanning.md decision
  * 44, dev-bench task 013).
  *
  * All payloads here are synthetic -- constructed byte arrays, never a

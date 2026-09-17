@@ -36,7 +36,7 @@
  * still validate/CRC a `Study` against that ceiling). Real gap found and
  * fixed, Milestone 3 (Study Designer: Feature-Branch Iteration): once
  * `struct dbm_step`'s action union had to grow to also hold
- * `Action::DataExchange`'s up-to-512-byte `Write` payload (decisions
+ * `Action::DataExchange`'s up-to-512-byte `Write` payload (`embarch-study-designer` decisions
  * 31/32's own GattDiscover/GattMonitorAll additions triggered writing this
  * union out in full for the first time), a full 64-slot `steps[]` array
  * pushed `struct dev_bench_message`'s union well past what this board's
@@ -737,7 +737,7 @@ struct dbm_study_start {
 	uint32_t streams_crc;
 	/* Not part of the wire format, same as `steps_crc_valid` above:
 	 * whether the walked `streams` span recomputes to `streams_crc`.
-	 * Checked **independently** of `steps_crc_valid`, which is why decision
+	 * Checked **independently** of `steps_crc_valid`, which is why `embarch-study-designer` decision
 	 * 39's amendment chose a sibling seal over a widened one -- a mismatch
 	 * says which half of a `Study` is corrupt. Also `false` when decoding
 	 * stopped early on an unsupported action, for the same reason
