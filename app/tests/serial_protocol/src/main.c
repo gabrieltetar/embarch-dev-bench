@@ -85,7 +85,8 @@ ZTEST(serial_protocol, test_hello_ack_with_no_hardware_id_round_trips)
 
 /* `HelloAck`'s wire bytes, pinned across both languages for the first time at
  * schema v10 (`embarch-study-designer` decision 47). Like
- * `StepResult` below, this frame predates decision 36's both-languages rule
+ * `StepResult` below, this frame predates `embarch-study-designer` decision
+ * 36's both-languages rule
  * and so was never covered -- and `StepResult`'s own history is the argument
  * for pinning it now: this file's encoder wrote two stale `Option` bytes for
  * a whole schema version while both suites stayed green, because each agreed
@@ -727,7 +728,8 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
  *     the handshake, rather than as a study that runs and captures into the
  *     wrong file. The decoder value is deliberately 1, not 0, so a decoder
  *     that skipped the byte entirely still shifts the span.
- *   - the kept `characteristic_uuid` on a GattNotify tap (decision 55), which
+ *   - the kept `characteristic_uuid` on a GattNotify tap (`embarch-study-designer`
+ *     decision 55), which
  *     nothing kept before v14 and which is what routes a notification to this
  *     tap's id at all.
  */
@@ -803,7 +805,7 @@ ZTEST(serial_protocol, test_decodes_cores_selective_monitor_study_start)
 		     "streams_crc must validate -- a Struct encoding walked at the wrong width "
 		     "is what this catches");
 	zassert_equal(ss->streams[0].source_tag, DBM_STREAM_SRC_GATT_NOTIFY, "tap 0 source");
-	/* Decision 55: the characteristic is *kept*, not skipped, because this
+	/* `embarch-study-designer` decision 55: the characteristic is *kept*, not skipped, because this
 	 * node routes notifications to this tap's id and a notification
 	 * identifies itself by characteristic. */
 	zassert_equal(ss->streams[0].characteristic_uuid[3], 0x03,
@@ -958,9 +960,10 @@ ZTEST(serial_protocol, test_a_corrupted_streams_crc_is_caught_without_implicatin
 }
 
 /* `StepResult`'s wire bytes, pinned across both languages for the first time
- * at schema v9. It was never covered before: decision 36's both-languages
- * rule applied to *new* records, and this one predates it -- so when
- * decision 39 (v8) retired `power_samples_ref`/`waveform_ref` from
+ * at schema v9. It was never covered before: `embarch-study-designer`
+ * decision 36's both-languages rule applied to *new* records, and this one
+ * predates it -- so when `embarch-study-designer` decision 39 (v8) retired
+ * `power_samples_ref`/`waveform_ref` from
  * `StepResult`, this file's encoder kept writing two `Option` bytes for them
  * and nothing noticed. Both suites stayed green because each agreed with
  * itself, which is the exact blind spot the pairing exists to close.
@@ -978,7 +981,7 @@ ZTEST(serial_protocol, test_step_result_encodes_to_the_pinned_wire_bytes)
 		0x0d, 0x07, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73,
 		0x65, 0x07, 0x01, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x01,
 		/* Schema v12's trailing `security_level: Option<SecurityLevel>`
-		 * (`embarch-study-designer` decision 50), None here --
+		 * (`embarch-study-designer` decision 44), None here --
 		 * one more COBS zero-run code byte. The populated case is pinned
 		 * separately below; an all-None frame would pass against an
 		 * encoder that wrote the Option byte but not the value.
@@ -1245,7 +1248,7 @@ ZTEST(serial_protocol, test_study_done_round_trip)
  * the byte payload of a DBM_TAG_STREAM_CHUNK_BATCH record on a tap declared
  * `StreamEncoding::GattTranscript`. So what is pinned is the entry, which is
  * what actually crosses the wire; the bytes below are byte-for-byte the entry
- * half of the frame decision 36 originally pinned.
+ * half of the frame `embarch-study-designer` decision 36 originally pinned.
  *
  * embarch-study-designer pins the identical bytes in
  * `gatt_transcript_entry_matches_dev_bench_firmwares_own_hand_written_encoding`
@@ -1374,12 +1377,13 @@ ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
 
 
 /* ---- schema v12: security (`embarch-study-designer` decisions
- * 50/51) ------------------------------------------------------------------ */
+ * 44/50) ------------------------------------------------------------------ */
 
 /* The populated half of `StepResult.security_level`. The None case above
  * would pass against an encoder that wrote the Option byte and forgot the
- * value, which is a real shape of this exact bug -- decision 39's retired
- * refs survived a whole schema version as two bytes nothing read.
+ * value, which is a real shape of this exact bug -- `embarch-study-designer`
+ * decision 39's retired refs survived a whole schema version as two bytes
+ * nothing read.
  *
  * Pre-COBS body pinned by embarch-study-designer's
  * dump_step_result_with_security_wire_bytes; this is that body COBS-encoded
@@ -1476,7 +1480,8 @@ ZTEST(serial_protocol, test_study_start_rejects_an_unknown_security_level)
 	 * (`struct dbm_ble_set_security_action.level` is only ever set from a
 	 * decode that already checked it), so this frame has to be written
 	 * directly. A security step that silently became a *weaker* one is the
-	 * exact silent degradation decision 50 exists to refuse, which is why
+	 * exact silent degradation `embarch-study-designer` decision 44 exists
+	 * to refuse, which is why
 	 * this is a whole-frame reject rather than a per-step "unsupported". */
 	static const uint8_t body[] = {
 		0x06,                                            /* StudyStart */
@@ -1499,7 +1504,8 @@ ZTEST(serial_protocol, test_study_start_rejects_an_unknown_security_level)
 }
 
 /* Core's own bytes for a study that establishes security and then drops the
- * bond -- decision 36's both-languages rule applied to schema v12's two new
+ * bond -- `embarch-study-designer` decision 36's both-languages rule applied
+ * to schema v12's two new
  * actions in the pass that adds them, rather than a version later (which is
  * how `StepResult`'s two stale bytes survived one).
  *
@@ -1580,7 +1586,8 @@ ZTEST(serial_protocol, test_decodes_cores_real_security_study_start_bytes)
  *
  * Two kinds of test here, and the split is deliberate.
  *
- * The first is the usual decision-36 cross-language pin: a literal frame that
+ * The first is the usual `embarch-study-designer` decision-36 cross-language
+ * pin: a literal frame that
  * crate produced, decoded here and asserted field by field. Nothing in this
  * file can produce those bytes -- `dbm_encode_frame` writes an empty
  * `protocols` list on purpose, because the decoder discards every name in a

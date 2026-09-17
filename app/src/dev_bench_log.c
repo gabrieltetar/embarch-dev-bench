@@ -18,9 +18,9 @@
 
 /* Appended in place of the tail of a line that did not fit. Deliberately not
  * "..." -- a log message can legitimately end in an ellipsis, and a reader who
- * cannot tell truncation from content is the failure mode design.md §3
- * decision 36 already spent a whole feature removing from the GATT
- * transcript. */
+ * cannot tell truncation from content is the failure mode
+ * `embarch-study-designer` decision 36 already spent a whole feature removing
+ * from the GATT transcript. */
 #define TRUNC_MARK " [cut]"
 
 static dev_bench_log_sink_fn log_sink;
@@ -262,7 +262,8 @@ static void dev_bench_log_dropped(const struct log_backend *const backend, uint3
 	ARG_UNUSED(backend);
 
 	/* Reported, never swallowed -- the same discipline the GATT
-	 * transcript's own drop counter follows (design.md §3 decision 36).
+	 * transcript's own drop counter follows (`embarch-study-designer`
+	 * decision 36).
 	 * Hand-prefixed `<wrn>` so Core's level classifier reads it as the
 	 * warning it is, since this line has no log record behind it. */
 	char note[DBM_MAX_LOG_LINE_LEN + 1];
