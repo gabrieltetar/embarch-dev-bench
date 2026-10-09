@@ -15,6 +15,7 @@
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/usb_c/usbc_pd.h>
+#include <zephyr/drivers/usb_c/usbc_tcpc.h>
 #include <zephyr/drivers/usb_c/usbc_vbus.h>
 #include <zephyr/dt-bindings/usb-c/pd.h>
 #include <zephyr/kernel.h>
@@ -51,6 +52,7 @@ struct want {
 
 static const struct device *const port_dev = DEVICE_DT_GET(PORT_NODE);
 static const struct device *const vbus_dev = DEVICE_DT_GET(DT_PHANDLE(PORT_NODE, vbus));
+static const struct device *const tcpc_dev = DEVICE_DT_GET(DT_PHANDLE(PORT_NODE, tcpc));
 static const struct gpio_dt_spec tcpp_vcc = GPIO_DT_SPEC_GET(USER_NODE, tcpp_vcc_gpios);
 static const struct gpio_dt_spec tcpp_db = GPIO_DT_SPEC_GET(USER_NODE, tcpp_db_gpios);
 
@@ -429,6 +431,47 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static const char *cc_name(enum tc_cc_voltage_state cc)
+{
+	switch (cc) {
+	case TC_CC_VOLT_OPEN:
+		return "open";
+	case TC_CC_VOLT_RA:
+		return "ra";
+	case TC_CC_VOLT_RD:
+		return "rd";
+	case TC_CC_VOLT_RP_DEF:
+		return "rp-default";
+	case TC_CC_VOLT_RP_1A5:
+		return "rp-1.5a";
+	case TC_CC_VOLT_RP_3A0:
+		return "rp-3a";
+	default:
+		return "unknown";
+	}
+}
+
+/* What each CC line sees from the partner: a cable or path fault shows as open on both */
+static int cmd_cc(const struct shell *sh, size_t argc, char **argv)
+{
+	enum tc_cc_voltage_state cc1;
+	enum tc_cc_voltage_state cc2;
+	int ret = tcpc_get_cc(tcpc_dev, &cc1, &cc2);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	if (ret < 0) {
+		shell_print(sh, "pd: error cc read %d", ret);
+		return ret;
+	}
+	shell_print(sh, "cc1: %s", cc_name(cc1));
+	shell_print(sh, "cc2: %s", cc_name(cc2));
+	shell_print(sh, "pd: ok");
+
+	return 0;
+}
+
 static int cmd_caps(const struct shell *sh, size_t argc, char **argv)
 {
 	uint32_t caps[PDO_MAX_DATA_OBJECTS];
@@ -550,6 +593,7 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	sub_pd,
 	SHELL_CMD_ARG(status, NULL, "Rp, partner, contract and VBUS", cmd_status, 1, 0),
 	SHELL_CMD_ARG(caps, NULL, "The partner's Source_Capabilities", cmd_caps, 1, 0),
+	SHELL_CMD_ARG(cc, NULL, "What each CC line sees from the partner", cmd_cc, 1, 0),
 	SHELL_CMD_ARG(req, NULL, "Ask a fixed PDO: pd req <pos> [mA]", cmd_req, 2, 1),
 	SHELL_CMD_ARG(pps, NULL, "Ask a PPS APDO: pd pps <pos> <mV> <mA>", cmd_pps, 4, 0),
 	SHELL_CMD_ARG(max, NULL, "Ask the highest power fixed PDO (the default)", cmd_max, 1, 0),

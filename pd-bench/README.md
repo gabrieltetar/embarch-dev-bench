@@ -64,14 +64,29 @@ Every `pd` command ends its output with one line, `pd: ok` or
 |---|---|
 | `pd status` | Rp current, whether the partner is PD, the contract in force, Rejects seen, VBUS |
 | `pd caps` | The partner's Source_Capabilities, one PDO per line |
+| `pd cc` | What each CC line sees: `open`, `ra`, `rd`, `rp-default`, `rp-1.5a`, `rp-3a` |
 | `pd req <pos> [mA]` | Ask for fixed PDO `pos`, at its current or `mA` |
 | `pd pps <pos> <mV> <mA>` | Ask for PPS APDO `pos` at `mV` / `mA` |
 | `pd max` | Ask for the highest-power fixed PDO, at most 3 A (the default) |
 | `pd getcaps` | Send Get_Source_Cap |
 | `pd hardreset` | Send Hard Reset Signaling |
 
+`devmem` is enabled too, for reading the UCPD and GPIO registers without
+halting the core.
+
 A choice is checked against the caps held and refused at once when it is
 not offered. `pd: ok` means the Request was queued, not accepted: read the
 outcome back with `pd status`. A Reject leaves the earlier contract in force
 and counts in `rejects`. A PPS contract is renewed every 8 s, under
 tPPSRequest (10 s), by repeating the contract, not the last choice.
+
+## Two things the bench taught
+
+- **The USB-C thread runs at the shell's priority (14).** Zephyr's
+  AttachWait.SNK skips its sleep while it sees Rp and no VBUS, so at a
+  higher priority a source that withholds VBUS starves the shell and the
+  log. Time slicing keeps both answering.
+- **The VBUS ADC samples for the longest time.** The divider is about
+  33 kΩ; the shortest sampling read 5.0 V as 4.36 V, under the 4.75 V
+  vSafe5V floor, and the sink never attached.
+
