@@ -5,7 +5,8 @@
  * pinout: CC1 PA8 and CC2 PB15 on UCPD1, VBUS divider (200 k over 40 k)
  * on PB1 = ADC1_IN9, DB_OUT on PB6 (high: the TCPP01 releases its
  * dead-battery Rd to the UCPD), VCC_OUT on PC10 (high: TCPP01 supply).
- * Jumpers on the SNK1M1 at their defaults.
+ * On the SNK1M1, JP3 (LDO_OUT) and JP4 (RESET) off and J1/J2 in position
+ * 1-2: fitted, JP4 holds the MCU in reset until USB-C powers the board.
  */
 
 #include <zephyr/dt-bindings/usb-c/pd.h>

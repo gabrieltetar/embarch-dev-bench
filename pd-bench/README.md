@@ -12,8 +12,16 @@ with Core's `signal_exchange` on a declared `Direct` signal.
 
 ## Hardware
 
-NUCLEO-G0B1RE with an X-NUCLEO-SNK1M1 (TCPP01-M12 sink protection), jumpers
-at their defaults.
+NUCLEO-G0B1RE with an X-NUCLEO-SNK1M1 (TCPP01-M12 sink protection),
+powered from the ST-LINK USB. On the SNK1M1:
+
+- **JP3 (LDO_OUT) and JP4 (RESET) off.** Fitted, they select dead-battery
+  mode: JP4 holds the MCU in reset until a USB-C source powers the board, so
+  the shell is silent and SWD cannot halt the core.
+- Solder bridges J1 and J2 in position 1-2.
+
+This is the setup ST's X-CUBE-TCPP `SNK1M1_Sink_PPS` example for the
+NUCLEO-G071RB gives.
 
 | Function | Pin |
 |---|---|
@@ -25,10 +33,6 @@ at their defaults.
 
 The pins come from ST's X-CUBE-TCPP SNK1M1 examples for the Nucleo-64
 pinout.
-
-**With the SNK1M1 fitted, SWD cannot halt the core** (2026-10-09): the
-debug port answers, but a halt and a connect-under-reset both time out.
-Flash with the shield off, then refit it.
 
 ## Build and flash
 
