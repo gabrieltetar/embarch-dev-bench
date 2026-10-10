@@ -77,7 +77,8 @@ halting the core.
 A choice is checked against the caps held and refused at once when it is
 not offered. `pd: ok` means the Request was queued, not accepted: read the
 outcome back with `pd status`. A Reject leaves the earlier contract in force
-and counts in `rejects`. A PPS contract is renewed every 8 s, under
+and counts in `rejects`. A Wait counts in `waits`, and the stack repeats
+the Request after tSinkRequest (100 ms). A PPS contract is renewed every 8 s, under
 tPPSRequest (10 s), by repeating the contract, not the last choice.
 
 ## Two things the bench taught
