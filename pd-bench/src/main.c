@@ -76,6 +76,7 @@ static struct {
 	bool pd_connected;
 	int rp_ma;
 	int rejects;
+	int waits;
 
 	struct k_work_delayable keepalive;
 } self = {
@@ -365,6 +366,24 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 	}
 }
 
+/* A Wait leaves the contract as it was: the stack repeats the Request after tSinkRequest */
+static bool policy_wait_notify(const struct device *dev, const enum usbc_policy_wait_t wait)
+{
+	k_spinlock_key_t key;
+
+	ARG_UNUSED(dev);
+
+	if (wait != WAIT_SINK_REQUEST) {
+		return false;
+	}
+	key = k_spin_lock(&self.lock);
+	self.waits++;
+	k_spin_unlock(&self.lock, key);
+	LOG_INF("Request answered with Wait, repeating it");
+
+	return true;
+}
+
 static bool policy_check(const struct device *dev, const enum usbc_policy_check_t check)
 {
 	ARG_UNUSED(dev);
@@ -398,6 +417,7 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	bool pd = self.pd_connected;
 	int rp_ma = self.rp_ma;
 	int rejects = self.rejects;
+	int waits = self.waits;
 	int vbus_mv = 0;
 	int ret;
 
@@ -419,6 +439,7 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 			    PD_CONVERT_FIXED_PDO_CURRENT_TO_MA(rdo.fixed.operating_current));
 	}
 	shell_print(sh, "rejects: %d", rejects);
+	shell_print(sh, "waits: %d", waits);
 
 	ret = usbc_vbus_measure(vbus_dev, &vbus_mv);
 	if (ret < 0) {
@@ -621,6 +642,7 @@ int main(void)
 
 	usbc_set_policy_cb_check(port_dev, policy_check);
 	usbc_set_policy_cb_notify(port_dev, policy_notify);
+	usbc_set_policy_cb_wait_notify(port_dev, policy_wait_notify);
 	usbc_set_policy_cb_get_snk_cap(port_dev, policy_get_snk_cap);
 	usbc_set_policy_cb_set_src_cap(port_dev, policy_set_src_cap);
 	usbc_set_policy_cb_get_rdo(port_dev, policy_get_rdo);
