@@ -70,12 +70,18 @@ Every `pd` command ends its output with one line, `pd: ok` or
 | `pd max` | Ask for the highest-power fixed PDO, at most 3 A (the default) |
 | `pd getcaps` | Send Get_Source_Cap |
 | `pd hardreset` | Send Hard Reset Signaling |
+| `pd drswap` | Send DR_Swap |
+| `pd dr <accept\|reject\|nosupport>` | How the bench answers a partner's DR_Swap (default accept); nosupport also clears the 5 V sink PDO's Dual-Role Data bit |
 
 `devmem` is enabled too, for reading the UCPD and GPIO registers without
 halting the core.
 
 A choice is checked against the caps held and refused at once when it is
-not offered. `pd: ok` means the Request was queued, not accepted: read the
+not offered. `pd status` also shows the data role, the DR_Swap answer and the outcome of the bench's own last DR_Swap (`accepted`, `rejected`, `not supported`, `wait`, or `pending` when the stack did not send it, as after a refusal until the next negotiation, USB PD 7.4.2).
+
+The bench cannot take part in a completed PR_Swap: the SNK1M1 only sinks. A PR_Swap sent to it gets Not_Supported.
+
+`pd: ok` means the Request was queued, not accepted: read the
 outcome back with `pd status`. A Reject leaves the earlier contract in force
 and counts in `rejects`. A Wait counts in `waits`, and the stack repeats
 the Request after tSinkRequest (100 ms). A PPS contract is renewed every 8 s, under

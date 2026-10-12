@@ -10,6 +10,7 @@
  */
 
 #include <stdlib.h>
+#include <string.h>
 
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
@@ -36,6 +37,15 @@ BUILD_ASSERT(DT_ENUM_HAS_VALUE(PORT_NODE, power_role, sink), "the PD bench is a 
 #define SAFE_MA 500
 /* `pd max` never asks for more than a cable without an e-marker carries */
 #define CABLE_MA 3000
+
+/* How the bench answers a partner's DR_Swap */
+enum dr_answer {
+	DR_ACCEPT,
+	DR_REJECT,
+	DR_NOT_SUPPORTED,
+};
+
+static const char *const dr_answer_names[] = {"accept", "reject", "nosupport"};
 
 enum want_kind {
 	WANT_MAX,
@@ -77,6 +87,11 @@ static struct {
 	int rp_ma;
 	int rejects;
 	int waits;
+	/* Data roles (Table 7.4): the bench's answer, its role, its own last DR_Swap */
+	enum dr_answer dr_answer;
+	bool dfp;
+	bool drs_pending;
+	const char *drs_result;
 
 	struct k_work_delayable keepalive;
 } self = {
@@ -334,6 +349,8 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 		break;
 	case POWER_CHANGE_0A0:
 		key = k_spin_lock(&self.lock);
+		self.dfp = false;
+		self.drs_pending = false;
 		self.rp_ma = 0;
 		self.src_cap_cnt = 0;
 		self.pd_connected = false;
@@ -350,9 +367,34 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 		break;
 	case MSG_REJECTED_RECEIVED:
 		key = k_spin_lock(&self.lock);
-		self.rejects++;
+		if (self.drs_pending) {
+			self.drs_pending = false;
+			self.drs_result = "rejected";
+		} else {
+			self.rejects++;
+		}
 		k_spin_unlock(&self.lock, key);
-		LOG_WRN("Request rejected");
+		LOG_WRN("Rejected");
+		break;
+	case MSG_NOT_SUPPORTED_RECEIVED:
+		key = k_spin_lock(&self.lock);
+		if (self.drs_pending) {
+			self.drs_pending = false;
+			self.drs_result = "not supported";
+		}
+		k_spin_unlock(&self.lock, key);
+		LOG_WRN("Not_Supported");
+		break;
+	case DATA_ROLE_IS_UFP:
+	case DATA_ROLE_IS_DFP:
+		key = k_spin_lock(&self.lock);
+		self.dfp = notify == DATA_ROLE_IS_DFP;
+		if (self.drs_pending) {
+			self.drs_pending = false;
+			self.drs_result = "accepted";
+		}
+		k_spin_unlock(&self.lock, key);
+		LOG_INF("data role %s", notify == DATA_ROLE_IS_DFP ? "DFP" : "UFP");
 		break;
 	case SNK_TRANSITION_TO_DEFAULT:
 		contract_end();
@@ -373,6 +415,13 @@ static bool policy_wait_notify(const struct device *dev, const enum usbc_policy_
 
 	ARG_UNUSED(dev);
 
+	if (wait == WAIT_DATA_ROLE_SWAP) {
+		key = k_spin_lock(&self.lock);
+		self.drs_pending = false;
+		self.drs_result = "wait";
+		k_spin_unlock(&self.lock, key);
+		return false;
+	}
 	if (wait != WAIT_SINK_REQUEST) {
 		return false;
 	}
@@ -386,9 +435,32 @@ static bool policy_wait_notify(const struct device *dev, const enum usbc_policy_
 
 static bool policy_check(const struct device *dev, const enum usbc_policy_check_t check)
 {
+	enum dr_answer answer = self.dr_answer;
+
 	ARG_UNUSED(dev);
 
-	return check == CHECK_SNK_AT_DEFAULT_LEVEL;
+	switch (check) {
+	case CHECK_SNK_AT_DEFAULT_LEVEL:
+		return true;
+	case CHECK_DATA_ROLE_SWAP_SUPPORTED:
+		return answer != DR_NOT_SUPPORTED;
+	case CHECK_DATA_ROLE_SWAP_TO_DFP:
+	case CHECK_DATA_ROLE_SWAP_TO_UFP:
+		return answer == DR_ACCEPT;
+	default:
+		return false;
+	}
+}
+
+/* The 5 V sink PDO's Dual-Role Data bit follows whether the bench takes a DR_Swap */
+static void dr_answer_set(enum dr_answer answer)
+{
+	self.dr_answer = answer;
+	if (answer == DR_NOT_SUPPORTED) {
+		self.snk_caps[0] &= ~PDO_FIXED_DATA_SWAP;
+	} else {
+		self.snk_caps[0] |= PDO_FIXED_DATA_SWAP;
+	}
 }
 
 static void print_pdo(const struct shell *sh, int pos, uint32_t pdo)
@@ -418,6 +490,9 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	int rp_ma = self.rp_ma;
 	int rejects = self.rejects;
 	int waits = self.waits;
+	bool dfp = self.dfp;
+	const char *drs = self.drs_pending ? "pending" : self.drs_result;
+	enum dr_answer answer = self.dr_answer;
 	int vbus_mv = 0;
 	int ret;
 
@@ -440,6 +515,8 @@ static int cmd_status(const struct shell *sh, size_t argc, char **argv)
 	}
 	shell_print(sh, "rejects: %d", rejects);
 	shell_print(sh, "waits: %d", waits);
+	shell_print(sh, "data: %s, answers dr_swap: %s, last dr_swap: %s", dfp ? "dfp" : "ufp",
+		    dr_answer_names[answer], drs);
 
 	ret = usbc_vbus_measure(vbus_dev, &vbus_mv);
 	if (ret < 0) {
@@ -594,6 +671,34 @@ static int cmd_max(const struct shell *sh, size_t argc, char **argv)
 	return want_set(sh, &w);
 }
 
+static int cmd_drswap(const struct shell *sh, size_t argc, char **argv)
+{
+	k_spinlock_key_t key = k_spin_lock(&self.lock);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+	self.drs_pending = true;
+	k_spin_unlock(&self.lock, key);
+
+	return dpm_request(sh, REQUEST_PE_DR_SWAP);
+}
+
+static int cmd_dr(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+
+	for (int i = 0; i < ARRAY_SIZE(dr_answer_names); i++) {
+		if (strcmp(argv[1], dr_answer_names[i]) == 0) {
+			dr_answer_set(i);
+			shell_print(sh, "pd: ok");
+			return 0;
+		}
+	}
+	shell_print(sh, "pd: error answer is accept, reject or nosupport");
+
+	return -EINVAL;
+}
+
 static int cmd_getcaps(const struct shell *sh, size_t argc, char **argv)
 {
 	ARG_UNUSED(argc);
@@ -620,6 +725,9 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(max, NULL, "Ask the highest power fixed PDO (the default)", cmd_max, 1, 0),
 	SHELL_CMD_ARG(getcaps, NULL, "Send Get_Source_Cap", cmd_getcaps, 1, 0),
 	SHELL_CMD_ARG(hardreset, NULL, "Send Hard Reset Signaling", cmd_hardreset, 1, 0),
+	SHELL_CMD_ARG(drswap, NULL, "Send DR_Swap", cmd_drswap, 1, 0),
+	SHELL_CMD_ARG(dr, NULL, "Answer a DR_Swap: pd dr <accept|reject|nosupport>", cmd_dr, 2,
+		      0),
 	SHELL_SUBCMD_SET_END);
 
 SHELL_CMD_REGISTER(pd, &sub_pd, "PD bench sink", NULL);
@@ -639,6 +747,8 @@ int main(void)
 	__ASSERT(ret == 0, "TCPP01 DB: %d", ret);
 
 	k_work_init_delayable(&self.keepalive, keepalive_handler);
+	self.drs_result = "none";
+	dr_answer_set(DR_ACCEPT);
 
 	usbc_set_policy_cb_check(port_dev, policy_check);
 	usbc_set_policy_cb_notify(port_dev, policy_notify);
