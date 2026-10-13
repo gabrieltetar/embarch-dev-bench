@@ -1,0 +1,66 @@
+/*
+ * X-NUCLEO-SNK1M1 (TCPP01-M12 sink protection) on a Nucleo-64 with an STM32G0
+ * (NUCLEO-G0B1RE, NUCLEO-G071RB).
+ *
+ * Pins as ST's X-CUBE-TCPP SNK1M1 examples set them for the Nucleo-64
+ * pinout: CC1 PA8 and CC2 PB15 on UCPD1, VBUS divider (200 k over 40 k)
+ * on PB1 = ADC1_IN9, DB_OUT on PB6 (high: the TCPP01 releases its
+ * dead-battery Rd to the UCPD), VCC_OUT on PC10 (high: TCPP01 supply).
+ * On the SNK1M1, JP3 (LDO_OUT) and JP4 (RESET) off and J1/J2 in position
+ * 1-2: fitted, JP4 holds the MCU in reset until USB-C powers the board.
+ */
+
+#include <zephyr/dt-bindings/usb-c/pd.h>
+
+/ {
+	aliases {
+		usbc-port0 = &port1;
+	};
+
+	zephyr,user {
+		tcpp-vcc-gpios = <&gpioc 10 GPIO_ACTIVE_HIGH>;
+		tcpp-db-gpios = <&gpiob 6 GPIO_ACTIVE_HIGH>;
+	};
+
+	vbus1: vbus {
+		compatible = "zephyr,usb-c-vbus-adc";
+		io-channels = <&adc1 9>;
+		output-ohms = <40000>;
+		full-ohms = <(200000 + 40000)>;
+	};
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port1: usbc-port@1 {
+			compatible = "usb-c-connector";
+			reg = <1>;
+			tcpc = <&ucpd1>;
+			vbus = <&vbus1>;
+			power-role = "sink";
+			sink-pdos = <PDO_FIXED(5000, 3000, 0)
+				     PDO_FIXED(9000, 3000, 0)
+				     PDO_FIXED(15000, 3000, 0)
+				     PDO_FIXED(20000, 3000, 0)
+				     PDO_PPS_APDO(3300, 21000, 3000)>;
+		};
+	};
+};
+
+&adc1 {
+	pinctrl-0 = <&adc1_in9_pb1>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@9 {
+		reg = <9>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		/* The divider is about 33 k: the shortest sampling reads 13 % low */
+		zephyr,acquisition-time = <ADC_ACQ_TIME_MAX>;
+		zephyr,resolution = <12>;
+		zephyr,vref-mv = <3300>;
+	};
+};

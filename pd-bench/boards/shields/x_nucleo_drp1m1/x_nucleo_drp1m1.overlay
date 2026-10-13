@@ -1,0 +1,97 @@
+/*
+ * X-NUCLEO-DRP1M1 (TCPP03-M20 dual-role protection) on a Nucleo-64 with an
+ * STM32G0 (NUCLEO-G0B1RE, NUCLEO-G071RB).
+ *
+ * Pins as ST's X-CUBE-TCPP DRP1M1_DRP example sets them for the
+ * NUCLEO-G071RB (drp1m1_conf.h, DRP1M1_DRP.ioc): CC1 PA8 and CC2 PB15 on
+ * UCPD1, the TCPP03 on I2C1 (PB8 SCL, PB9 SDA) at 0x34 (0x68 in ST's 8-bit
+ * form), ENABLE on PC8, FLGn on PC5, VBUS at the connector on PA0 =
+ * ADC1_IN0 and the provider path (CN3) on PA1 = ADC1_IN1, both through
+ * 200 k over 40.2 k (UM2891 1.7). No jumper on the DRP1M1: JP1 would feed
+ * the Nucleo from the shield's LDO.
+ *
+ * The provider path switches the CN3 supply onto VBUS as it is: the bench
+ * only offers 5 V, and checks CN3 is at vSafe5V before it sources.
+ */
+
+#include <zephyr/dt-bindings/usb-c/pd.h>
+
+/ {
+	aliases {
+		usbc-port0 = &port1;
+	};
+
+	vbus1: vbus {
+		compatible = "zephyr,usb-c-vbus-adc";
+		io-channels = <&adc1 0>;
+		output-ohms = <40200>;
+		full-ohms = <(200000 + 40200)>;
+	};
+
+	vprov: vprov {
+		compatible = "zephyr,usb-c-vbus-adc";
+		io-channels = <&adc1 1>;
+		output-ohms = <40200>;
+		full-ohms = <(200000 + 40200)>;
+	};
+
+	ports {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		port1: usbc-port@1 {
+			compatible = "usb-c-connector";
+			reg = <1>;
+			tcpc = <&ucpd1>;
+			vbus = <&vbus1>;
+			power-role = "dual";
+			/* The most the bench offers as a source: pd srccaps stays within it */
+			source-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE)>;
+			sink-pdos = <PDO_FIXED(5000, 3000, PDO_FIXED_DUAL_ROLE)
+				     PDO_FIXED(9000, 3000, 0)
+				     PDO_FIXED(15000, 3000, 0)
+				     PDO_FIXED(20000, 3000, 0)
+				     PDO_PPS_APDO(3300, 21000, 3000)>;
+		};
+	};
+};
+
+&i2c1 {
+	tcpp03: tcpp03@34 {
+		compatible = "st,tcpp03";
+		reg = <0x34>;
+		enable-gpios = <&gpioc 8 GPIO_ACTIVE_HIGH>;
+		flg-gpios = <&gpioc 5 GPIO_ACTIVE_LOW>;
+	};
+};
+
+/* PC5 is FLGn on the DRP1M1, not USART1 RX */
+&usart1 {
+	status = "disabled";
+};
+
+&adc1 {
+	pinctrl-0 = <&adc1_in0_pa0 &adc1_in1_pa1>;
+	pinctrl-names = "default";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	/* The dividers are about 33 k: the shortest sampling reads 13 % low */
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_MAX>;
+		zephyr,resolution = <12>;
+		zephyr,vref-mv = <3300>;
+	};
+
+	channel@1 {
+		reg = <1>;
+		zephyr,gain = "ADC_GAIN_1";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_MAX>;
+		zephyr,resolution = <12>;
+		zephyr,vref-mv = <3300>;
+	};
+};

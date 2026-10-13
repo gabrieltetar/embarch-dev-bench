@@ -1,0 +1,19 @@
+description: |
+  STMicroelectronics TCPP03-M20 USB Type-C port protection with VBUS provider
+  and consumer gate drivers. No Zephyr driver: the PD bench app drives it over
+  I2C (src/tcpp03.c).
+
+compatible: "st,tcpp03"
+
+include: i2c-device.yaml
+
+properties:
+  enable-gpios:
+    type: phandle-array
+    required: true
+    description: ENABLE, which powers the TCPP03's I2C interface
+
+  flg-gpios:
+    type: phandle-array
+    required: true
+    description: FLGn, open drain, low on a fault in Normal mode

@@ -1,0 +1,6 @@
+shield:
+  name: x_nucleo_snk1m1
+  full_name: X-NUCLEO-SNK1M1 (TCPP01-M12 USB-C sink protection)
+  vendor: st
+  supported_features:
+    - usb-c
