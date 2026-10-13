@@ -83,6 +83,8 @@ static struct {
 	uint32_t contract_pdo;
 	/* The next Request repeats the contract: a PPS keep-alive */
 	bool refresh;
+	/* Off, a PPS contract gets no keep-alive: the source's tPPSTimeout test */
+	bool keepalive_off;
 	bool pd_connected;
 	int rp_ma;
 	int rejects;
@@ -292,7 +294,7 @@ static uint32_t policy_get_rdo(const struct device *dev)
 static void keepalive_handler(struct k_work *work)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
-	bool pps = self.contract && pdo_is_pps(self.contract_pdo);
+	bool pps = self.contract && pdo_is_pps(self.contract_pdo) && !self.keepalive_off;
 
 	ARG_UNUSED(work);
 
@@ -442,8 +444,6 @@ static bool policy_check(const struct device *dev, const enum usbc_policy_check_
 	switch (check) {
 	case CHECK_SNK_AT_DEFAULT_LEVEL:
 		return true;
-	case CHECK_DATA_ROLE_SWAP_SUPPORTED:
-		return answer != DR_NOT_SUPPORTED;
 	case CHECK_DATA_ROLE_SWAP_TO_DFP:
 	case CHECK_DATA_ROLE_SWAP_TO_UFP:
 		return answer == DR_ACCEPT;
@@ -452,7 +452,10 @@ static bool policy_check(const struct device *dev, const enum usbc_policy_check_
 	}
 }
 
-/* The 5 V sink PDO's Dual-Role Data bit follows whether the bench takes a DR_Swap */
+/*
+ * The 5 V sink PDO's Dual-Role Data bit follows whether the bench takes a
+ * DR_Swap: the stack answers Not_Supported when it is clear
+ */
 static void dr_answer_set(enum dr_answer answer)
 {
 	self.dr_answer = answer;
@@ -671,6 +674,28 @@ static int cmd_max(const struct shell *sh, size_t argc, char **argv)
 	return want_set(sh, &w);
 }
 
+static int cmd_keepalive(const struct shell *sh, size_t argc, char **argv)
+{
+	bool off;
+
+	ARG_UNUSED(argc);
+	if (strcmp(argv[1], "on") == 0) {
+		off = false;
+	} else if (strcmp(argv[1], "off") == 0) {
+		off = true;
+	} else {
+		shell_print(sh, "pd: error keepalive is on or off");
+		return -EINVAL;
+	}
+	self.keepalive_off = off;
+	if (!off) {
+		k_work_reschedule(&self.keepalive, K_NO_WAIT);
+	}
+	shell_print(sh, "pd: ok");
+
+	return 0;
+}
+
 static int cmd_drswap(const struct shell *sh, size_t argc, char **argv)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
@@ -726,6 +751,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(getcaps, NULL, "Send Get_Source_Cap", cmd_getcaps, 1, 0),
 	SHELL_CMD_ARG(hardreset, NULL, "Send Hard Reset Signaling", cmd_hardreset, 1, 0),
 	SHELL_CMD_ARG(drswap, NULL, "Send DR_Swap", cmd_drswap, 1, 0),
+	SHELL_CMD_ARG(keepalive, NULL, "PPS keep-alive Requests: pd keepalive <on|off>",
+		      cmd_keepalive, 2, 0),
 	SHELL_CMD_ARG(dr, NULL, "Answer a DR_Swap: pd dr <accept|reject|nosupport>", cmd_dr, 2,
 		      0),
 	SHELL_SUBCMD_SET_END);
