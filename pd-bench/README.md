@@ -71,6 +71,7 @@ Every `pd` command ends its output with one line, `pd: ok` or
 | `pd getcaps` | Send Get_Source_Cap |
 | `pd hardreset` | Send Hard Reset Signaling |
 | `pd drswap` | Send DR_Swap |
+| `pd keepalive <on\|off>` | Off, a PPS contract gets no keep-alive Request, to test a source's tPPSTimeout Hard Reset (on by default) |
 | `pd dr <accept\|reject\|nosupport>` | How the bench answers a partner's DR_Swap (default accept); nosupport also clears the 5 V sink PDO's Dual-Role Data bit |
 
 `devmem` is enabled too, for reading the UCPD and GPIO registers without
