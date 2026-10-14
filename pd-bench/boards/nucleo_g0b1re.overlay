@@ -3,6 +3,16 @@
  * boards use. The rest comes from the shield (boards/shields/).
  */
 
+#include <zephyr/dt-bindings/dma/stm32_dma.h>
+
+&dma1 {
+	status = "okay";
+};
+
+&dmamux1 {
+	status = "okay";
+};
+
 &ucpd1 {
 	status = "okay";
 	/* HSI 16 MHz / 27 = 592.6 kHz half-bit clock, as on the STM32G081B-EVAL */
@@ -10,4 +20,12 @@
 	hbitclkdiv = <27>;
 	pinctrl-0 = <&ucpd1_cc1_pa8 &ucpd1_cc2_pb15>;
 	pinctrl-names = "default";
+	/*
+	 * Messages by DMA (DMAMUX requests 58 UCPD1_RX, 59 UCPD1_TX): one
+	 * interrupt per byte underran the transmitter and sent zero bytes
+	 * under a valid CRC
+	 */
+	dmas = <&dmamux1 0 58 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_VERY_HIGH)>,
+	       <&dmamux1 1 59 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_VERY_HIGH)>;
+	dma-names = "rx", "tx";
 };
