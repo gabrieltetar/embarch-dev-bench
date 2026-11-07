@@ -1032,23 +1032,6 @@ static bool scan_seen_ad_record(struct bt_data *data, void *user_data)
 	return true;
 }
 
-/* How many of the advertisers recorded this scan advertised a local name.
- * The `fail_reason` census reports this alongside `scan_seen_len` so a reader
- * can tell a short list from a partial one: the name list holds only named
- * advertisers, and before this the difference between "these are all of them"
- * and "these are the two that happened to have names" was invisible. */
-static uint8_t scan_seen_named_count(void)
-{
-	uint8_t named = 0;
-
-	for (uint8_t i = 0; i < scan_seen_len; i++) {
-		if (scan_seen[i].name[0] != '\0') {
-			named++;
-		}
-	}
-	return named;
-}
-
 /* One line per advertiser seen, emitted through the bridge's log sink from
  * the dispatch thread once a scan has given up -- on **either** filter path.
  * It used to run only for a name-filtered scan, so a `BleConnect` filtered by
@@ -1076,93 +1059,22 @@ static void report_scan_seen(void)
 	}
 }
 
-/* The two markers `connect_as_central` can append to a `no name match`
- * `fail_reason`, and why they must stay two: `SCAN_SEEN_TRUNCATED_MARKER`
- * means the *name list* ran out of the 64-byte `fail_reason` before it ran
- * out of named advertisers -- reached at three or four names, the common
- * case. `SCAN_SEEN_OVERFLOW_MARKER` means the *census itself*
- * (`SCAN_SEEN_MAX` above) dropped advertisers because more than 256 distinct
- * addresses showed up -- rare (needs 256 advertisers to ever fire) but not
- * mutually exclusive with the first: a census that overflowed can *also* be
- * the one whose name list ran out of room. When both hold, both markers are
- * written, concatenated (decision 45) -- collapsing them into one marker, or
- * silently keeping only one, would tell a reader something was cut without
- * saying which of two very different things happened, in exactly the case
- * where both happened. */
-/* `SCAN_SEEN_PREFIX` is a format, not a literal: the two counts say how many
- * advertisers were on air and how many of those advertised a name, so a reader
- * can tell from the `fail_reason` alone how much of the census the name list
- * could ever have shown. `SCAN_SEEN_PREFIX_MAX_LEN` is its worst-case rendered
- * length -- three digits each, since both counts are bounded by SCAN_SEEN_MAX
- * (256) and `%u` of that is at most three characters. */
-#define SCAN_SEEN_PREFIX "no name match; %u/%u named"
-#define SCAN_SEEN_PREFIX_MAX_LEN (sizeof("no name match; 256/256 named") - 1)
-#define SCAN_SEEN_NAMES_SEP ": "
-#define SCAN_SEEN_TRUNCATED_MARKER " (truncated)"
-#define SCAN_SEEN_OVERFLOW_MARKER " (census full)"
-
-/* There must be room in the 64-byte `fail_reason` for *both* markers
- * concatenated *and* at least the prefix -- otherwise the combined case
- * above would itself get silently cut, the exact failure this budgeting
- * exists to prevent. */
-BUILD_ASSERT(SCAN_SEEN_PREFIX_MAX_LEN + (sizeof(SCAN_SEEN_NAMES_SEP) - 1) +
-		     (sizeof(SCAN_SEEN_TRUNCATED_MARKER) - 1) +
-		     (sizeof(SCAN_SEEN_OVERFLOW_MARKER) - 1) <
-	     OUTCOME_MAX_FAIL_REASON_LEN,
+/* The `no name match` `fail_reason` is composed by scan_seen_names.c, where
+ * the ztest suite reaches it (decision 52); its prefix, markers and budget
+ * are documented there. These two are what make its refusals unreachable
+ * from here: room in the 64-byte `fail_reason` for the prefix and *both*
+ * markers -- otherwise the combined case would itself get cut -- and counts
+ * that fit the prefix's three digits. */
+BUILD_ASSERT(SCAN_SEEN_FAIL_REASON_FIXED_LEN < OUTCOME_MAX_FAIL_REASON_LEN,
 	     "no room left for any names");
+BUILD_ASSERT(SCAN_SEEN_MAX <= SCAN_SEEN_NAMES_MAX_SEEN, "census counts overflow the prefix");
 
-/* Comma-separated list of the names seen this scan, into a static buffer --
- * the compact form that fits an `Outcome`'s 64-byte `fail_reason`. The full
- * per-advertiser detail goes through `report_scan_seen` instead.
- *
- * The requested name is deliberately not repeated by the caller: the caller
- * already knows what it asked for, whereas the names actually on the air are
- * the part it cannot get any other way. Echoing both truncated the list
- * exactly where it mattered -- found the first time this ran on a real bench,
- * where the one interesting name got cut in half.
- *
- * `max_len` is the number of bytes the caller can actually spend on this list
- * once its own prefix and marker suffix are accounted for -- not
- * `sizeof(summary)`. Budgeting here rather than against the full 65-byte
- * buffer is what closes the double-truncation this replaced: the old version
- * filled its own buffer to the brim and then `outcome_fail`'s `vsnprintk` cut
- * the *combined* string a second time, silently, wherever the 64-byte
- * `fail_reason` cap actually fell.
- *
- * `*truncated` is set when a name existed but did not fit -- distinct from
- * `scan_seen_overflowed`, which means the 256-entry census itself missed
- * advertisers. Each is reported through its own marker (see
- * `connect_as_central`), and the two can both be set on the same call --
- * `connect_as_central` concatenates both markers in that case rather than
- * reporting only one. */
-static const char *scan_seen_names_summary(size_t max_len, bool *truncated)
+/* `scan_seen_name_fn` over this scan's census: "" for an advertiser that sent
+ * no name. */
+static const char *scan_seen_name_at(size_t index, const void *ctx)
 {
-	static char summary[OUTCOME_MAX_FAIL_REASON_LEN + 1];
-	size_t used = 0;
-	uint8_t named = 0;
-
-	*truncated = false;
-	summary[0] = '\0';
-
-	for (uint8_t i = 0; i < scan_seen_len; i++) {
-		if (scan_seen[i].name[0] == '\0') {
-			continue;
-		}
-
-		if (!scan_seen_names_append(summary, sizeof(summary), max_len, &used,
-					     (named == 0) ? "" : ", ", scan_seen[i].name)) {
-			*truncated = true;
-			break; /* summary holds only complete entries -- no partial fragment */
-		}
-		named++;
-	}
-	/* Empty rather than a phrase: the caller's own prefix now carries both
-	 * counts, so `0/10 named` already says "advertisers seen, none named"
-	 * and `0/0 named` already says "nothing advertising at all" -- in
-	 * fewer bytes, and without two strings that have to stay in step with
-	 * the counts beside them. The caller omits its separator when this is
-	 * empty. */
-	return summary;
+	ARG_UNUSED(ctx);
+	return scan_seen[index].name;
 }
 
 static void scan_cb(const bt_addr_le_t *addr, int8_t rssi, uint8_t adv_type,
@@ -1306,47 +1218,22 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 			/* A name filter that matched nothing is reported as a
 			 * Fail naming what *was* advertised, not as a bare
 			 * TimedOut: "nothing called X appeared, but these did"
-			 * is actionable. */
+			 * is actionable. The requested name is deliberately
+			 * not repeated -- the caller knows what it asked for,
+			 * and echoing it cut the list exactly where it
+			 * mattered, the first time this ran on a real bench. */
+			char reason[OUTCOME_MAX_FAIL_REASON_LEN + 1];
 
-			/* Budgeting the name list against `name_budget` (rather
-			 * than the full `fail_reason` size) is what guarantees
-			 * whichever marker(s) apply always have room: the final
-			 * `vsnprintk` in `outcome_fail` never has to truncate the
-			 * combined string, so it can't silently eat a marker the
-			 * way the old unbudgeted version could. Both markers are
-			 * reserved unconditionally -- `scan_seen_overflowed` is
-			 * already known at this point, so its marker is reserved
-			 * only when it will actually be written -- reserving a
-			 * marker known not to fire spent 14 of the 64 bytes on
-			 * nothing, in the overwhelmingly common case where the
-			 * census did not overflow. `names_truncated` is the one
-			 * that genuinely cannot be known until
-			 * `scan_seen_names_summary` returns, so *its* marker is
-			 * reserved unconditionally. */
-			size_t marker_budget =
-				(sizeof(SCAN_SEEN_TRUNCATED_MARKER) - 1) +
-				(scan_seen_overflowed ? (sizeof(SCAN_SEEN_OVERFLOW_MARKER) - 1)
-						      : 0);
-			size_t name_budget = OUTCOME_MAX_FAIL_REASON_LEN -
-					     SCAN_SEEN_PREFIX_MAX_LEN -
-					     (sizeof(SCAN_SEEN_NAMES_SEP) - 1) - marker_budget;
-			uint8_t named_total = scan_seen_named_count();
-			bool names_truncated = false;
-			const char *summary = scan_seen_names_summary(name_budget,
-								       &names_truncated);
-
-			/* Both markers are written when both conditions hold --
-			 * decision 45's combined case. Neither marker names the
-			 * other away; a reader who sees only "(truncated)" must
-			 * be able to trust that the census itself did not also
-			 * overflow. */
-			return outcome_fail(SCAN_SEEN_PREFIX "%s%s%s%s",
-					    (unsigned int)named_total,
-					    (unsigned int)scan_seen_len,
-					    (summary[0] != '\0') ? SCAN_SEEN_NAMES_SEP : "",
-					    summary,
-					    names_truncated ? SCAN_SEEN_TRUNCATED_MARKER : "",
-					    scan_seen_overflowed ? SCAN_SEEN_OVERFLOW_MARKER : "");
+			if (!scan_seen_names_fail_reason(reason, sizeof(reason), scan_seen_len,
+							 scan_seen_name_at, NULL,
+							 scan_seen_overflowed)) {
+				/* Unreachable: the two BUILD_ASSERTs above fix
+				 * both bounds it refuses on. */
+				__ASSERT(false, "%s: census fail_reason did not compose",
+					 __func__);
+				return outcome_fail("no name match");
+			}
+			return outcome_fail("%s", reason);
 		}
 		return outcome_timed_out();
 	}

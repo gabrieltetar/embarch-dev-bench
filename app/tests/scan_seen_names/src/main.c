@@ -9,8 +9,10 @@
  */
 #include <string.h>
 
+#include <zephyr/sys/util.h>
 #include <zephyr/ztest.h>
 
+#include "ble_bridge.h"
 #include "scan_seen_names.h"
 
 ZTEST(scan_seen_names, test_names_that_fit_are_joined_with_separators)
@@ -101,6 +103,110 @@ ZTEST(scan_seen_names, test_a_name_exactly_at_the_boundary_is_rejected_not_squee
 	zassert_false(fit);
 	zassert_str_equal(buf, "");
 	zassert_equal(used, 0);
+}
+
+/* ---- the composed `fail_reason` (decision 52) ----------------------------
+ *
+ * Against the real `fail_reason` size from ble_bridge.h, so the budget
+ * pinned here is the one a bench run spends: 22 bytes of names normally, 8
+ * when `(census full)` is reserved too. */
+
+static const char *name_from_array(size_t index, const void *ctx)
+{
+	const char *const *names = ctx;
+
+	return names[index];
+}
+
+static const char *the_same_long_name(size_t index, const void *ctx)
+{
+	ARG_UNUSED(index);
+	ARG_UNUSED(ctx);
+	return "abcdefghijklmnop";
+}
+
+static char reason[OUTCOME_MAX_FAIL_REASON_LEN + 1];
+
+static void compose(const char *const *names, size_t seen, bool overflowed)
+{
+	zassert_true(scan_seen_names_fail_reason(reason, sizeof(reason), seen, name_from_array,
+						 names, overflowed),
+		     "composes");
+	zassert_true(strlen(reason) <= OUTCOME_MAX_FAIL_REASON_LEN, "and fits fail_reason");
+}
+
+ZTEST(scan_seen_names, test_nameless_advertisers_count_but_are_not_listed)
+{
+	static const char *const names[] = {"", "ab", "", "cd"};
+
+	compose(names, ARRAY_SIZE(names), false);
+	zassert_str_equal(reason, "no name match; 2/4 named: 'ab', 'cd'");
+}
+
+ZTEST(scan_seen_names, test_none_named_drops_the_list_and_its_separator)
+{
+	static const char *const names[] = {"", ""};
+
+	compose(names, ARRAY_SIZE(names), false);
+	zassert_str_equal(reason, "no name match; 0/2 named");
+
+	compose(names, 0, false);
+	zassert_str_equal(reason, "no name match; 0/0 named", "nothing advertising at all");
+}
+
+ZTEST(scan_seen_names, test_a_list_past_its_budget_is_cut_at_a_whole_name)
+{
+	static const char *const names[] = {"alpha", "bravo", "charlie", "delta"};
+
+	/* 'alpha', 'bravo' is 16 of the 22 bytes; ", 'charlie'" would make 27. */
+	compose(names, ARRAY_SIZE(names), false);
+	zassert_str_equal(reason, "no name match; 4/4 named: 'alpha', 'bravo' (truncated)");
+}
+
+ZTEST(scan_seen_names, test_census_full_is_reserved_only_when_it_fires)
+{
+	static const char *const names[] = {"alpha", "bravo"};
+
+	/* Not overflowed: both names fit, so `(census full)`'s 14 bytes were not
+	 * spent on a marker that does not fire. */
+	compose(names, ARRAY_SIZE(names), false);
+	zassert_str_equal(reason, "no name match; 2/2 named: 'alpha', 'bravo'");
+
+	/* Overflowed: 8 bytes are left for names, and both markers are written
+	 * -- decision 45's combined case. */
+	compose(names, ARRAY_SIZE(names), true);
+	zassert_str_equal(reason, "no name match; 2/2 named: 'alpha' (truncated) (census full)");
+}
+
+ZTEST(scan_seen_names, test_census_full_alone_when_the_list_fits)
+{
+	static const char *const names[] = {"ab"};
+
+	compose(names, ARRAY_SIZE(names), true);
+	zassert_str_equal(reason, "no name match; 1/1 named: 'ab' (census full)");
+}
+
+ZTEST(scan_seen_names, test_the_widest_prefix_still_leaves_room_for_both_markers)
+{
+	/* Every advertiser named, none fitting even alone: no list, no
+	 * separator, both markers, inside 64 bytes. */
+	zassert_true(scan_seen_names_fail_reason(reason, sizeof(reason), 256, the_same_long_name,
+						 NULL, true));
+	zassert_str_equal(reason, "no name match; 256/256 named (truncated) (census full)");
+}
+
+ZTEST(scan_seen_names, test_a_fail_reason_it_cannot_budget_is_refused)
+{
+	char small[SCAN_SEEN_FAIL_REASON_FIXED_LEN + 1];
+
+	zassert_false(scan_seen_names_fail_reason(small, sizeof(small), 1, the_same_long_name,
+						  NULL, false),
+		      "no byte left for a name");
+	zassert_str_equal(small, "", "and nothing written");
+	zassert_false(scan_seen_names_fail_reason(reason, sizeof(reason),
+						  SCAN_SEEN_NAMES_MAX_SEEN + 1, the_same_long_name,
+						  NULL, false),
+		      "a count the prefix cannot print in three digits");
 }
 
 ZTEST_SUITE(scan_seen_names, NULL, NULL, NULL, NULL, NULL);
