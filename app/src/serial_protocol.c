@@ -90,6 +90,14 @@ static int pc_read_str(const uint8_t *in, size_t in_len, size_t *pos, char *out,
  * this firmware assigns no meaning -- and no numeric type -- to a stream
  * payload at all.
  */
+/* Walks a length-prefixed sequence of `elem_size`-byte elements without
+ * keeping it. The prefix is compared against the bytes left *before* any
+ * arithmetic: a crafted varint near 2^64 would otherwise wrap the multiply,
+ * the `(size_t)` narrowing (32 bits on both targets) or the add, pass the
+ * bound and move `*pos` backwards -- the "untrusted, possibly crafted" input
+ * `cobs_decode` refuses to be overflowed by. `pc_read_varint` leaves
+ * `*pos <= in_len`, so the subtraction cannot wrap. Every caller passes a
+ * non-zero `elem_size`. */
 static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, size_t elem_size)
 {
 	uint64_t len;
@@ -97,12 +105,10 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 	if (pc_read_varint(in, in_len, pos, &len) != 0) {
 		return -1;
 	}
-	size_t n = (size_t)len * elem_size;
-
-	if (*pos + n > in_len) {
+	if (len > (in_len - *pos) / elem_size) {
 		return -1;
 	}
-	*pos += n;
+	*pos += (size_t)len * elem_size;
 	return 0;
 }
 

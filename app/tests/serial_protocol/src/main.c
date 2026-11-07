@@ -2283,3 +2283,79 @@ ZTEST(serial_protocol, test_a_protocols_span_past_the_byte_cap_is_refused)
 	zassert_not_equal(decode_built(body, n), 0,
 			  "a protocols span past DBM_MAX_PROTOCOLS_WIRE_LEN must be refused");
 }
+
+/* ---- a length prefix the input cannot hold ------------------------------
+ *
+ * `pc_skip_len_prefixed` walks the fields this firmware does not keep. Its
+ * bound used to be `*pos + len * elem_size > in_len`, in wrapping arithmetic,
+ * so a crafted prefix near 2^64 passed it. Both bodies below are laid out so
+ * that the *wrapped* walk lands on bytes that decode cleanly: the old decoder
+ * returned 0 for each, so a refusal here is the bound and not some later
+ * field failing by accident.
+ */
+
+ZTEST(serial_protocol, test_a_length_prefix_near_2_64_is_refused_not_wrapped)
+{
+	uint8_t body[64];
+	size_t n = 0;
+
+	body[n++] = 0x06; /* StudyStart */
+	body[n++] = 0x00; /* steps: empty */
+	body[n++] = 0x00; /* steps_crc */
+	body[n++] = 0x00; /* streams: empty */
+	body[n++] = 0x00; /* streams_crc */
+	body[n++] = 0x00; /* dev_bench_log_level */
+	body[n++] = 0x01; /* protocols: 1 */
+	/* The protocol's name: a length of 2^64 - 1, a ten-byte varint. Wrapped,
+	 * the skip moved the cursor back one byte, onto this varint's own last
+	 * byte, and read it as the source count. */
+	memset(body + n, 0xff, 9);
+	n += 9;
+	body[n++] = 0x01;
+	body[n++] = 0x01;
+	body[n++] = 's'; /* source alias */
+	memset(body + n, 0, 32); /* service + characteristic UUIDs */
+	n += 32;
+	body[n++] = 0x00; /* frames: none */
+	body[n++] = 0x00; /* session: none */
+	body[n++] = 0x00; /* states: none */
+	body[n++] = 0x00; /* protocols_crc */
+
+	zassert_true(n <= sizeof(body), "test body overflowed its own buffer");
+	zassert_not_equal(decode_built(body, n), 0,
+			  "a name longer than the frame must be refused, never walked backwards");
+}
+
+ZTEST(serial_protocol, test_a_uuid_count_near_2_60_is_refused_not_wrapped)
+{
+	uint8_t body[64];
+	size_t n = 0;
+
+	body[n++] = 0x06; /* StudyStart */
+	body[n++] = 0x01; /* steps: 1 */
+	body[n++] = 0x01;
+	body[n++] = 'a';  /* step name */
+	body[n++] = DBM_ACTION_BLE_ADVERTISE;
+	body[n++] = 0x00; /* local_name: None */
+	/* service_uuids: 2^60 sixteen-byte UUIDs, a nine-byte varint. Times 16
+	 * that is 2^64, a skip of zero bytes once it wraps, and narrowed to a
+	 * 32-bit size_t it is zero before the multiply. Either way the old bound
+	 * passed and the walk carried on as if the list were empty. */
+	memset(body + n, 0x80, 8);
+	n += 8;
+	body[n++] = 0x10;
+	body[n++] = 0x64; /* adv_interval_ms = 100 */
+	body[n++] = 0x00; /* timeout_ms */
+	body[n++] = 0x00; /* continue_on_fail */
+	body[n++] = 0x00; /* delay_before_ms */
+	body[n++] = 0x00; /* steps_crc */
+	body[n++] = 0x00; /* streams: empty */
+	body[n++] = 0x00; /* streams_crc */
+	body[n++] = 0x00; /* dev_bench_log_level */
+	body[n++] = 0x00; /* protocols: none */
+	body[n++] = 0x00; /* protocols_crc */
+
+	zassert_true(n <= sizeof(body), "test body overflowed its own buffer");
+	zassert_not_equal(decode_built(body, n), 0,
+			  "a UUID count the frame cannot hold must be refused");
+}
