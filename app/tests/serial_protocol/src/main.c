@@ -2139,6 +2139,110 @@ ZTEST(serial_protocol, test_an_out_of_range_entry_state_is_refused)
 		      "an entry state past the end must be refused");
 }
 
+/* The other three state indices, and `remember`'s variable. Each test breaks
+ * one index of the worked protocol to the first value past the end and drives
+ * the machine to the move that reads it: the run fails by name, in the state
+ * that named it, and nothing indexes past `def->states[]` or
+ * `run->session[]`. The same belt and braces as the entry state above --
+ * `validate_protocol` and Core's pre-flight refuse such a manifest first. */
+static struct eap_protocol_def broken_def;
+
+static struct eap_protocol_def *broken_protocol(void)
+{
+	broken_def = *worked_protocol();
+	return &broken_def;
+}
+
+static void assert_failed_in(const struct eap_run *run, const struct eap_step *step,
+			     uint8_t state, const char *name, const char *reason)
+{
+	zassert_equal(step->kind, EAP_STEP_DONE, "the run ends");
+	zassert_equal(step->outcome.tag, EAP_OUTCOME_FAIL, "as a Fail");
+	zassert_str_equal(step->outcome.fail_reason, reason, "naming what is missing");
+	zassert_equal(eap_run_state(run), state, "without moving");
+	zassert_str_equal(step->final_state, name, "against the state that named it");
+}
+
+ZTEST(serial_protocol, test_an_out_of_range_when_goto_fails_the_run)
+{
+	struct eap_protocol_def *def = broken_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+	uint8_t chunk[200] = {0};
+
+	/* `pumping`'s guard: `when received >= expect_total: goto consuming`. */
+	def->states[1].on_event[0].when[0].goto_state = def->states_len;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 100);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(eap_run_state(&run), 1, "in `pumping` with expect_total = 100");
+
+	/* 200 bytes against 100 expected: the guard holds and names no state. */
+	notify(&run, 2, chunk, sizeof(chunk), &step);
+	assert_failed_in(&run, &step, 1, "pumping", EAP_FAIL_NO_SUCH_STATE);
+}
+
+ZTEST(serial_protocol, test_an_out_of_range_otherwise_fails_the_run)
+{
+	struct eap_protocol_def *def = broken_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+
+	/* `start`'s only arm: `otherwise: goto pumping`. */
+	def->states[0].on_event[0].otherwise = def->states_len;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	assert_failed_in(&run, &step, 0, "start", EAP_FAIL_NO_SUCH_STATE);
+}
+
+ZTEST(serial_protocol, test_an_out_of_range_on_timeout_goto_fails_the_run)
+{
+	struct eap_protocol_def *def = broken_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+
+	/* `pumping`'s stall watchdog: `on_timeout 1500ms retry 0: goto aborting`,
+	 * so the first expiry takes the goto. */
+	def->states[1].on_timeout.goto_state = def->states_len;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	zassert_equal(eap_run_state(&run), 1, "in `pumping`");
+
+	expire(&run, &step);
+	assert_failed_in(&run, &step, 1, "pumping", EAP_FAIL_NO_SUCH_STATE);
+}
+
+ZTEST(serial_protocol, test_an_out_of_range_remember_fails_the_run)
+{
+	struct eap_protocol_def *def = broken_protocol();
+	struct eap_run run;
+	struct eap_step step;
+	uint8_t progress[9];
+
+	/* `start`'s arm remembers `expect_total` (variable 1) from the frame.
+	 * Out of range, that write used to be dropped and the machine moved on
+	 * with the variable still at its initial value. */
+	def->states[0].on_event[0].remember[0].var = def->session_len;
+
+	zassert_equal(eap_run_start(&run, def, 0), 0, NULL);
+	eap_run_enter(&run, &step);
+	progress_frame(progress, 0, 700);
+	notify(&run, 1, progress, sizeof(progress), &step);
+	assert_failed_in(&run, &step, 0, "start", EAP_FAIL_NO_SUCH_VARIABLE);
+	zassert_equal((int)eap_run_session(&run)[1], 0, "and no variable was written");
+}
+
 /* ---- the disclosed capacity limits -------------------------------------
  *
  * Every cap this firmware sets below the crate's own is refused **outright

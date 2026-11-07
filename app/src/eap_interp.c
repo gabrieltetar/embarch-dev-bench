@@ -395,6 +395,19 @@ static void terminal_fail_reason(const char *state, char *out, size_t out_cap)
 	out[n + sl] = '\0';
 }
 
+/* Ends the run as a named `Fail` without moving it, so `final_state` names
+ * the state whose manifest entry was bad. For an index the decoder hands
+ * over unchecked: `validate_protocol` and Core's pre-flight refuse one first,
+ * and this is the last line before it becomes a raw array subscript. Checked
+ * here rather than refused at decode because a refused `StudyStart` says
+ * nothing on the link, and a failed run reaches Core by name (decision 50). */
+static void fail_on_bad_index(struct eap_run *run, struct eap_step *out, const char *reason)
+{
+	run->finished = true;
+	memset(out, 0, sizeof(*out));
+	set_outcome(run, out, EAP_OUTCOME_FAIL, reason);
+}
+
 static void wait_step(const struct eap_state *st, struct eap_step *out)
 {
 	out->kind = EAP_STEP_WAIT;
@@ -498,6 +511,10 @@ static void on_timeout(struct eap_run *run, struct eap_step *out)
 		on_entered(run, out);
 		return;
 	}
+	if (st->on_timeout.goto_state >= run->def->states_len) {
+		fail_on_bad_index(run, out, EAP_FAIL_NO_SUCH_STATE);
+		return;
+	}
 	run->state = st->on_timeout.goto_state;
 	eap_run_enter(run, out);
 }
@@ -542,12 +559,17 @@ static void on_notify(struct eap_run *run, uint8_t source, const uint8_t *payloa
 	for (uint8_t i = 0; i < arm->remember_len; i++) {
 		int64_t v;
 
+		/* Checked before the value, so a bad index fails whether or not
+		 * this frame's operands resolve: the manifest is wrong either way,
+		 * and a dropped write would leave the variable silently stale. */
+		if (arm->remember[i].var >= run->def->session_len) {
+			fail_on_bad_index(run, out, EAP_FAIL_NO_SUCH_VARIABLE);
+			return;
+		}
 		if (!eval_expr(&arm->remember[i].value, run, frame, payload, payload_len, &v)) {
 			continue;
 		}
-		if (arm->remember[i].var < run->def->session_len) {
-			run->session[arm->remember[i].var] = v;
-		}
+		run->session[arm->remember[i].var] = v;
 	}
 
 	bool have_target = false;
@@ -579,6 +601,10 @@ static void on_notify(struct eap_run *run, uint8_t source, const uint8_t *payloa
 		return;
 	}
 
+	if (target >= run->def->states_len) {
+		fail_on_bad_index(run, out, EAP_FAIL_NO_SUCH_STATE);
+		return;
+	}
 	run->state = target;
 	eap_run_enter(run, out);
 }

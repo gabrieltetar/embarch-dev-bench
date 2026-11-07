@@ -54,6 +54,13 @@ enum eap_outcome_tag {
 	EAP_OUTCOME_TIMED_OUT = 2,
 };
 
+/* The `fail_reason` of a run whose manifest names something it does not have:
+ * a `when … goto`, `otherwise` or `on_timeout` naming no state, or a
+ * `remember` naming no session variable. The run fails in the state that
+ * named it. No comma and no quote -- the CSV rule every reason follows. */
+#define EAP_FAIL_NO_SUCH_STATE    "protocol goto names no state"
+#define EAP_FAIL_NO_SUCH_VARIABLE "protocol remember names no session variable"
+
 /* Largest `write` payload a manifest can assemble: every field of an
  * `on_enter` write at its widest. Sized from the grammar rather than borrowed
  * from the link protocol's own DBM_MAX_PAYLOAD_LEN, which would be 512 bytes
