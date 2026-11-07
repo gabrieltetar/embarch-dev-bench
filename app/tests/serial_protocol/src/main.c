@@ -2305,13 +2305,28 @@ static size_t build_protocol_study_start(uint8_t *out, uint8_t protocols, uint8_
 	return n;
 }
 
+/* What the last `decode_built` was refused for, if it was over a cap. */
+static struct dbm_decode_refusal refusal;
+
 static int decode_built(const uint8_t *body, size_t body_len)
 {
 	uint8_t framed[DBM_MAX_FRAME_LEN];
 	size_t framed_len = test_cobs_encode(body, body_len, framed);
 
 	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
-	return dbm_decode_frame(framed, framed_len, &study_start_decoded);
+	return dbm_decode_frame_why(framed, framed_len, &study_start_decoded, &refusal);
+}
+
+/* A cap refusal is told apart from a malformed frame, and names the cap, the
+ * value the frame carried and this bench's limit -- the three things the
+ * `LogLine` in main.c's `receive_message` says. */
+static void assert_refused_over(int status, const char *cap, uint64_t value, uint32_t limit)
+{
+	zassert_equal(status, DBM_DECODE_OVER_CAP, "refused as over a cap, not as malformed");
+	zassert_not_null(refusal.cap, "the refusal names its cap");
+	zassert_str_equal(refusal.cap, cap, "the cap it was over");
+	zassert_equal(refusal.value, value, "the value the frame carried");
+	zassert_equal(refusal.limit, limit, "this bench's limit");
 }
 
 ZTEST(serial_protocol, test_a_protocol_within_every_cap_decodes)
@@ -2336,9 +2351,10 @@ ZTEST(serial_protocol, test_more_protocols_than_this_bench_holds_is_refused)
 	size_t len = build_protocol_study_start(body, DBM_MAX_PROTOCOLS_PER_STUDY + 1,
 						EAP_MAX_EVENT_ARMS_PER_STATE);
 
-	zassert_not_equal(decode_built(body, len), 0,
-			  "protocols_len beyond struct eap_protocol_def[]'s bound must be "
-			  "rejected, not read out of bounds");
+	/* Beyond struct eap_protocol_def[]'s bound: refused, not read out of
+	 * bounds -- and named. */
+	assert_refused_over(decode_built(body, len), "protocols", DBM_MAX_PROTOCOLS_PER_STUDY + 1,
+			    DBM_MAX_PROTOCOLS_PER_STUDY);
 }
 
 ZTEST(serial_protocol, test_more_event_arms_than_this_bench_holds_is_refused)
@@ -2351,8 +2367,8 @@ ZTEST(serial_protocol, test_more_event_arms_than_this_bench_holds_is_refused)
 	 * firmware cannot hold it and says so rather than dropping the third
 	 * transition, which would be a state machine that runs and branches
 	 * wrongly. */
-	zassert_not_equal(decode_built(body, len), 0,
-			  "an event-arm count past this firmware's cap must be rejected");
+	assert_refused_over(decode_built(body, len), "event arms in a state",
+			    EAP_MAX_EVENT_ARMS_PER_STATE + 1, EAP_MAX_EVENT_ARMS_PER_STATE);
 }
 
 ZTEST(serial_protocol, test_a_protocols_span_past_the_byte_cap_is_refused)
@@ -2384,8 +2400,34 @@ ZTEST(serial_protocol, test_a_protocols_span_past_the_byte_cap_is_refused)
 	body[n++] = 0x00; /* protocols_crc */
 
 	zassert_true(n <= sizeof(body), "test body overflowed its own buffer");
-	zassert_not_equal(decode_built(body, n), 0,
-			  "a protocols span past DBM_MAX_PROTOCOLS_WIRE_LEN must be refused");
+	/* The span is the name's two-byte length, the name, and the four empty
+	 * counts after it. */
+	assert_refused_over(decode_built(body, n), "protocol bytes", name_len + 2 + 4,
+			    DBM_MAX_PROTOCOLS_WIRE_LEN);
+}
+
+ZTEST(serial_protocol, test_a_study_over_the_step_cap_is_refused_by_name)
+{
+	uint8_t body[8];
+	size_t n = 0;
+
+	/* The count is all the decoder reads: the cap fires before the first
+	 * step, so nothing after it needs to be well formed. */
+	body[n++] = 0x06; /* StudyStart */
+	body[n++] = DBM_MAX_STEPS_PER_STUDY + 1;
+
+	assert_refused_over(decode_built(body, n), "steps", DBM_MAX_STEPS_PER_STUDY + 1,
+			    DBM_MAX_STEPS_PER_STUDY);
+}
+
+ZTEST(serial_protocol, test_a_malformed_study_start_names_no_cap)
+{
+	uint8_t body[] = {0x06, 0x01, 0x05, 'a'}; /* one step whose name stops short */
+
+	/* Line noise, not a study too big for the bench: -1, which the link
+	 * resyncs past without a word, and no cap to name. */
+	zassert_equal(decode_built(body, sizeof(body)), -1, "a truncated body is malformed");
+	zassert_is_null(refusal.cap, "and is not reported as over a cap");
 }
 
 /* ---- a length prefix the input cannot hold ------------------------------

@@ -399,8 +399,9 @@ static void terminal_fail_reason(const char *state, char *out, size_t out_cap)
  * the state whose manifest entry was bad. For an index the decoder hands
  * over unchecked: `validate_protocol` and Core's pre-flight refuse one first,
  * and this is the last line before it becomes a raw array subscript. Checked
- * here rather than refused at decode because a refused `StudyStart` says
- * nothing on the link, and a failed run reaches Core by name (decision 50). */
+ * here rather than refused at decode because it then holds for any
+ * definition, decoded or built, and the `Fail` lands on the step that ran
+ * (decision 50 and its amendment). */
 static void fail_on_bad_index(struct eap_run *run, struct eap_step *out, const char *reason)
 {
 	run->finished = true;

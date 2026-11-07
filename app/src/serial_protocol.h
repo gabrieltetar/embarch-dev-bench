@@ -927,4 +927,23 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
  * decoding a `Study`, not a `StudyStart` -- doesn't fit this call site). */
 int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out);
 
+/* Returned for a `StudyStart` that decodes as far as one of this bench's
+ * decode-time caps and is over it -- legal on the wire, too big for this
+ * bench. -1 stays "malformed", which the link resyncs past without a word;
+ * this one the caller says out loud (spec §3: a capacity limit is rejected by
+ * name). */
+#define DBM_DECODE_OVER_CAP (-2)
+
+/* Which cap a DBM_DECODE_OVER_CAP was for. */
+struct dbm_decode_refusal {
+	const char *cap; /* the cap's name, a string literal; NULL if none fired */
+	uint64_t value;  /* what the frame carried */
+	uint32_t limit;  /* this bench's cap */
+};
+
+/* `dbm_decode_frame`, and on DBM_DECODE_OVER_CAP also fills `why` (when
+ * non-NULL). `why->cap` is NULL after any other result. */
+int dbm_decode_frame_why(const uint8_t *in, size_t in_len, struct dev_bench_message *out,
+			 struct dbm_decode_refusal *why);
+
 #endif /* EMBARCH_DEV_BENCH_SERIAL_PROTOCOL_H_ */

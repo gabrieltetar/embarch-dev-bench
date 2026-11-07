@@ -7,7 +7,8 @@
  *
  * The only thing this file has to say is the baud rate. `zephyr,console` on
  * this board is already `&uart20` (nrf54l_05_10_15_cpuapp_common.dtsi's own
- * chosen block), wired through the DK's onboard J-Link OB to VCOM0 -- so
+ * chosen block), wired through the DK's onboard J-Link OB to VCOM1, USB
+ * interface 2 (decision 43: enrol it with `link_port_interface = 2`) -- so
  * unlike the ESP32-C5, which had to be moved off its native USB-Serial/JTAG
  * peripheral onto a separate bridge chip, nothing here needs repointing.
  * What does need overriding is `current-speed`: the board's upstream default
@@ -15,8 +16,8 @@
  * DEV_BENCH_BAUD` (1 Mbaud) exactly or Core's very first `Hello` fails to
  * decode.
  *
- * uart30 is left at its own 115200 default and unused. It is a real second
- * VCOM on this DK (VCOM1) and it is deliberately NOT given a role here:
+ * uart30 is left at its own 115200 default and unused, and it is
+ * deliberately NOT given a role here:
  * app/prj.conf's decision-7 block turns off every log backend that would
  * write raw text, so there is nothing left that wants a second console, and
  * a second enabled UART would only add a candidate for
@@ -44,7 +45,7 @@
 	 *
 	 * The DK already assigns the pins: `uart20_default` carries UART_RTS on
 	 * P1.06 and UART_CTS on P1.07 alongside TX P1.04 / RX P1.05, routed
-	 * through the onboard J-Link OB to VCOM0. Nothing here rewires
+	 * through the onboard J-Link OB to VCOM1. Nothing here rewires
 	 * anything -- it only asks the UARTE to honour lines the board file
 	 * already declared. */
 	hw-flow-control;

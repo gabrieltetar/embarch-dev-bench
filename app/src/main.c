@@ -876,7 +876,8 @@ static int link_rx_byte(uint8_t *byte)
 /* Blocks until one full COBS frame has been read off the link UART and
  * decoded. Malformed frames are dropped silently and the reader resyncs on
  * the next 0x00 delimiter, per COBS's own resync property
- * (`embarch-study-designer` decision 10). */
+ * (`embarch-study-designer` decision 10). A `StudyStart` over one of this
+ * bench's caps is dropped too, and named in a `LogLine`. */
 static int receive_message(struct dev_bench_message *out)
 {
 	/* DBM_MAX_INBOUND_FRAME_LEN, not DBM_MAX_FRAME_LEN: Core sends dev-bench
@@ -912,11 +913,26 @@ static int receive_message(struct dev_bench_message *out)
 			continue;
 		}
 		if (byte == 0x00) {
-			int status = (rx_len > 0) ? dbm_decode_frame(rx_buf, rx_len, out) : -1;
+			struct dbm_decode_refusal why;
+			int status = (rx_len > 0) ? dbm_decode_frame_why(rx_buf, rx_len, out, &why)
+						  : -1;
 
 			rx_len = 0;
 			if (status == 0) {
 				return 0;
+			}
+			if (status == DBM_DECODE_OVER_CAP) {
+				/* Legal on the wire, too big for this bench: say which
+				 * cap, so Core's log tells this apart from a dead link.
+				 * A malformed frame stays a silent resync -- one line
+				 * per frame of line noise would bury the real ones. */
+				char note[DBM_MAX_LOG_LINE_LEN + 1];
+
+				snprintk(note, sizeof(note),
+					 "StudyStart refused: %llu %s over the bench cap of %u",
+					 (unsigned long long)why.value, why.cap,
+					 (unsigned int)why.limit);
+				send_log_line(note);
 			}
 			continue;
 		}

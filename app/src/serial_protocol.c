@@ -112,6 +112,25 @@ static int pc_skip_len_prefixed(const uint8_t *in, size_t in_len, size_t *pos, s
 	return 0;
 }
 
+/* Where the decode in progress records a cap refusal. Decoding is
+ * single-threaded already -- `dbm_decode_frame_why` stages into a static
+ * buffer -- so one pointer, set only for the length of one call, is enough. */
+static struct dbm_decode_refusal *decode_refusal;
+
+/* Every decode-time cap refuses through here. It still returns -1, so no
+ * caller on the way out changes; `dbm_decode_frame_why` sees the record and
+ * returns DBM_DECODE_OVER_CAP instead. A malformed frame never calls it, which
+ * is what keeps "too big for this bench" and "line noise" apart. */
+static int refuse_over_cap(const char *cap, uint64_t value, uint32_t limit)
+{
+	if (decode_refusal != NULL) {
+		decode_refusal->cap = cap;
+		decode_refusal->value = value;
+		decode_refusal->limit = limit;
+	}
+	return -1;
+}
+
 /* Reads one postcard-encoded `StreamTap` (embarch-study-designer
  * src/streams.rs), advancing *pos past it and filling `out`
  * with the part this node acts on. Returns 0 on success, -1 on a malformed
@@ -386,7 +405,7 @@ static int pc_read_eap_write(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_WRITE_FIELDS) {
-		return -1;
+		return refuse_over_cap("write fields", len, EAP_MAX_WRITE_FIELDS);
 	}
 	out->fields_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -428,7 +447,7 @@ static int pc_read_eap_event_arm(const uint8_t *raw, size_t raw_len, size_t *pos
 		return -1;
 	}
 	if (len > EAP_MAX_REMEMBER_PER_ARM) {
-		return -1;
+		return refuse_over_cap("remembers in an arm", len, EAP_MAX_REMEMBER_PER_ARM);
 	}
 	out->remember_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -445,7 +464,7 @@ static int pc_read_eap_event_arm(const uint8_t *raw, size_t raw_len, size_t *pos
 		return -1;
 	}
 	if (len > EAP_MAX_GUARDS_PER_ARM) {
-		return -1;
+		return refuse_over_cap("guards in an arm", len, EAP_MAX_GUARDS_PER_ARM);
 	}
 	out->when_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -526,7 +545,7 @@ static int pc_read_eap_state(const uint8_t *raw, size_t raw_len, size_t *pos,
 		 * name rather than truncated, because a state machine missing a
 		 * transition runs and branches wrongly, which is strictly worse
 		 * than one that does not run. See EAP_MAX_EVENT_ARMS_PER_STATE. */
-		return -1;
+		return refuse_over_cap("event arms in a state", len, EAP_MAX_EVENT_ARMS_PER_STATE);
 	}
 	out->on_event_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -584,7 +603,11 @@ static int pc_read_eap_frame(const uint8_t *raw, size_t raw_len, size_t *pos,
 		if (pc_read_varint(raw, raw_len, pos, &len) != 0) {
 			return -1;
 		}
-		if (len > EAP_MAX_SELECT_MATCH_LEN || *pos + len > raw_len) {
+		if (len > EAP_MAX_SELECT_MATCH_LEN) {
+			return refuse_over_cap("select bytes in a frame", len,
+					       EAP_MAX_SELECT_MATCH_LEN);
+		}
+		if (*pos + len > raw_len) {
 			return -1;
 		}
 		memcpy(out->select_eq, raw + *pos, (size_t)len);
@@ -596,7 +619,7 @@ static int pc_read_eap_frame(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_FRAME_FIELDS) {
-		return -1;
+		return refuse_over_cap("fields in a frame", len, EAP_MAX_FRAME_FIELDS);
 	}
 	out->fields_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -620,7 +643,7 @@ static int pc_read_eap_frame(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_FRAME_SPANS) {
-		return -1;
+		return refuse_over_cap("spans in a frame", len, EAP_MAX_FRAME_SPANS);
 	}
 	out->spans_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -674,7 +697,7 @@ static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_SOURCES_PER_PROTOCOL) {
-		return -1;
+		return refuse_over_cap("sources in a protocol", len, EAP_MAX_SOURCES_PER_PROTOCOL);
 	}
 	out->sources_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -695,7 +718,7 @@ static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_FRAMES_PER_PROTOCOL) {
-		return -1;
+		return refuse_over_cap("frames in a protocol", len, EAP_MAX_FRAMES_PER_PROTOCOL);
 	}
 	out->frames_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -709,7 +732,8 @@ static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_SESSION_VARS) {
-		return -1;
+		return refuse_over_cap("session variables in a protocol", len,
+				       EAP_MAX_SESSION_VARS);
 	}
 	out->session_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -726,7 +750,7 @@ static int pc_read_protocol_def(const uint8_t *raw, size_t raw_len, size_t *pos,
 		return -1;
 	}
 	if (len > EAP_MAX_STATES_PER_PROTOCOL) {
-		return -1;
+		return refuse_over_cap("states in a protocol", len, EAP_MAX_STATES_PER_PROTOCOL);
 	}
 	out->states_len = (uint8_t)len;
 	for (uint32_t i = 0; i < (uint32_t)len; i++) {
@@ -1423,7 +1447,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		if (steps_len > DBM_MAX_STEPS_PER_STUDY) {
-			return -1;
+			return refuse_over_cap("steps", steps_len, DBM_MAX_STEPS_PER_STUDY);
 		}
 
 		size_t steps_start_pos = pos;
@@ -1646,7 +1670,9 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 					 * it named is the silently-empty
 					 * capture this whole family of
 					 * decisions keeps being opened by. */
-					return -1;
+					return refuse_over_cap("monitor targets in a step",
+							       targets_len,
+							       DBM_MAX_MONITOR_TARGETS);
 				}
 				if (pos + (size_t)targets_len * 32 > raw_len) {
 					return -1;
@@ -1776,7 +1802,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		if (streams_len > DBM_MAX_STREAMS_PER_STUDY) {
-			return -1;
+			return refuse_over_cap("taps", streams_len, DBM_MAX_STREAMS_PER_STUDY);
 		}
 
 		size_t streams_start_pos = pos;
@@ -1841,7 +1867,7 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 			return -1;
 		}
 		if (protocols_len > DBM_MAX_PROTOCOLS_PER_STUDY) {
-			return -1;
+			return refuse_over_cap("protocols", protocols_len, DBM_MAX_PROTOCOLS_PER_STUDY);
 		}
 
 		size_t protocols_start_pos = pos;
@@ -1863,7 +1889,9 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		 * firmware could not have received at all is caught earlier
 		 * still, by the frame-length check in dbm_decode_frame. */
 		if (protocols_end_pos - protocols_start_pos > DBM_MAX_PROTOCOLS_WIRE_LEN) {
-			return -1;
+			return refuse_over_cap("protocol bytes",
+					       protocols_end_pos - protocols_start_pos,
+					       DBM_MAX_PROTOCOLS_WIRE_LEN);
 		}
 
 		uint64_t protocols_crc;
@@ -2055,11 +2083,15 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 	}
 }
 
-int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out)
+int dbm_decode_frame_why(const uint8_t *in, size_t in_len, struct dev_bench_message *out,
+			 struct dbm_decode_refusal *why)
 {
 	/* `static`, not stack-local -- see dbm_encode_frame's own comment above. */
 	static uint8_t raw[DBM_MAX_RAW_LEN];
+	struct dbm_decode_refusal unread;
+	struct dbm_decode_refusal *sink = (why != NULL) ? why : &unread;
 
+	memset(sink, 0, sizeof(*sink));
 	if (in_len == 0 || in_len > DBM_MAX_FRAME_LEN) {
 		return -1;
 	}
@@ -2068,5 +2100,18 @@ int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message 
 	if (raw_len == 0 || raw_len > sizeof(raw)) {
 		return -1;
 	}
-	return decode_body(raw, raw_len, out);
+
+	decode_refusal = sink;
+	int status = decode_body(raw, raw_len, out);
+
+	decode_refusal = NULL;
+	if (status != 0 && sink->cap != NULL) {
+		return DBM_DECODE_OVER_CAP;
+	}
+	return status;
+}
+
+int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out)
+{
+	return dbm_decode_frame_why(in, in_len, out, NULL);
 }
