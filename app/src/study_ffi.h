@@ -16,6 +16,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The crate's own bounds, read from its source at configure time (decision 56). */
+#include "crate_limits.h"
+
 /* embarch-study-designer's DEV_BENCH_WIRE_SCHEMA_VERSION, for this firmware's
  * HelloAck (embarch-study-designer/design.md §3 decision 12). */
 uint32_t study_ffi_schema_version(void);
@@ -46,10 +49,10 @@ int study_ffi_decode_and_verify(const uint8_t *input, size_t input_len, bool *ou
  * `essd_study_decode_and_verify`'s existing `Study`-shaped precedent, for a
  * future caller that does have a real `Study` blob to decode (see main.c's
  * own comment for the full reasoning). */
-#define STUDY_FFI_MAX_LOCAL_NAME_LEN 26  /* mirrors limits::MAX_LOCAL_NAME_LEN */
-#define STUDY_FFI_MAX_NAME_LEN 32        /* mirrors limits::MAX_NAME_LEN */
-#define STUDY_FFI_MAX_STUDY_NAME_LEN 64  /* mirrors limits::MAX_STUDY_NAME_LEN */
-#define STUDY_FFI_MAX_STEPS_PER_STUDY 64 /* mirrors limits::MAX_STEPS_PER_STUDY */
+#define STUDY_FFI_MAX_LOCAL_NAME_LEN CRATE_MAX_LOCAL_NAME_LEN
+#define STUDY_FFI_MAX_NAME_LEN CRATE_MAX_NAME_LEN
+#define STUDY_FFI_MAX_STUDY_NAME_LEN CRATE_MAX_STUDY_NAME_LEN
+#define STUDY_FFI_MAX_STEPS_PER_STUDY CRATE_MAX_STEPS_PER_STUDY
 
 struct study_ffi_ble_advertise_action {
 	uint8_t local_name[STUDY_FFI_MAX_LOCAL_NAME_LEN];

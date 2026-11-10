@@ -18,19 +18,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Mirrors embarch-study-designer's limits::MAX_FIRMWARE_VERSION_LEN / MAX_LOG_LINE_LEN
- * / MAX_LOCAL_NAME_LEN / MAX_NAME_LEN / MAX_STEPS_PER_STUDY / MAX_FAIL_REASON_LEN /
- * MAX_PAYLOAD_LEN (embarch-study-designer/src/limits.rs) — kept in sync by hand until
- * decision 8's west-module wiring lets this firmware pull the constants directly from
- * that crate. */
-#define DBM_MAX_FIRMWARE_VERSION_LEN 32
-/* limits::MAX_HARDWARE_ID_LEN — this board's own factory-unique chip ID,
- * hex-encoded (`embarch-study-designer` decision 47,
- * `embarch-core` decision 35). */
-#define DBM_MAX_HARDWARE_ID_LEN 32
-#define DBM_MAX_LOG_LINE_LEN 128
-#define DBM_MAX_LOCAL_NAME_LEN 26
-#define DBM_MAX_NAME_LEN 32
+/* Every bound below that embarch-study-designer also defines is its value,
+ * read from embarch-study-designer/src/limits.rs into crate_limits.h at
+ * configure time (decision 56). They were typed here by hand, each with a
+ * "mirrors limits::X" comment that nothing checked, until then. The few that
+ * are deliberately smaller than the crate's are this firmware's own numbers,
+ * named as forks and held against the crate by _Static_assert below. */
+#include "crate_limits.h"
+
+#define DBM_MAX_FIRMWARE_VERSION_LEN CRATE_MAX_FIRMWARE_VERSION_LEN
+/* This board's own factory-unique chip ID, hex-encoded
+ * (`embarch-study-designer` decision 47, `embarch-core` decision 35). */
+#define DBM_MAX_HARDWARE_ID_LEN CRATE_MAX_HARDWARE_ID_LEN
+#define DBM_MAX_LOG_LINE_LEN CRATE_MAX_LOG_LINE_LEN
+#define DBM_MAX_LOCAL_NAME_LEN CRATE_MAX_LOCAL_NAME_LEN
+#define DBM_MAX_NAME_LEN CRATE_MAX_NAME_LEN
 /* A dev-bench-internal capacity cap, NOT a mirror of the crate's own
  * limits::MAX_STEPS_PER_STUDY (still 64 there, unaffected -- Core/embarch-api
  * still validate/CRC a `Study` against that ceiling). Real gap found and
@@ -52,14 +54,20 @@
  * needs more steps than this against real dev-bench hardware.
  */
 #define DBM_MAX_STEPS_PER_STUDY 16
-#define DBM_MAX_FAIL_REASON_LEN 64
-#define DBM_MAX_PAYLOAD_LEN 512
-/* Mirrors embarch-study-designer's limits::MAX_DISCOVERED_SERVICES/
- * MAX_CHARS_PER_SERVICE (`embarch-study-designer` decisions 31/32/33's update) --
- * these two, unlike DBM_MAX_STEPS_PER_STUDY above, are small enough that
- * mirroring the crate's own real ceiling costs no meaningful RAM. */
-#define DBM_MAX_DISCOVERED_SERVICES 8
-#define DBM_MAX_CHARS_PER_SERVICE 16
+/* A fork, so: never above the crate's own ceiling, and equal to the advisory
+ * copy the crate keeps of it (`limits::DEV_BENCH_MAX_STEPS_PER_STUDY`, which
+ * an authoring UI warns from). */
+_Static_assert(DBM_MAX_STEPS_PER_STUDY <= CRATE_MAX_STEPS_PER_STUDY,
+	       "DBM_MAX_STEPS_PER_STUDY is a cap below the crate's, never above it");
+_Static_assert(DBM_MAX_STEPS_PER_STUDY == CRATE_DEV_BENCH_MAX_STEPS_PER_STUDY,
+	       "the crate's DEV_BENCH_MAX_STEPS_PER_STUDY copy disagrees with this cap");
+#define DBM_MAX_FAIL_REASON_LEN CRATE_MAX_FAIL_REASON_LEN
+#define DBM_MAX_PAYLOAD_LEN CRATE_MAX_PAYLOAD_LEN
+/* At the crate's own ceilings (`embarch-study-designer` decisions 31/32/33's
+ * update) -- these two, unlike DBM_MAX_STEPS_PER_STUDY above, are small
+ * enough that the crate's real ceiling costs no meaningful RAM. */
+#define DBM_MAX_DISCOVERED_SERVICES CRATE_MAX_DISCOVERED_SERVICES
+#define DBM_MAX_CHARS_PER_SERVICE CRATE_MAX_CHARS_PER_SERVICE
 /* DBM_MAX_GATT_ACTIVITY_RECORDS was here. Retired at schema v14 with the
  * field it bounded (`embarch-study-designer` decision 54): it was
  * the single largest contributor to `struct dbm_step_result_payload`'s size
@@ -75,9 +83,9 @@
  * notification (247 - 3 bytes of ATT header), the value app/prj.conf
  * configures CONFIG_BT_L2CAP_TX_MTU/CONFIG_BT_BUF_ACL_RX_SIZE for. */
 #define DBM_MAX_TRANSCRIPT_PAYLOAD_LEN 244
-/* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES /
- * MAX_STREAM_RECORDS_PER_BATCH (schema v8, `embarch-study-designer` decision 39).
- * Deliberately *smaller* than the crate's own 512/4 for the same reason
+/* This firmware's own bound on limits::MAX_STREAM_CHUNK_BYTES (schema v8,
+ * `embarch-study-designer` decision 39), a fork.
+ * Deliberately *smaller* than the crate's own 512 for the same reason
  * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is smaller than DBM_MAX_PAYLOAD_LEN: the
  * largest record this firmware produces is one encoded transcript entry
  * (DBM_MAX_TRANSCRIPT_RECORD_LEN, a full ATT MTU notification *plus* the
@@ -89,11 +97,11 @@
  * about 210 bytes failed to encode and was dropped. Defined from the record it must hold so
  * the two cannot drift apart again. */
 #define DBM_MAX_STREAM_CHUNK_BYTES DBM_MAX_TRANSCRIPT_RECORD_LEN
-/* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES, only so the
- * fork above can be checked against it at build time. */
-#define DBM_CRATE_MAX_STREAM_CHUNK_BYTES 512
-#define DBM_MAX_STREAM_RECORDS_PER_BATCH 4
-/* Mirrors embarch-study-designer's limits::MAX_STREAMS_PER_STUDY (schema
+/* The crate's own value, only so the fork above can be checked against it at
+ * build time. */
+#define DBM_CRATE_MAX_STREAM_CHUNK_BYTES CRATE_MAX_STREAM_CHUNK_BYTES
+#define DBM_MAX_STREAM_RECORDS_PER_BATCH CRATE_MAX_STREAM_RECORDS_PER_BATCH
+/* limits::MAX_STREAMS_PER_STUDY (schema
  * v9). At its full value rather than shrunk, unlike DBM_MAX_STEPS_PER_STUDY:
  * refusing a tap count Core considers legal would be this firmware inventing
  * a limit.
@@ -105,7 +113,7 @@
  * specifically not supposed to hold. Eight of them is under 100 bytes, on a
  * board whose `sram0_0_seg` has already overflowed twice during this
  * decision's implementation (decisions 27, 28). */
-#define DBM_MAX_STREAMS_PER_STUDY 8
+#define DBM_MAX_STREAMS_PER_STUDY CRATE_MAX_STREAMS_PER_STUDY
 
 /* The `.eap` protocol manifest types a `StudyStart` carries and this file
  * decodes (`embarch-study-designer` decisions 58-62).
@@ -118,7 +126,7 @@
  */
 #include "eap.h"
 
-#define DBM_MAX_PROTOCOLS_PER_STUDY 2
+#define DBM_MAX_PROTOCOLS_PER_STUDY CRATE_MAX_PROTOCOLS_PER_STUDY
 /* Largest postcard-encoded `protocols` span this firmware will accept, in
  * bytes -- a **disclosed byte-count cap**, and the only limit here that is
  * not a mirror of a count.
@@ -136,6 +144,10 @@
  * refused at decode with the limit named, the same disclosed-capacity posture
  * DBM_MAX_STEPS_PER_STUDY takes. */
 #define DBM_MAX_PROTOCOLS_WIRE_LEN 3072
+/* This firmware's own number, so the crate's advisory copy is checked against
+ * it rather than the other way round. */
+_Static_assert(DBM_MAX_PROTOCOLS_WIRE_LEN == CRATE_DEV_BENCH_MAX_PROTOCOLS_WIRE_LEN,
+	       "the crate's DEV_BENCH_MAX_PROTOCOLS_WIRE_LEN copy disagrees with this cap");
 
 /* Largest single postcard-encoded (pre-COBS) DevBenchMessage this firmware sends/receives.
  *
@@ -588,13 +600,13 @@ struct dbm_run_protocol_action {
 	uint8_t entry_state;
 };
 
-/* How many characteristics one selective monitor step may name -- mirrors
+/* How many characteristics one selective monitor step may name --
  * embarch-study-designer's limits::MAX_MONITOR_TARGETS. At the crate's full
  * value: refusing a count Core considers legal would be this firmware
  * inventing a limit, and this array costs nothing extra in practice because
  * `struct dbm_step`'s union is already sized by `dbm_data_exchange_action`
  * (~553 bytes), which is larger than 16 targets (512). */
-#define DBM_MAX_MONITOR_TARGETS 16
+#define DBM_MAX_MONITOR_TARGETS CRATE_MAX_MONITOR_TARGETS
 
 /* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs,
  * decision 44). Values are postcard discriminants -- the enum's *declaration*

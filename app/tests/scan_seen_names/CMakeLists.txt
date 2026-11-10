@@ -3,6 +3,9 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(embarch_dev_bench_scan_seen_names_test)
 
+# crate_limits.h, which the app headers under test include (decision 56).
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/crate_limits.cmake)
+
 # scan_seen_names.c is linkable in isolation on purpose (see its own header
 # comment): it needs Zephyr's printk helper but nothing from the BT host,
 # which is what lets this run under native_sim even though ble_bridge_real.c

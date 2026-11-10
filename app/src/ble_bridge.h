@@ -19,10 +19,12 @@
 #include <stdint.h>
 
 /* The `.eap` protocol manifest types (`embarch-study-designer`
- * decisions 58-62). The one include this header has, and it is not the
- * link protocol's: eap.h is deliberately independent of serial_protocol.h for
- * exactly the reason BLE_MAX_PAYLOAD_LEN below is a duplicate rather than an
- * include -- nothing on this side of the boundary knows the wire format. */
+ * decisions 58-62), and the crate's own bounds (crate_limits.h, decision 56).
+ * Neither is the link protocol's: eap.h is deliberately independent of
+ * serial_protocol.h, and BLE_MAX_PAYLOAD_LEN below comes from the crate
+ * rather than from DBM_MAX_PAYLOAD_LEN for the same reason -- nothing on
+ * this side of the boundary knows the wire format. */
+#include "crate_limits.h"
 #include "eap.h"
 
 enum ble_role {
@@ -61,9 +63,9 @@ struct gatt_operation {
 	};
 };
 
-#define BLE_MAX_LOCAL_NAME_LEN 26 /* mirrors limits::MAX_LOCAL_NAME_LEN */
-#define BLE_MAX_SERVICE_UUIDS 4   /* mirrors limits::MAX_SERVICE_UUIDS */
-#define BLE_MAX_PAYLOAD_LEN 512   /* mirrors limits::MAX_PAYLOAD_LEN */
+#define BLE_MAX_LOCAL_NAME_LEN CRATE_MAX_LOCAL_NAME_LEN
+#define BLE_MAX_SERVICE_UUIDS CRATE_MAX_SERVICE_UUIDS
+#define BLE_MAX_PAYLOAD_LEN CRATE_MAX_PAYLOAD_LEN
 
 struct ble_advertise_params {
 	bool has_local_name;
@@ -150,7 +152,7 @@ enum action_kind {
 
 /* Mirrors `GattTarget` (embarch-study-designer/src/gatt.rs) -- raw
  * big-endian UUIDs, this header's convention throughout. */
-#define BLE_MAX_MONITOR_TARGETS 16 /* mirrors limits::MAX_MONITOR_TARGETS */
+#define BLE_MAX_MONITOR_TARGETS CRATE_MAX_MONITOR_TARGETS
 
 struct gatt_target {
 	uint8_t service_uuid[16];
@@ -213,8 +215,8 @@ struct action {
  * characteristic-properties byte, passed through unchanged (that decision's
  * "raw, not symbolic" stance). UUID byte order matches every other UUID in
  * this header: big-endian, embarch-study-designer's own convention. */
-#define BLE_MAX_DISCOVERED_SERVICES 8 /* mirrors limits::MAX_DISCOVERED_SERVICES */
-#define BLE_MAX_CHARS_PER_SERVICE 16  /* mirrors limits::MAX_CHARS_PER_SERVICE */
+#define BLE_MAX_DISCOVERED_SERVICES CRATE_MAX_DISCOVERED_SERVICES
+#define BLE_MAX_CHARS_PER_SERVICE CRATE_MAX_CHARS_PER_SERVICE
 
 struct ble_gatt_characteristic_info {
 	uint8_t uuid[16];
@@ -233,7 +235,7 @@ enum outcome_kind {
 	OUTCOME_TIMED_OUT,
 };
 
-#define OUTCOME_MAX_FAIL_REASON_LEN 64 /* mirrors limits::MAX_FAIL_REASON_LEN */
+#define OUTCOME_MAX_FAIL_REASON_LEN CRATE_MAX_FAIL_REASON_LEN
 
 struct outcome {
 	enum outcome_kind kind;
@@ -428,11 +430,12 @@ void ble_bridge_set_drop_sink(ble_drop_sink sink, void *user_data);
  * the first attempt at reporting a failed name match truncated the one name
  * that mattered. With no sink registered, lines are dropped; diagnostics are
  * never a precondition for a step running. */
-/* Mirrors serial_protocol.h's DBM_MAX_LOG_LINE_LEN, which in turn mirrors
- * embarch-study-designer's limits::MAX_LOG_LINE_LEN -- duplicated rather than
- * included, to keep this BLE-facing header independent of the link protocol's
- * own header (nothing else here knows the wire format either). */
-#define BLE_MAX_LOG_LINE_LEN 128
+/* embarch-study-designer's limits::MAX_LOG_LINE_LEN, as serial_protocol.h's
+ * DBM_MAX_LOG_LINE_LEN is -- both from crate_limits.h rather than one
+ * including the other, to keep this BLE-facing header independent of the
+ * link protocol's own header (nothing else here knows the wire format
+ * either). */
+#define BLE_MAX_LOG_LINE_LEN CRATE_MAX_LOG_LINE_LEN
 
 typedef void (*ble_log_sink)(const char *line, void *user_data);
 void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data);

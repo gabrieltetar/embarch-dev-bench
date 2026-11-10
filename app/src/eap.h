@@ -39,6 +39,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/* The crate's own counts and wire enums, read from its source at configure
+ * time (decision 56). */
+#include "crate_limits.h"
+
 /* ---- `.eap` protocol manifests (`embarch-study-designer` decisions 58-62)
  * --------------------------------------------------------------------------
  *
@@ -62,12 +66,12 @@
  * occupy on the wire, are bounds on the *message* rather than on the grammar
  * and live in serial_protocol.h with the rest of those.
  */
-#define EAP_MAX_SOURCES_PER_PROTOCOL 6
-#define EAP_MAX_FRAMES_PER_PROTOCOL 8
-#define EAP_MAX_FRAME_FIELDS 8
-#define EAP_MAX_FRAME_SPANS 4
-#define EAP_MAX_SESSION_VARS 6
-#define EAP_MAX_STATES_PER_PROTOCOL 12
+#define EAP_MAX_SOURCES_PER_PROTOCOL CRATE_MAX_SOURCES_PER_PROTOCOL
+#define EAP_MAX_FRAMES_PER_PROTOCOL CRATE_MAX_FRAMES_PER_PROTOCOL
+#define EAP_MAX_FRAME_FIELDS CRATE_MAX_FRAME_FIELDS
+#define EAP_MAX_FRAME_SPANS CRATE_MAX_FRAME_SPANS
+#define EAP_MAX_SESSION_VARS CRATE_MAX_SESSION_VARS
+#define EAP_MAX_STATES_PER_PROTOCOL CRATE_MAX_STATES_PER_PROTOCOL
 /* limits::MAX_STATE_NAME_LEN -- the one `.eap` string this firmware keeps,
  * because `ProtocolOutcome.final_state` reports it back (that doc's decision
  * 62). Every other name in a manifest -- protocol, source, frame, field,
@@ -75,7 +79,7 @@
  * dbm_stream_tap` discards `name`/`encoding`: every cross-reference inside a
  * resolved `ProtocolDef` is already an index, so this firmware compares no
  * strings and needs none of them. */
-#define EAP_MAX_STATE_NAME_LEN 24
+#define EAP_MAX_STATE_NAME_LEN CRATE_MAX_STATE_NAME_LEN
 /* **The one cap below the crate's own** (4 there). An event arm is the
  * heaviest thing a state holds -- two `remember`s and two guarded `goto`s,
  * each carrying operands -- and it is multiplied by
@@ -88,50 +92,64 @@
  * worse than one that does not run). Revisit this number, not the crate's own
  * MAX_EVENT_ARMS_PER_STATE, if a real manifest needs a third arm. */
 #define EAP_MAX_EVENT_ARMS_PER_STATE 2
-#define EAP_MAX_GUARDS_PER_ARM 2
-#define EAP_MAX_REMEMBER_PER_ARM 2
-#define EAP_MAX_WRITE_FIELDS 6
-#define EAP_MAX_SELECT_MATCH_LEN 8
-/* limits::MAX_FAIL_REASON_LEN. Duplicated from serial_protocol.h's
- * DBM_MAX_FAIL_REASON_LEN rather than included, the same way
- * BLE_MAX_PAYLOAD_LEN duplicates DBM_MAX_PAYLOAD_LEN: this header is one of
- * three that must not depend on the link protocol. Both mirror the one crate
- * constant, which is the definition. */
-#define EAP_MAX_FAIL_REASON_LEN 64
+/* A fork, so: never above the crate's own ceiling, and equal to the advisory
+ * copy the crate keeps of it (`limits::DEV_BENCH_MAX_EVENT_ARMS_PER_STATE`). */
+_Static_assert(EAP_MAX_EVENT_ARMS_PER_STATE <= CRATE_MAX_EVENT_ARMS_PER_STATE,
+	       "EAP_MAX_EVENT_ARMS_PER_STATE is a cap below the crate's, never above it");
+_Static_assert(EAP_MAX_EVENT_ARMS_PER_STATE == CRATE_DEV_BENCH_MAX_EVENT_ARMS_PER_STATE,
+	       "the crate's DEV_BENCH_MAX_EVENT_ARMS_PER_STATE copy disagrees with this cap");
+#define EAP_MAX_GUARDS_PER_ARM CRATE_MAX_GUARDS_PER_ARM
+#define EAP_MAX_REMEMBER_PER_ARM CRATE_MAX_REMEMBER_PER_ARM
+#define EAP_MAX_WRITE_FIELDS CRATE_MAX_WRITE_FIELDS
+#define EAP_MAX_SELECT_MATCH_LEN CRATE_MAX_SELECT_MATCH_LEN
+/* limits::MAX_FAIL_REASON_LEN, as serial_protocol.h's DBM_MAX_FAIL_REASON_LEN
+ * is -- both from crate_limits.h, so this header, one of three that must not
+ * depend on the link protocol, still has no copy of its own. */
+#define EAP_MAX_FAIL_REASON_LEN CRATE_MAX_FAIL_REASON_LEN
 
-/* `ScalarType` (embarch-study-designer/src/decoder.rs) -- the discriminants,
- * which is what crosses the wire inside a `ScalarRead`/`WriteField`. Float
- * widths are listed because the enum has them and a manifest could name one;
- * they are refused at parse time host-side, and refused again here rather
- * than trusted, since the expression set is integer-only. */
+/* **Every `.eap` enum below takes its values from the crate's declaration
+ * order** (crate_limits.h, decision 56), which is what postcard writes on the
+ * wire. They were typed as 0, 1, 2... by hand, so a variant inserted
+ * anywhere but the end of the Rust enum renumbered the wire while this
+ * firmware kept decoding with the old table. Now a reorder follows the
+ * crate, a renamed or removed variant fails to compile here, and a variant
+ * added to the crate fails the `_COUNT` assert until this side handles it. */
+
+/* `ScalarType` (embarch-study-designer/src/decoder.rs) -- what crosses the
+ * wire inside a `ScalarRead`/`WriteField`. Float widths are listed because
+ * the enum has them and a manifest could name one; they are refused at parse
+ * time host-side, and refused again here rather than trusted, since the
+ * expression set is integer-only. */
 enum eap_scalar_type {
-	EAP_SCALAR_U8 = 0,
-	EAP_SCALAR_I8 = 1,
-	EAP_SCALAR_U16LE = 2,
-	EAP_SCALAR_U16BE = 3,
-	EAP_SCALAR_I16LE = 4,
-	EAP_SCALAR_I16BE = 5,
-	EAP_SCALAR_U32LE = 6,
-	EAP_SCALAR_U32BE = 7,
-	EAP_SCALAR_I32LE = 8,
-	EAP_SCALAR_I32BE = 9,
-	EAP_SCALAR_U64LE = 10,
-	EAP_SCALAR_U64BE = 11,
-	EAP_SCALAR_I64LE = 12,
-	EAP_SCALAR_I64BE = 13,
-	EAP_SCALAR_F32LE = 14,
-	EAP_SCALAR_F32BE = 15,
-	EAP_SCALAR_F64LE = 16,
-	EAP_SCALAR_F64BE = 17,
+	EAP_SCALAR_U8 = CRATE_SCALAR_TYPE_U8,
+	EAP_SCALAR_I8 = CRATE_SCALAR_TYPE_I8,
+	EAP_SCALAR_U16LE = CRATE_SCALAR_TYPE_U16_LE,
+	EAP_SCALAR_U16BE = CRATE_SCALAR_TYPE_U16_BE,
+	EAP_SCALAR_I16LE = CRATE_SCALAR_TYPE_I16_LE,
+	EAP_SCALAR_I16BE = CRATE_SCALAR_TYPE_I16_BE,
+	EAP_SCALAR_U32LE = CRATE_SCALAR_TYPE_U32_LE,
+	EAP_SCALAR_U32BE = CRATE_SCALAR_TYPE_U32_BE,
+	EAP_SCALAR_I32LE = CRATE_SCALAR_TYPE_I32_LE,
+	EAP_SCALAR_I32BE = CRATE_SCALAR_TYPE_I32_BE,
+	EAP_SCALAR_U64LE = CRATE_SCALAR_TYPE_U64_LE,
+	EAP_SCALAR_U64BE = CRATE_SCALAR_TYPE_U64_BE,
+	EAP_SCALAR_I64LE = CRATE_SCALAR_TYPE_I64_LE,
+	EAP_SCALAR_I64BE = CRATE_SCALAR_TYPE_I64_BE,
+	EAP_SCALAR_F32LE = CRATE_SCALAR_TYPE_F32_LE,
+	EAP_SCALAR_F32BE = CRATE_SCALAR_TYPE_F32_BE,
+	EAP_SCALAR_F64LE = CRATE_SCALAR_TYPE_F64_LE,
+	EAP_SCALAR_F64BE = CRATE_SCALAR_TYPE_F64_BE,
 };
+_Static_assert(CRATE_SCALAR_TYPE_COUNT == 18, "ScalarType gained or lost a variant");
 
 /* `Operand` (eap.rs) -- the four forms, and adding a fifth is a decision. */
 enum eap_operand_kind {
-	EAP_OP_LITERAL = 0,
-	EAP_OP_FIELD = 1,
-	EAP_OP_SESSION = 2,
-	EAP_OP_SPAN_LEN = 3,
+	EAP_OP_LITERAL = CRATE_OPERAND_LITERAL,
+	EAP_OP_FIELD = CRATE_OPERAND_FIELD,
+	EAP_OP_SESSION = CRATE_OPERAND_SESSION,
+	EAP_OP_SPAN_LEN = CRATE_OPERAND_SPAN_LEN,
 };
+_Static_assert(CRATE_OPERAND_COUNT == 4, "Operand gained or lost a variant");
 
 struct eap_operand {
 	uint8_t kind;  /* enum eap_operand_kind */
@@ -146,9 +164,10 @@ _Static_assert(sizeof(struct eap_operand) == 10, "eap_operand must stay packed")
 /* `Expr` (eap.rs) -- one level, exactly one arithmetic operation, and `Add`
  * saturates. `b` is unused for a Term. */
 enum eap_expr_kind {
-	EAP_EXPR_TERM = 0,
-	EAP_EXPR_ADD = 1,
+	EAP_EXPR_TERM = CRATE_EXPR_TERM,
+	EAP_EXPR_ADD = CRATE_EXPR_ADD,
 };
+_Static_assert(CRATE_EXPR_COUNT == 2, "Expr gained or lost a variant");
 
 struct eap_expr {
 	uint8_t kind; /* enum eap_expr_kind */
@@ -159,13 +178,14 @@ struct eap_expr {
 /* `CompareOp` (eap.rs). Six comparisons and no boolean connectives: `a && b`
  * is two states, `!a` is swapping `when` and `otherwise`. */
 enum eap_compare_op {
-	EAP_CMP_EQ = 0,
-	EAP_CMP_NE = 1,
-	EAP_CMP_LT = 2,
-	EAP_CMP_LE = 3,
-	EAP_CMP_GT = 4,
-	EAP_CMP_GE = 5,
+	EAP_CMP_EQ = CRATE_COMPARE_OP_EQ,
+	EAP_CMP_NE = CRATE_COMPARE_OP_NE,
+	EAP_CMP_LT = CRATE_COMPARE_OP_LT,
+	EAP_CMP_LE = CRATE_COMPARE_OP_LE,
+	EAP_CMP_GT = CRATE_COMPARE_OP_GT,
+	EAP_CMP_GE = CRATE_COMPARE_OP_GE,
 };
+_Static_assert(CRATE_COMPARE_OP_COUNT == 6, "CompareOp gained or lost a variant");
 
 struct eap_condition {
 	struct eap_operand lhs;
@@ -245,14 +265,17 @@ struct eap_timeout_arm {
 /* `StateKind`/`TerminalOutcome` (eap.rs). `Outcome::TimedOut` is deliberately
  * absent: a manifest cannot declare it, only a run can produce it. */
 enum eap_state_kind {
-	EAP_STATE_ACTIVE = 0,
-	EAP_STATE_TERMINAL = 1,
+	EAP_STATE_ACTIVE = CRATE_STATE_KIND_ACTIVE,
+	EAP_STATE_TERMINAL = CRATE_STATE_KIND_TERMINAL,
 };
+_Static_assert(CRATE_STATE_KIND_COUNT == 2, "StateKind gained or lost a variant");
 
 enum eap_terminal_outcome {
-	EAP_TERMINAL_PASS = 0,
-	EAP_TERMINAL_FAIL = 1,
+	EAP_TERMINAL_PASS = CRATE_TERMINAL_OUTCOME_PASS,
+	EAP_TERMINAL_FAIL = CRATE_TERMINAL_OUTCOME_FAIL,
 };
+_Static_assert(CRATE_TERMINAL_OUTCOME_COUNT == 2,
+	       "TerminalOutcome gained or lost a variant");
 
 struct eap_state {
 	/* The one `.eap` name this firmware keeps -- see the section comment

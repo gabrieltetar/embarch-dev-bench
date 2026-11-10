@@ -131,6 +131,10 @@ if(NOT EXISTS "${ESSD_DIR}/Cargo.toml")
   message(FATAL_ERROR "embarch-dev-bench: embarch-study-designer not found at ${ESSD_DIR} -- set EMBARCH_STUDY_DESIGNER_PATH if it isn't a sibling of this repo.")
 endif()
 
+# Every crate limit and `.eap` wire enum the headers size or decode by,
+# derived from the crate rather than typed (decision 56).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/crate_limits.cmake)
+
 # The stub's `study_ffi_schema_version()` answer, read out of the crate rather
 # than mirrored by hand in C.
 #
