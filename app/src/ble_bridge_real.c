@@ -238,7 +238,18 @@ static struct bt_gatt_discover_params all_chars_params;
  * lifetime. */
 static struct bt_gatt_subscribe_params monitor_subscribe_params[BLE_MAX_MONITOR_SUBSCRIPTIONS];
 static struct bt_gatt_discover_params monitor_ccc_discover_params[BLE_MAX_MONITOR_SUBSCRIPTIONS];
-static uint16_t monitor_char_index[BLE_MAX_MONITOR_SUBSCRIPTIONS];
+/* The (service, characteristic) pair each armed subscription was made for,
+ * copied at subscribe time as protocol_subscribe_char_uuid is. A window
+ * spans steps, and every later GattDiscover, monitor or RunProtocol step
+ * zeroes and refills `discovered`, so labelling a window's notification by an
+ * index into that table named whatever the table held when it arrived --
+ * nothing mid-walk, the wrong row after a walk that came back different or
+ * failed partway, and a GattNotify tap that matched on the label missed it
+ * with nothing counted (decision 55). 32 B a slot, 1 KB in all. */
+static struct {
+	uint8_t service_uuid[16];
+	uint8_t characteristic_uuid[16];
+} monitor_subscribe_label[BLE_MAX_MONITOR_SUBSCRIPTIONS];
 static uint8_t monitor_subscribe_count;
 
 /* `activity[]`/`activity_len` were here -- the fixed-size inline summary
@@ -281,38 +292,6 @@ static const uint8_t *cached_service_uuid(void)
 static const uint8_t *cached_characteristic_uuid(void)
 {
 	return handle_cache.valid ? handle_cache.characteristic_uuid : NULL;
-}
-
-/* Resolves a flattened characteristic index back to its (service,
- * characteristic) UUID pair, against `discovered`/`discovered_len`.
- *
- * "Flattened" is ble_bridge.h's own documented convention for
- * `ble_gatt_activity_record.characteristic_index`: service 0's characteristics
- * first, then service 1's, and so on, in discovery order. This is the one
- * place that flattening is inverted, so a transcript entry and an activity
- * record can never disagree about which characteristic an index names.
- *
- * Returns false with both outputs left NULL when the index is out of range --
- * a transcript entry with no UUIDs is still a truthful record of the event,
- * which is why callers `(void)` this rather than failing the step. */
-static bool uuids_for_flat_index(uint16_t flat, const uint8_t **service_uuid,
-				 const uint8_t **characteristic_uuid)
-{
-	uint16_t seen = 0;
-
-	*service_uuid = NULL;
-	*characteristic_uuid = NULL;
-	for (uint8_t si = 0; si < discovered_len; si++) {
-		uint8_t count = discovered[si].characteristics_len;
-
-		if (flat < seen + count) {
-			*service_uuid = discovered[si].uuid;
-			*characteristic_uuid = discovered[si].characteristics[flat - seen].uuid;
-			return true;
-		}
-		seen += count;
-	}
-	return false;
 }
 
 /* Hands one GATT event to the registered transcript sink.
@@ -1551,6 +1530,28 @@ static void ccc_note_torn_down(struct bt_gatt_subscribe_params *params)
 	}
 }
 
+/* Whether a monitor subscription (a window's, or a one-shot's during its
+ * step) holds `value_handle`. While one does, it alone writes that handle's
+ * transcript rows: Zephyr hands a notification to every subscriber on its
+ * handle, so a DataExchange subscribe or a RunProtocol source on the same
+ * characteristic would otherwise record each notification twice, and every
+ * GattNotify tap on it would receive it twice (decision 55). Read on the BT
+ * RX thread over slots the dispatch thread fills; a slot counts only once its
+ * subscription has landed, so the race costs at most a duplicate, never a
+ * missing row. */
+static bool monitor_holds(uint16_t value_handle)
+{
+	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+		if (monitor_subscribe_params[i].value_handle == value_handle) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Defined after the protocol state it also reads. */
+static bool subscription_covers(uint16_t value_handle, uint16_t value);
+
 /* Starts one subscription and waits for its CCC answer, the shared core of
  * the monitor walk and the protocol subscribe. `sp` is fully filled in by the
  * caller; `*start_err` gets bt_gatt_subscribe's errno on CCC_START_FAILED.
@@ -1568,6 +1569,9 @@ static enum ccc_verdict subscribe_and_wait(struct bt_gatt_subscribe_params *sp,
 		return CCC_LINK_LOST;
 	}
 
+	/* Asked before `sp` is counted, so it is not its own cover. */
+	const bool covered = subscription_covers(sp->value_handle, sp->value);
+
 	ccc_att_err = 0;
 	ccc_torn_down = false;
 	k_sem_reset(&ccc_sem);
@@ -1578,6 +1582,12 @@ static enum ccc_verdict subscribe_and_wait(struct bt_gatt_subscribe_params *sp,
 
 	if (err == -EALREADY) {
 		/* Already in the host's list, so already armed. */
+		verdict = CCC_SUBSCRIBED;
+	} else if (err == 0 && covered) {
+		/* Zephyr linked it beside the subscription that covers the
+		 * handle and wrote no CCC, so no answer will ever come
+		 * (decision 55). The CCC is enabled; notifications on the
+		 * handle reach this params too. */
 		verdict = CCC_SUBSCRIBED;
 	} else if (err == -ENOTCONN) {
 		verdict = CCC_LINK_LOST;
@@ -1769,20 +1779,6 @@ static struct outcome execute_gatt_discover(int64_t deadline)
 	return result;
 }
 
-/* service/characteristic index, flattened service-then-characteristic in
- * discovery order -- the exact convention `embarch-study-designer` decision 32
- * documents for `GattActivityRecord.characteristic_index`, computed here in the one place
- * both this bridge and any consumer need to agree on it. */
-static uint16_t flat_characteristic_index(uint8_t service_idx, uint8_t char_idx)
-{
-	uint16_t flat = 0;
-
-	for (uint8_t s = 0; s < service_idx; s++) {
-		flat += discovered[s].characteristics_len;
-	}
-	return flat + char_idx;
-}
-
 /* GattMonitorAll's own notify callback -- deliberately not notify_cb (below):
  * that one serves the single shared subscribe_params ensure_subscribed()
  * manages for GATT_OP_NOTIFY/INDICATE/SUBSCRIBE/STREAM_CAPTURE, whereas this
@@ -1800,15 +1796,17 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 		ccc_note_torn_down(params);
 		return BT_GATT_ITER_STOP;
 	}
-	ptrdiff_t idx_for_transcript = params - monitor_subscribe_params;
-	uint16_t flat_for_transcript =
-		(idx_for_transcript >= 0 && (size_t)idx_for_transcript < monitor_subscribe_count)
-			? monitor_char_index[idx_for_transcript]
-			: 0;
-	const uint8_t *tr_service_uuid = NULL;
-	const uint8_t *tr_char_uuid = NULL;
+	/* Labelled from the copy the walk made before subscribing this slot,
+	 * so a notification that beats the walk's own bookkeeping, or arrives
+	 * while a later step rebuilds `discovered`, still names the
+	 * characteristic it was subscribed under (decision 55). */
+	ptrdiff_t slot = params - monitor_subscribe_params;
+	const bool labelled = slot >= 0 && slot < BLE_MAX_MONITOR_SUBSCRIPTIONS;
+	const uint8_t *tr_service_uuid =
+		labelled ? monitor_subscribe_label[slot].service_uuid : NULL;
+	const uint8_t *tr_char_uuid =
+		labelled ? monitor_subscribe_label[slot].characteristic_uuid : NULL;
 
-	(void)uuids_for_flat_index(flat_for_transcript, &tr_service_uuid, &tr_char_uuid);
 	/* **The only sink for a captured notification, as of schema v14.** It
 	 * used to be one of two, the other being a 32-record inline summary
 	 * that stopped growing mid-capture (`embarch-study-designer` decision 54
@@ -1928,6 +1926,15 @@ static struct outcome monitor_subscribe_matching(int64_t deadline,
 					&monitor_subscribe_params[monitor_subscribe_count];
 				int start_err = 0;
 
+				/* Zeroing is safe only because nothing can still call
+				 * through this slot (decision 55). It is in no host
+				 * list: every exit of a monitor step tears its slots
+				 * down, a one-shot inside an open window is refused,
+				 * and a disconnect removes them (VOLATILE). And no
+				 * request still holds it: a teardown's CCC-clear
+				 * writes were queued on the one ATT bearer ahead of
+				 * the discovery this walk just finished, so all of
+				 * them have been answered. */
 				memset(sp, 0, sizeof(*sp));
 				sp->notify = monitor_notify_cb;
 				sp->subscribe = subscribe_cb;
@@ -1944,6 +1951,11 @@ static struct outcome monitor_subscribe_matching(int64_t deadline,
 				 * zeroes -- and nothing may unsubscribe it with no
 				 * connection to write the CCC on. */
 				atomic_set_bit(sp->flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
+				memcpy(monitor_subscribe_label[monitor_subscribe_count].service_uuid,
+				       service->uuid, 16);
+				memcpy(monitor_subscribe_label[monitor_subscribe_count]
+					       .characteristic_uuid,
+				       char_uuid, 16);
 
 				verdict = subscribe_and_wait(sp, deadline, &start_err);
 			}
@@ -1970,8 +1982,6 @@ static struct outcome monitor_subscribe_matching(int64_t deadline,
 			transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_SUBSCRIBED, service->uuid,
 					char_uuid, 0, NULL, 0);
 
-			monitor_char_index[monitor_subscribe_count] =
-				flat_characteristic_index(s, c);
 			monitor_subscribe_count++;
 			if (filtered) {
 				target_landed[target] = true;
@@ -2040,15 +2050,12 @@ static void monitor_unsubscribe_all(void)
 	const bool live = conn != NULL && !monitor_link_dropped;
 
 	for (uint8_t i = 0; live && i < monitor_subscribe_count; i++) {
-		const uint8_t *service_uuid = NULL;
-		const uint8_t *char_uuid = NULL;
-
 		if (bt_gatt_unsubscribe(conn, &monitor_subscribe_params[i]) != 0) {
 			continue;
 		}
-		(void)uuids_for_flat_index(monitor_char_index[i], &service_uuid, &char_uuid);
-		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED, service_uuid,
-				char_uuid, 0, NULL, 0);
+		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED,
+				monitor_subscribe_label[i].service_uuid,
+				monitor_subscribe_label[i].characteristic_uuid, 0, NULL, 0);
 	}
 	monitor_subscribe_count = 0;
 }
@@ -2071,10 +2078,23 @@ static struct outcome monitor_result(void)
 /* Shared by ACTION_GATT_MONITOR_ALL and ACTION_GATT_MONITOR_SELECTED --
  * `params` is NULL for the first and the step's target list for the second,
  * and that is the *only* difference between them
- * (`embarch-study-designer` decision 53). */
+ * (`embarch-study-designer` decision 53).
+ *
+ * Refused while a window is open (decision 55). The one-shot uses the
+ * window's own subscription slots, and zeroing slots the host still has
+ * linked cuts its intrusive subscription list: traced through Zephyr's
+ * gatt.c, the window loses most of its subscribers with their CCCs still
+ * enabled on the DUT, captures nothing more, and its Stop passes. Closing and
+ * reopening the window instead would
+ * leave a gap in a capture whose whole point is to span the steps inside
+ * it, and say nothing about it. */
 static struct outcome execute_gatt_monitor_window(
 	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
+	if (monitor_window_open) {
+		return outcome_fail("a monitor window is open; Stop it before this step");
+	}
+
 	/* Before the walk, not after it: a disconnect during the walk gives
 	 * this semaphore too. Resetting it (and `link_lost`) after the walk is
 	 * what used to throw such a disconnect away and pass the step. */
@@ -2216,7 +2236,6 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 			 const void *data, uint16_t length)
 {
 	ARG_UNUSED(conn);
-	ARG_UNUSED(params);
 
 	if (data == NULL) {
 		/* The subscription is gone: a CCC descriptor that couldn't be
@@ -2229,6 +2248,10 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		return BT_GATT_ITER_STOP;
 	}
 
+	/* One notification, one row: a monitor subscription on the same
+	 * handle records it itself (monitor_holds). */
+	const bool record = !monitor_holds(params->value_handle);
+
 	if (streaming) {
 		if (stream_handler != NULL) {
 			stream_handler(data, length, stream_user_data);
@@ -2236,13 +2259,18 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 		/* Recorded even though the bytes also go to the stream handler:
 		 * "exhaustive" means the transcript accounts for every
 		 * notification, including the ones another channel consumes. */
-		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
-				cached_characteristic_uuid(), 0, data, length);
+		if (record) {
+			transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION,
+					cached_service_uuid(), cached_characteristic_uuid(), 0,
+					data, length);
+		}
 		return BT_GATT_ITER_CONTINUE;
 	}
 
-	transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
-			cached_characteristic_uuid(), 0, data, length);
+	if (record) {
+		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
+				cached_characteristic_uuid(), 0, data, length);
+	}
 
 	capture_reset();
 	capture_append(data, length);
@@ -2413,6 +2441,10 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 	ccc_torn_down = false;
 	k_sem_reset(&ccc_sem);
 
+	/* An open window holding this handle means Zephyr writes no CCC and
+	 * calls nothing back; waiting would sit out the step (decision 55).
+	 * `subscribed` is false here, so this params is not its own cover. */
+	const bool covered = subscription_covers(value_handle, ccc_value);
 	int err = bt_gatt_subscribe(conn, &subscribe_params);
 
 	if (err != 0 && err != -EALREADY) {
@@ -2420,7 +2452,7 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 		goto done;
 	}
 
-	if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+	if (err == 0 && !covered && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
 		ccc_waiting = NULL;
 		abandon(&subscribe_params);
 		result = outcome_timed_out();
@@ -2914,6 +2946,41 @@ static uint16_t protocol_source_service_end[EAP_MAX_SOURCES_PER_PROTOCOL];
 static uint8_t protocol_source_props[EAP_MAX_SOURCES_PER_PROTOCOL];
 static uint32_t protocol_notifications_dropped;
 
+/* Whether one of this file's own live subscriptions already covers
+ * `value_handle` at `value` or above. That is Zephyr's own test in
+ * bt_gatt_subscribe, and when it holds Zephyr skips the CCC write, links the
+ * new params beside the old and returns 0 with no callback at all -- so a
+ * caller that then waited on ccc_sem sat out its whole budget and reported
+ * `TimedOut`. Reached by a DataExchange subscribe or a RunProtocol source on
+ * a characteristic an open window holds, which for an unfiltered window is
+ * every notifying source a bracketed protocol run reads (decision 55).
+ *
+ * Mirrors the host's rule over the three sets this file arms, since the
+ * host's list is not readable: the single subscribe_params while it is
+ * live, the monitor slots counted so far, the protocol slots counted so far.
+ * A subscription the host keeps that this file has stopped tracking (a
+ * bonded peer's across a reconnect) is not seen, and waits as it always did. */
+static bool subscription_covers(uint16_t value_handle, uint16_t value)
+{
+	if (subscribed && subscribe_params.value_handle == value_handle &&
+	    subscribe_params.value >= value) {
+		return true;
+	}
+	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+		if (monitor_subscribe_params[i].value_handle == value_handle &&
+		    monitor_subscribe_params[i].value >= value) {
+			return true;
+		}
+	}
+	for (uint8_t i = 0; i < protocol_subscribe_count; i++) {
+		if (protocol_subscribe_params[i].value_handle == value_handle &&
+		    protocol_subscribe_params[i].value >= value) {
+			return true;
+		}
+	}
+	return false;
+}
+
 static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *params,
 				  const void *data, uint16_t length)
 {
@@ -2949,8 +3016,12 @@ static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe
 		 * characteristic loses the payload while still reporting
 		 * `truncated: false`. Measured: 275 lost, 28,548 bytes
 		 * reported complete
-		 * (embarch-doc/embarch-decision-reversals.md row 73). */
-		if (drop_sink != NULL) {
+		 * (embarch-doc/embarch-decision-reversals.md row 73).
+		 *
+		 * Not when a monitor subscription holds the handle: that one
+		 * already wrote the row every tap received, so only the run
+		 * missed the frame, and its own count says so. */
+		if (drop_sink != NULL && !monitor_holds(params->value_handle)) {
 			drop_sink(protocol_subscribe_char_uuid[slot], drop_user_data);
 		}
 	}
@@ -3313,10 +3384,15 @@ static struct outcome execute_run_protocol(const struct run_protocol_params *par
 				.payload_len = note.len,
 			};
 
-			transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION,
-					def->sources[note.source].service_uuid,
-					def->sources[note.source].characteristic_uuid, 0,
-					note.payload, note.len);
+			/* Unless the window bracketing this run holds the
+			 * source: its row went out when the frame arrived
+			 * (monitor_holds). */
+			if (!monitor_holds(protocol_source_handle[note.source])) {
+				transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION,
+						def->sources[note.source].service_uuid,
+						def->sources[note.source].characteristic_uuid, 0,
+						note.payload, note.len);
+			}
 			eap_run_on_event(&run, &ev, &step);
 			continue;
 		}
@@ -3458,7 +3534,12 @@ void ble_bridge_reset(void)
 		(void)bt_gatt_unsubscribe(conn, &subscribe_params);
 	}
 	subscribed = false;
-	memset(&subscribe_params, 0, sizeof(subscribe_params));
+	/* Not memset, by ensure_subscribed's own rule: the CCC-clear write
+	 * just started still holds this struct, and its answer calls
+	 * `notify` through it (gatt_write_ccc_rsp), so zeroing it made that
+	 * answer, if it beat the disconnect below, a NULL call (decision 55).
+	 * Forgetting the handle is all the next ensure_subscribed needs. */
+	subscribe_params.value_handle = 0;
 
 	/* GattMonitorAll's own subscription set (`embarch-study-designer`
 	 * decision 32) -- torn down here too, before the disconnect below,
