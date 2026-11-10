@@ -1,4 +1,4 @@
-# crate_limits.h: embarch-study-designer's limits and `.eap` wire enums,
+# crate_limits.h: embarch-study-designer's limits and wire enums (link-level and `.eap`),
 # derived from the crate's own source at configure time (decision 56).
 #
 # Included after find_package(Zephyr) by the app and by every test under
@@ -26,6 +26,12 @@ set(_crate_limits_inputs
   "${ESSD_DIR}/src/limits.rs"
   "${ESSD_DIR}/src/decoder.rs"
   "${ESSD_DIR}/src/eap.rs"
+  "${ESSD_DIR}/src/protocol.rs"
+  "${ESSD_DIR}/src/study.rs"
+  "${ESSD_DIR}/src/ids.rs"
+  "${ESSD_DIR}/src/gatt.rs"
+  "${ESSD_DIR}/src/sample.rs"
+  "${ESSD_DIR}/src/streams.rs"
 )
 foreach(_crate_limits_input ${_crate_limits_inputs})
   if(NOT EXISTS "${_crate_limits_input}")

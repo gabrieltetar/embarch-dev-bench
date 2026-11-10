@@ -279,16 +279,22 @@ _Static_assert(DBM_MAX_STREAM_CHUNK_BYTES <= DBM_CRATE_MAX_STREAM_CHUNK_BYTES,
  * which is how dev-bench/020 got it wrong on the first pass.
  *
  * Appended, never reordered, for the same positional-encoding reason every
- * other enum on this wire is. */
-#define DBM_LOG_LEVEL_OFF 0
-#define DBM_LOG_LEVEL_ERR 1
-#define DBM_LOG_LEVEL_WRN 2
-#define DBM_LOG_LEVEL_INF 3
-#define DBM_LOG_LEVEL_DBG 4
+ * other enum on this wire is. The values come from the crate's declaration
+ * order (crate_limits.h, decision 56), like every link-level enum below;
+ * dev_bench_log.c asserts they are still Zephyr's severity numbers, so a
+ * reorder in the crate fails the build instead of remapping severities. */
+#define DBM_LOG_LEVEL_OFF CRATE_DEV_BENCH_LOG_LEVEL_OFF
+#define DBM_LOG_LEVEL_ERR CRATE_DEV_BENCH_LOG_LEVEL_ERROR
+#define DBM_LOG_LEVEL_WRN CRATE_DEV_BENCH_LOG_LEVEL_WARN
+#define DBM_LOG_LEVEL_INF CRATE_DEV_BENCH_LOG_LEVEL_INFO
+#define DBM_LOG_LEVEL_DBG CRATE_DEV_BENCH_LOG_LEVEL_DEBUG
+_Static_assert(CRATE_DEV_BENCH_LOG_LEVEL_COUNT == 5, "DevBenchLogLevel gained or lost a variant");
 
-/* Matches `DevBenchMessage`'s variant order exactly; postcard encodes this
- * as the enum's varint discriminant, so the order here must never drift from
- * the crate's.
+/* `DevBenchMessage`'s variant order; postcard encodes this as the enum's
+ * varint discriminant, so the values come from the crate's declaration order
+ * (crate_limits.h, decision 56) rather than being typed here. A renamed or
+ * removed variant fails to compile, and an added one fails the `_COUNT`
+ * assert until this firmware handles it.
  *
  * **Tags 2/3/4 changed meaning at schema v8** (`embarch-study-designer`
  * decision 39): the old StreamStart/StreamChunk/StreamEnd trio
@@ -300,15 +306,15 @@ _Static_assert(DBM_MAX_STREAM_CHUNK_BYTES <= DBM_CRATE_MAX_STREAM_CHUNK_BYTES,
  * HelloAck, LogLine, StudyStart, StepResult and StudyDone all keep the
  * discriminants they have always had. */
 enum dbm_tag {
-	DBM_TAG_HELLO = 0,
-	DBM_TAG_HELLO_ACK = 1,
-	DBM_TAG_STREAM_OPEN = 2,
-	DBM_TAG_STREAM_CHUNK_BATCH = 3,
-	DBM_TAG_STREAM_CLOSE = 4,
-	DBM_TAG_LOG_LINE = 5,
-	DBM_TAG_STUDY_START = 6,
-	DBM_TAG_STEP_RESULT = 7,
-	DBM_TAG_STUDY_DONE = 8,
+	DBM_TAG_HELLO = CRATE_DEV_BENCH_MESSAGE_HELLO,
+	DBM_TAG_HELLO_ACK = CRATE_DEV_BENCH_MESSAGE_HELLO_ACK,
+	DBM_TAG_STREAM_OPEN = CRATE_DEV_BENCH_MESSAGE_STREAM_OPEN,
+	DBM_TAG_STREAM_CHUNK_BATCH = CRATE_DEV_BENCH_MESSAGE_STREAM_CHUNK_BATCH,
+	DBM_TAG_STREAM_CLOSE = CRATE_DEV_BENCH_MESSAGE_STREAM_CLOSE,
+	DBM_TAG_LOG_LINE = CRATE_DEV_BENCH_MESSAGE_LOG_LINE,
+	DBM_TAG_STUDY_START = CRATE_DEV_BENCH_MESSAGE_STUDY_START,
+	DBM_TAG_STEP_RESULT = CRATE_DEV_BENCH_MESSAGE_STEP_RESULT,
+	DBM_TAG_STUDY_DONE = CRATE_DEV_BENCH_MESSAGE_STUDY_DONE,
 	/* `GattTranscriptRecord`, tag 10 -- **retired by schema v8**
 	 * (`embarch-study-designer` decision 39) and, as of
 	 * Milestone 7 Phase B item 3, **no longer sent or encoded**. The
@@ -322,38 +328,44 @@ enum dbm_tag {
 	 * reused when the old StreamStart/StreamChunk/StreamEnd trio retired,
 	 * and that was safe because no firmware carrying the old shapes had
 	 * ever been flashed. That is no longer the argument available here --
-	 * this firmware is being flashed -- so 10 stays spent.
+	 * this firmware is being flashed -- so 10 stays spent. The crate holds
+	 * no placeholder for it (its retired variants were simply removed), so
+	 * the next variant it appends takes the next index; the `_COUNT` assert
+	 * below is where that addition stops this build and gets read.
 	 *
 	 * `dbm_encode_transcript_entry` below is the piece that carried
 	 * forward: it emits exactly the entry bytes a stream record's payload
 	 * holds, and is what the cross-language pinning covers. */
 };
+_Static_assert(CRATE_DEV_BENCH_MESSAGE_COUNT == 9, "DevBenchMessage gained or lost a variant");
 
-/* Mirrors `GattDirection` (embarch-study-designer src/gatt.rs). Append-only,
- * same wire-compatibility rule as `dbm_tag`. */
+/* `GattDirection` (embarch-study-designer src/gatt.rs), values from the
+ * crate's declaration order like `dbm_tag`. */
 enum dbm_gatt_direction {
-	DBM_GATT_DIR_OUT = 0,
-	DBM_GATT_DIR_IN = 1,
-	DBM_GATT_DIR_LOCAL = 2,
+	DBM_GATT_DIR_OUT = CRATE_GATT_DIRECTION_OUT,
+	DBM_GATT_DIR_IN = CRATE_GATT_DIRECTION_IN,
+	DBM_GATT_DIR_LOCAL = CRATE_GATT_DIRECTION_LOCAL,
 };
+_Static_assert(CRATE_GATT_DIRECTION_COUNT == 3, "GattDirection gained or lost a variant");
 
-/* Mirrors `GattEventKind` (embarch-study-designer src/gatt.rs). Append-only. */
+/* `GattEventKind` (embarch-study-designer src/gatt.rs), likewise. */
 enum dbm_gatt_event_kind {
-	DBM_GATT_EVT_CONNECTED = 0,
-	DBM_GATT_EVT_DISCONNECTED = 1,
-	DBM_GATT_EVT_DISCOVERY_STARTED = 2,
-	DBM_GATT_EVT_SERVICE_DISCOVERED = 3,
-	DBM_GATT_EVT_CHARACTERISTIC_DISCOVERED = 4,
-	DBM_GATT_EVT_SUBSCRIBED = 5,
-	DBM_GATT_EVT_UNSUBSCRIBED = 6,
-	DBM_GATT_EVT_WRITE_REQUEST = 7,
-	DBM_GATT_EVT_WRITE_RESPONSE = 8,
-	DBM_GATT_EVT_READ_REQUEST = 9,
-	DBM_GATT_EVT_READ_RESPONSE = 10,
-	DBM_GATT_EVT_NOTIFICATION = 11,
-	DBM_GATT_EVT_INDICATION = 12,
-	DBM_GATT_EVT_ERROR = 13,
+	DBM_GATT_EVT_CONNECTED = CRATE_GATT_EVENT_KIND_CONNECTED,
+	DBM_GATT_EVT_DISCONNECTED = CRATE_GATT_EVENT_KIND_DISCONNECTED,
+	DBM_GATT_EVT_DISCOVERY_STARTED = CRATE_GATT_EVENT_KIND_DISCOVERY_STARTED,
+	DBM_GATT_EVT_SERVICE_DISCOVERED = CRATE_GATT_EVENT_KIND_SERVICE_DISCOVERED,
+	DBM_GATT_EVT_CHARACTERISTIC_DISCOVERED = CRATE_GATT_EVENT_KIND_CHARACTERISTIC_DISCOVERED,
+	DBM_GATT_EVT_SUBSCRIBED = CRATE_GATT_EVENT_KIND_SUBSCRIBED,
+	DBM_GATT_EVT_UNSUBSCRIBED = CRATE_GATT_EVENT_KIND_UNSUBSCRIBED,
+	DBM_GATT_EVT_WRITE_REQUEST = CRATE_GATT_EVENT_KIND_WRITE_REQUEST,
+	DBM_GATT_EVT_WRITE_RESPONSE = CRATE_GATT_EVENT_KIND_WRITE_RESPONSE,
+	DBM_GATT_EVT_READ_REQUEST = CRATE_GATT_EVENT_KIND_READ_REQUEST,
+	DBM_GATT_EVT_READ_RESPONSE = CRATE_GATT_EVENT_KIND_READ_RESPONSE,
+	DBM_GATT_EVT_NOTIFICATION = CRATE_GATT_EVENT_KIND_NOTIFICATION,
+	DBM_GATT_EVT_INDICATION = CRATE_GATT_EVENT_KIND_INDICATION,
+	DBM_GATT_EVT_ERROR = CRATE_GATT_EVENT_KIND_ERROR,
 };
+_Static_assert(CRATE_GATT_EVENT_KIND_COUNT == 14, "GattEventKind gained or lost a variant");
 
 /* Mirrors `GattTranscriptEntry` (embarch-study-designer src/gatt.rs, decision 36).
  *
@@ -378,14 +390,15 @@ struct dbm_gatt_transcript_entry {
 	uint8_t payload[DBM_MAX_TRANSCRIPT_PAYLOAD_LEN];
 };
 
-/* Mirrors embarch-study-designer's `Unit` (src/sample.rs). Append-only, same
- * wire-compatibility rule as `dbm_tag` above. */
+/* embarch-study-designer's `Unit` (src/sample.rs), values from the crate's
+ * declaration order like `dbm_tag` above. */
 enum dbm_unit {
-	DBM_UNIT_MILLIAMPS = 0,
-	DBM_UNIT_VOLTS = 1,
-	DBM_UNIT_MILLIWATTS = 2,
-	DBM_UNIT_RAW = 3,
+	DBM_UNIT_MILLIAMPS = CRATE_UNIT_MILLIAMPS,
+	DBM_UNIT_VOLTS = CRATE_UNIT_VOLTS,
+	DBM_UNIT_MILLIWATTS = CRATE_UNIT_MILLIWATTS,
+	DBM_UNIT_RAW = CRATE_UNIT_RAW,
 };
+_Static_assert(CRATE_UNIT_COUNT == 4, "Unit gained or lost a variant");
 
 /* `Hello` lost `steps_crc` (moved to `StudyStart` — embarch-study-designer
  * schema v3, `embarch-study-designer` decision 24). */
@@ -445,21 +458,23 @@ struct dbm_stream_chunk_batch {
 	uint32_t records_len;
 };
 
-/* Mirrors `StreamSource`'s variant order (embarch-study-designer
- * src/streams.rs). Positional, like every other tag mirror here. */
+/* `StreamSource`'s variant order (embarch-study-designer src/streams.rs),
+ * from the crate like every other tag here. */
 enum dbm_stream_source_tag {
-	DBM_STREAM_SRC_GATT_NOTIFY = 0,
-	DBM_STREAM_SRC_POWER_FRONT_END = 1,
-	DBM_STREAM_SRC_GATT_TRANSCRIPT = 2,
-	DBM_STREAM_SRC_DEV_BENCH_LOG = 3,
-	DBM_STREAM_SRC_SIGNAL = 4,
+	DBM_STREAM_SRC_GATT_NOTIFY = CRATE_STREAM_SOURCE_GATT_NOTIFY,
+	DBM_STREAM_SRC_POWER_FRONT_END = CRATE_STREAM_SOURCE_POWER_FRONT_END,
+	DBM_STREAM_SRC_GATT_TRANSCRIPT = CRATE_STREAM_SOURCE_GATT_TRANSCRIPT,
+	DBM_STREAM_SRC_DEV_BENCH_LOG = CRATE_STREAM_SOURCE_DEV_BENCH_LOG,
+	DBM_STREAM_SRC_SIGNAL = CRATE_STREAM_SOURCE_SIGNAL,
 };
+_Static_assert(CRATE_STREAM_SOURCE_COUNT == 5, "StreamSource gained or lost a variant");
 
-/* Mirrors `StreamScope` (embarch-study-designer src/streams.rs). */
+/* `StreamScope` (embarch-study-designer src/streams.rs). */
 enum dbm_stream_scope_tag {
-	DBM_STREAM_SCOPE_WHOLE_STUDY = 0,
-	DBM_STREAM_SCOPE_STEPS = 1,
+	DBM_STREAM_SCOPE_WHOLE_STUDY = CRATE_STREAM_SCOPE_WHOLE_STUDY,
+	DBM_STREAM_SCOPE_STEPS = CRATE_STREAM_SCOPE_STEPS,
 };
+_Static_assert(CRATE_STREAM_SCOPE_COUNT == 2, "StreamScope gained or lost a variant");
 
 /* One declared tap, as much of it as **this node acts on** -- schema v9's
  * `StreamTap` (embarch-study-designer src/streams.rs), deliberately
@@ -537,27 +552,27 @@ struct dbm_log_line {
 /* Mirrors embarch-study-designer's `Action` (src/study.rs), one variant per
  * enum tag -- `embarch-study-designer` decisions 44/50 added the
  * last two of these.
- * Append-only, same discipline as `enum dbm_tag`: the tag values below match
- * `Action`'s own declared variant order exactly, since postcard encodes an
- * enum discriminant positionally. */
+ * Append-only, same discipline as `enum dbm_tag`, and like it the values come
+ * from `Action`'s declared variant order in the crate (crate_limits.h), since
+ * postcard encodes an enum discriminant positionally. */
 enum dbm_action_tag {
-	DBM_ACTION_BLE_ADVERTISE = 0,
-	DBM_ACTION_BLE_CONNECT = 1,
-	DBM_ACTION_DATA_EXCHANGE = 2,
-	DBM_ACTION_GATT_DISCOVER = 3,
-	DBM_ACTION_GATT_MONITOR_ALL = 4,
+	DBM_ACTION_BLE_ADVERTISE = CRATE_ACTION_BLE_ADVERTISE,
+	DBM_ACTION_BLE_CONNECT = CRATE_ACTION_BLE_CONNECT,
+	DBM_ACTION_DATA_EXCHANGE = CRATE_ACTION_DATA_EXCHANGE,
+	DBM_ACTION_GATT_DISCOVER = CRATE_ACTION_GATT_DISCOVER,
+	DBM_ACTION_GATT_MONITOR_ALL = CRATE_ACTION_GATT_MONITOR_ALL,
 	/* `embarch-study-designer` decision 36 -- a capture window that outlives its own
 	 * step, so a stimulus write and a capture can finally overlap. Both
 	 * field-less, same as GattDiscover/GattMonitorAll. */
-	DBM_ACTION_GATT_MONITOR_START = 5,
-	DBM_ACTION_GATT_MONITOR_STOP = 6,
+	DBM_ACTION_GATT_MONITOR_START = CRATE_ACTION_GATT_MONITOR_START,
+	DBM_ACTION_GATT_MONITOR_STOP = CRATE_ACTION_GATT_MONITOR_STOP,
 	/* `embarch-study-designer` decisions 44/50, schema v12 --
 	 * the first Action variant since BleConnect to carry a field, and one
 	 * that carries none. Appended, never inserted: postcard encodes the
 	 * discriminant positionally, so inserting would shift both of these
 	 * and every future one. */
-	DBM_ACTION_BLE_SECURITY = 7,
-	DBM_ACTION_BLE_UNBOND = 8,
+	DBM_ACTION_BLE_SECURITY = CRATE_ACTION_BLE_SECURITY,
+	DBM_ACTION_BLE_UNBOND = CRATE_ACTION_BLE_UNBOND,
 	/* `embarch-study-designer` decision 53, schema v14 -- the
 	 * same discovery-and-subscribe walk as GATT_MONITOR_ALL/START, narrowed
 	 * to the characteristics the study names.
@@ -569,8 +584,8 @@ enum dbm_action_tag {
 	 * length and produce a step list that still decodes, into nonsense. The
 	 * v14 wire vector in the crate's tests/firmware_test_vectors.rs exists
 	 * for exactly that. */
-	DBM_ACTION_GATT_MONITOR_SELECTED = 9,
-	DBM_ACTION_GATT_MONITOR_SELECTED_START = 10,
+	DBM_ACTION_GATT_MONITOR_SELECTED = CRATE_ACTION_GATT_MONITOR_SELECTED,
+	DBM_ACTION_GATT_MONITOR_SELECTED_START = CRATE_ACTION_GATT_MONITOR_SELECTED_START,
 	/* `embarch-study-designer` decision 60, schema v15 -- hand
 	 * the link to a declared `.eap` state machine for the length of this
 	 * step. Appended, never inserted, same positional-encoding rule as
@@ -586,8 +601,9 @@ enum dbm_action_tag {
 	 * primitives a running machine can actually reach -- `repeat`,
 	 * `bitpack`, `crc32` and `fixed` stay host-side and never arrive
 	 * here. */
-	DBM_ACTION_RUN_PROTOCOL = 11,
+	DBM_ACTION_RUN_PROTOCOL = CRATE_ACTION_RUN_PROTOCOL,
 };
+_Static_assert(CRATE_ACTION_COUNT == 12, "Action gained or lost a variant");
 
 /* Mirrors `Action::RunProtocol { protocol, entry_state }`. Both are indices,
  * never names. Both reach a C array subscript here, which is why
@@ -608,22 +624,23 @@ struct dbm_run_protocol_action {
  * (~553 bytes), which is larger than 16 targets (512). */
 #define DBM_MAX_MONITOR_TARGETS CRATE_MAX_MONITOR_TARGETS
 
-/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs,
- * decision 44). Values are postcard discriminants -- the enum's *declaration*
- * order, which is NOT the spec's level number: L1 encodes as 0. That offset
- * is the whole reason this mirror is spelled out rather than assumed, and
- * `dbm_security_level_number()` below is the one place it is undone.
+/* `BleSecurityLevel` (embarch-study-designer/src/study.rs, decision 44).
+ * Values are postcard discriminants -- the enum's *declaration* order, taken
+ * from the crate (crate_limits.h), which is NOT the spec's level number: L1
+ * encodes as 0. `dbm_security_level_number()` below is the one place that
+ * offset is undone.
  *
  * L1 is carried because `StepResult.security_level` reports it (a link that
  * never got encrypted is exactly the answer a study debugging a
  * security-requiring DUT needs); no study may *request* it, and
  * ble_bridge_real.c fails such a step rather than treating it as a no-op. */
 enum dbm_security_level {
-	DBM_SECURITY_L1 = 0,
-	DBM_SECURITY_L2 = 1,
-	DBM_SECURITY_L3 = 2,
-	DBM_SECURITY_L4 = 3,
+	DBM_SECURITY_L1 = CRATE_BLE_SECURITY_LEVEL_L1,
+	DBM_SECURITY_L2 = CRATE_BLE_SECURITY_LEVEL_L2,
+	DBM_SECURITY_L3 = CRATE_BLE_SECURITY_LEVEL_L3,
+	DBM_SECURITY_L4 = CRATE_BLE_SECURITY_LEVEL_L4,
 };
+_Static_assert(CRATE_BLE_SECURITY_LEVEL_COUNT == 4, "BleSecurityLevel gained or lost a variant");
 
 /* The Bluetooth spec's own level number for a `enum dbm_security_level` --
  * 1 for DBM_SECURITY_L1, and so on. The one place the declaration-order/
@@ -646,9 +663,9 @@ struct dbm_ble_advertise_action {
  * significant byte first), same convention `ble_bridge.h`'s
  * `struct ble_connect_params` already documents. */
 struct dbm_ble_connect_action {
-	uint8_t role; /* 0 = Central, 1 = Peripheral (mirrors BleRole) */
+	uint8_t role; /* a CRATE_BLE_ROLE_* value (`BleRole`) */
 	bool has_target_address;
-	uint8_t target_address_kind; /* 0 = Public, 1 = Random (mirrors BleAddressKind) */
+	uint8_t target_address_kind; /* a CRATE_BLE_ADDRESS_KIND_* value (`BleAddressKind`) */
 	uint8_t target_address[6];
 	/* Advertised local name to connect to (`embarch-study-designer`
 	 * decision 43, schema v7). Encoded last in the BleConnect variant, so
@@ -659,17 +676,26 @@ struct dbm_ble_connect_action {
 	char target_name[DBM_MAX_LOCAL_NAME_LEN + 1]; /* NUL-terminated */
 };
 
-/* Mirrors `GattOperation` (src/study.rs). `payload`/`payload_len` are valid
- * only when `kind == DBM_GATT_OP_WRITE`; `timeout_ms` only for
- * `DBM_GATT_OP_NOTIFY`/`DBM_GATT_OP_INDICATE`. */
+/* `GattOperation` (src/study.rs), values from the crate's declaration order.
+ * `payload`/`payload_len` are valid only when `kind == DBM_GATT_OP_WRITE`;
+ * `timeout_ms` only for `DBM_GATT_OP_NOTIFY`/`DBM_GATT_OP_INDICATE`.
+ *
+ * DBM_GATT_OP_STREAM_CAPTURE is the one value here the crate no longer has:
+ * `embarch-study-designer` decision 39 retired `GattOperation::StreamCapture`
+ * and removed the variant, so nothing the host sends carries a 5 today. It
+ * stays typed by hand because this firmware still decodes it; the `_COUNT`
+ * assert is what stops a variant the crate appends from landing on its slot
+ * unread. ble_bridge.h's `gatt_operation_kind` carries the same values, and
+ * main.c casts one to the other. */
 enum dbm_gatt_op_kind {
-	DBM_GATT_OP_READ = 0,
-	DBM_GATT_OP_WRITE = 1,
-	DBM_GATT_OP_NOTIFY = 2,
-	DBM_GATT_OP_INDICATE = 3,
-	DBM_GATT_OP_SUBSCRIBE = 4,
+	DBM_GATT_OP_READ = CRATE_GATT_OPERATION_READ,
+	DBM_GATT_OP_WRITE = CRATE_GATT_OPERATION_WRITE,
+	DBM_GATT_OP_NOTIFY = CRATE_GATT_OPERATION_NOTIFY,
+	DBM_GATT_OP_INDICATE = CRATE_GATT_OPERATION_INDICATE,
+	DBM_GATT_OP_SUBSCRIBE = CRATE_GATT_OPERATION_SUBSCRIBE,
 	DBM_GATT_OP_STREAM_CAPTURE = 5,
 };
+_Static_assert(CRATE_GATT_OPERATION_COUNT == 5, "GattOperation gained or lost a variant");
 
 struct dbm_gatt_operation {
 	uint8_t kind;

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Write crate_limits.h: embarch-study-designer's limits and `.eap` wire enums, for C.
+"""Write crate_limits.h: embarch-study-designer's limits and wire enums, for C.
 
 Run at configure time by crate_limits.cmake (decision 56). Every constant
 dev-bench's headers used to type by hand with a `/* mirrors limits::X */`
-comment comes from here instead, and so does every `.eap` enum whose
-declaration order is its postcard wire value. A header that still disagrees
-with the crate then fails to compile rather than decoding with an old table.
+comment comes from here instead, and so does every link-level and `.eap`
+enum whose declaration order is its postcard wire value. A header that still
+disagrees with the crate then fails to compile rather than decoding with an
+old table.
 
 What it reads, and nothing else:
 
@@ -37,6 +38,19 @@ ENUMS = (
     ("src/eap.rs", "CompareOp", "CRATE_COMPARE_OP"),
     ("src/eap.rs", "StateKind", "CRATE_STATE_KIND"),
     ("src/eap.rs", "TerminalOutcome", "CRATE_TERMINAL_OUTCOME"),
+    # The link-level enums: what every message on the serial link crosses.
+    ("src/protocol.rs", "DevBenchMessage", "CRATE_DEV_BENCH_MESSAGE"),
+    ("src/study.rs", "Action", "CRATE_ACTION"),
+    ("src/study.rs", "GattOperation", "CRATE_GATT_OPERATION"),
+    ("src/study.rs", "BleSecurityLevel", "CRATE_BLE_SECURITY_LEVEL"),
+    ("src/study.rs", "BleRole", "CRATE_BLE_ROLE"),
+    ("src/study.rs", "DevBenchLogLevel", "CRATE_DEV_BENCH_LOG_LEVEL"),
+    ("src/ids.rs", "BleAddressKind", "CRATE_BLE_ADDRESS_KIND"),
+    ("src/gatt.rs", "GattDirection", "CRATE_GATT_DIRECTION"),
+    ("src/gatt.rs", "GattEventKind", "CRATE_GATT_EVENT_KIND"),
+    ("src/sample.rs", "Unit", "CRATE_UNIT"),
+    ("src/streams.rs", "StreamSource", "CRATE_STREAM_SOURCE"),
+    ("src/streams.rs", "StreamScope", "CRATE_STREAM_SCOPE"),
 )
 
 CONST_RE = re.compile(r"^pub const ([A-Z][A-Z0-9_]*): usize = ([A-Za-z0-9_]+);", re.M)

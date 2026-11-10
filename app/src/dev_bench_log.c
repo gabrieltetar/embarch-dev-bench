@@ -23,6 +23,19 @@
  * from the GATT transcript. */
 #define TRUNC_MARK " [cut]"
 
+/* A DBM_LOG_LEVEL_* value is handed to Zephyr's filter as its severity with
+ * no table between them. Those values now come from `DevBenchLogLevel`'s
+ * declaration order in the crate (decision 56), so a reorder there must stop
+ * this build rather than remap severities. */
+BUILD_ASSERT(DBM_LOG_LEVEL_OFF == LOG_LEVEL_NONE, "DevBenchLogLevel::Off is not Zephyr's NONE");
+BUILD_ASSERT(DBM_LOG_LEVEL_ERR == LOG_LEVEL_ERR, "DevBenchLogLevel::Error is not Zephyr's ERR");
+BUILD_ASSERT(DBM_LOG_LEVEL_WRN == LOG_LEVEL_WRN, "DevBenchLogLevel::Warn is not Zephyr's WRN");
+BUILD_ASSERT(DBM_LOG_LEVEL_INF == LOG_LEVEL_INF, "DevBenchLogLevel::Info is not Zephyr's INF");
+BUILD_ASSERT(DBM_LOG_LEVEL_DBG == LOG_LEVEL_DBG, "DevBenchLogLevel::Debug is not Zephyr's DBG");
+/* dev_bench_log.h types these two as 2 so it needs no link-protocol header. */
+BUILD_ASSERT(DEV_BENCH_LOG_BOOT_LEVEL == DBM_LOG_LEVEL_WRN, "boot level is not Warn");
+BUILD_ASSERT(DEV_BENCH_LOG_KERNEL_CEILING == DBM_LOG_LEVEL_WRN, "kernel ceiling is not Warn");
+
 static dev_bench_log_sink_fn log_sink;
 
 /* The level this backend will forward, independent of Zephyr's own runtime

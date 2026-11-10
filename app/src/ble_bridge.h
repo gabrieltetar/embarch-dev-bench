@@ -38,14 +38,19 @@ enum ble_address_kind {
 	BLE_ADDR_RANDOM,
 };
 
+/* `GattOperation` (embarch-study-designer/src/study.rs), values from the
+ * crate's declaration order: main.c casts serial_protocol.h's
+ * `dbm_gatt_op_kind` straight to this. GATT_OP_STREAM_CAPTURE is the variant
+ * the crate retired (its decision 39) and is typed by hand, as it is there. */
 enum gatt_operation_kind {
-	GATT_OP_READ,
-	GATT_OP_WRITE,
-	GATT_OP_NOTIFY,
-	GATT_OP_INDICATE,
-	GATT_OP_SUBSCRIBE,
-	GATT_OP_STREAM_CAPTURE,
+	GATT_OP_READ = CRATE_GATT_OPERATION_READ,
+	GATT_OP_WRITE = CRATE_GATT_OPERATION_WRITE,
+	GATT_OP_NOTIFY = CRATE_GATT_OPERATION_NOTIFY,
+	GATT_OP_INDICATE = CRATE_GATT_OPERATION_INDICATE,
+	GATT_OP_SUBSCRIBE = CRATE_GATT_OPERATION_SUBSCRIBE,
+	GATT_OP_STREAM_CAPTURE = 5,
 };
+_Static_assert(CRATE_GATT_OPERATION_COUNT == 5, "GattOperation gained or lost a variant");
 
 struct gatt_operation {
 	enum gatt_operation_kind kind;
@@ -164,18 +169,19 @@ struct gatt_monitor_selected_params {
 	size_t targets_len;
 };
 
-/* Mirrors `SecurityLevel` (embarch-study-designer/src/study.rs). Values are
- * the wire discriminants, NOT the spec's level numbers -- BLE_SECURITY_L1 is
- * 0. serial_protocol.h's `enum dbm_security_level` carries the same values
- * and `dbm_security_level_number()` is where the offset is undone; this
- * header keeps its own copy so it stays independent of the link protocol's,
- * the same way BLE_MAX_PAYLOAD_LEN already mirrors DBM_MAX_PAYLOAD_LEN. */
+/* `BleSecurityLevel` (embarch-study-designer/src/study.rs). Values are the
+ * wire discriminants, from the crate (crate_limits.h), NOT the spec's level
+ * numbers -- BLE_SECURITY_L1 is 0. serial_protocol.h's `enum
+ * dbm_security_level` takes the same values from the same macros and
+ * `dbm_security_level_number()` is where the offset is undone; this header
+ * keeps its own enum so it stays independent of the link protocol's. */
 enum ble_security_level {
-	BLE_SECURITY_L1 = 0,
-	BLE_SECURITY_L2 = 1,
-	BLE_SECURITY_L3 = 2,
-	BLE_SECURITY_L4 = 3,
+	BLE_SECURITY_L1 = CRATE_BLE_SECURITY_LEVEL_L1,
+	BLE_SECURITY_L2 = CRATE_BLE_SECURITY_LEVEL_L2,
+	BLE_SECURITY_L3 = CRATE_BLE_SECURITY_LEVEL_L3,
+	BLE_SECURITY_L4 = CRATE_BLE_SECURITY_LEVEL_L4,
 };
+_Static_assert(CRATE_BLE_SECURITY_LEVEL_COUNT == 4, "BleSecurityLevel gained or lost a variant");
 
 struct ble_set_security_params {
 	uint8_t level; /* enum ble_security_level */
@@ -333,31 +339,34 @@ void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user
  * BLE_MAX_PAYLOAD_LEN already mirrors DBM_MAX_PAYLOAD_LEN. */
 #define BLE_MAX_TRANSCRIPT_PAYLOAD_LEN 244
 
-/* Mirrors `GattDirection`/`GattEventKind` (embarch-study-designer
- * src/gatt.rs). Values must match those enums' declaration order --
- * main.c passes them straight through to the wire without remapping. */
+/* `GattDirection`/`GattEventKind` (embarch-study-designer src/gatt.rs).
+ * Values are those enums' declaration order, from the crate
+ * (crate_limits.h) -- main.c passes them straight through to the wire
+ * without remapping. */
 enum ble_gatt_direction {
-	BLE_GATT_DIR_OUT = 0,
-	BLE_GATT_DIR_IN = 1,
-	BLE_GATT_DIR_LOCAL = 2,
+	BLE_GATT_DIR_OUT = CRATE_GATT_DIRECTION_OUT,
+	BLE_GATT_DIR_IN = CRATE_GATT_DIRECTION_IN,
+	BLE_GATT_DIR_LOCAL = CRATE_GATT_DIRECTION_LOCAL,
 };
+_Static_assert(CRATE_GATT_DIRECTION_COUNT == 3, "GattDirection gained or lost a variant");
 
 enum ble_gatt_event_kind {
-	BLE_GATT_EVT_CONNECTED = 0,
-	BLE_GATT_EVT_DISCONNECTED = 1,
-	BLE_GATT_EVT_DISCOVERY_STARTED = 2,
-	BLE_GATT_EVT_SERVICE_DISCOVERED = 3,
-	BLE_GATT_EVT_CHARACTERISTIC_DISCOVERED = 4,
-	BLE_GATT_EVT_SUBSCRIBED = 5,
-	BLE_GATT_EVT_UNSUBSCRIBED = 6,
-	BLE_GATT_EVT_WRITE_REQUEST = 7,
-	BLE_GATT_EVT_WRITE_RESPONSE = 8,
-	BLE_GATT_EVT_READ_REQUEST = 9,
-	BLE_GATT_EVT_READ_RESPONSE = 10,
-	BLE_GATT_EVT_NOTIFICATION = 11,
-	BLE_GATT_EVT_INDICATION = 12,
-	BLE_GATT_EVT_ERROR = 13,
+	BLE_GATT_EVT_CONNECTED = CRATE_GATT_EVENT_KIND_CONNECTED,
+	BLE_GATT_EVT_DISCONNECTED = CRATE_GATT_EVENT_KIND_DISCONNECTED,
+	BLE_GATT_EVT_DISCOVERY_STARTED = CRATE_GATT_EVENT_KIND_DISCOVERY_STARTED,
+	BLE_GATT_EVT_SERVICE_DISCOVERED = CRATE_GATT_EVENT_KIND_SERVICE_DISCOVERED,
+	BLE_GATT_EVT_CHARACTERISTIC_DISCOVERED = CRATE_GATT_EVENT_KIND_CHARACTERISTIC_DISCOVERED,
+	BLE_GATT_EVT_SUBSCRIBED = CRATE_GATT_EVENT_KIND_SUBSCRIBED,
+	BLE_GATT_EVT_UNSUBSCRIBED = CRATE_GATT_EVENT_KIND_UNSUBSCRIBED,
+	BLE_GATT_EVT_WRITE_REQUEST = CRATE_GATT_EVENT_KIND_WRITE_REQUEST,
+	BLE_GATT_EVT_WRITE_RESPONSE = CRATE_GATT_EVENT_KIND_WRITE_RESPONSE,
+	BLE_GATT_EVT_READ_REQUEST = CRATE_GATT_EVENT_KIND_READ_REQUEST,
+	BLE_GATT_EVT_READ_RESPONSE = CRATE_GATT_EVENT_KIND_READ_RESPONSE,
+	BLE_GATT_EVT_NOTIFICATION = CRATE_GATT_EVENT_KIND_NOTIFICATION,
+	BLE_GATT_EVT_INDICATION = CRATE_GATT_EVENT_KIND_INDICATION,
+	BLE_GATT_EVT_ERROR = CRATE_GATT_EVENT_KIND_ERROR,
 };
+_Static_assert(CRATE_GATT_EVENT_KIND_COUNT == 14, "GattEventKind gained or lost a variant");
 
 /* One transcript entry, mirroring `GattTranscriptEntry` (src/gatt.rs, `embarch-study-designer` decision 36).
  * Passed by pointer to the sink and copied there -- the bridge does not keep

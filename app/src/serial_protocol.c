@@ -1532,7 +1532,8 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 					step->action.connect.target_address_kind = (uint8_t)kind;
 				} else {
 					memset(step->action.connect.target_address, 0, 6);
-					step->action.connect.target_address_kind = 0;
+					step->action.connect.target_address_kind =
+						CRATE_BLE_ADDRESS_KIND_PUBLIC;
 				}
 
 				/* target_name: Option<String> -- schema v7 (`embarch-study-designer`

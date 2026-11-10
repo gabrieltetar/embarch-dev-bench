@@ -1245,12 +1245,14 @@ static struct action step_to_action(const struct dbm_study_start *study,
 
 	case DBM_ACTION_BLE_CONNECT:
 		action.kind = ACTION_BLE_CONNECT;
-		action.connect.role =
-			(step->action.connect.role == 1) ? BLE_ROLE_PERIPHERAL : BLE_ROLE_CENTRAL;
+		action.connect.role = (step->action.connect.role == CRATE_BLE_ROLE_PERIPHERAL)
+					      ? BLE_ROLE_PERIPHERAL
+					      : BLE_ROLE_CENTRAL;
 		action.connect.has_target_address = step->action.connect.has_target_address;
-		action.connect.target_address_kind = (step->action.connect.target_address_kind == 1)
-							      ? BLE_ADDR_RANDOM
-							      : BLE_ADDR_PUBLIC;
+		action.connect.target_address_kind =
+			(step->action.connect.target_address_kind == CRATE_BLE_ADDRESS_KIND_RANDOM)
+				? BLE_ADDR_RANDOM
+				: BLE_ADDR_PUBLIC;
 		memcpy(action.connect.target_address, step->action.connect.target_address, 6);
 		action.connect.has_target_name = step->action.connect.has_target_name;
 		strncpy(action.connect.target_name, step->action.connect.target_name,
