@@ -139,6 +139,16 @@ static uint8_t ccc_att_err;
  * data — how a failed CCC discovery/write surfaces, since Zephyr doesn't route
  * that through the subscribe callback. */
 static bool ccc_torn_down;
+/* The subscribe params whose CCC answer a step is waiting on, or NULL.
+ * subscribe_cb, and the NULL arms of the monitor and protocol notify
+ * callbacks, set the two flags above and wake ccc_sem only for this params.
+ * The monitor and protocol teardowns are fire-and-forget, so their CCC-clear
+ * answers can land during whatever step runs next; ungated, one could wake
+ * that step's wait before its own write was answered, and a subscription the
+ * DUT was about to refuse would read as live. Written by the dispatch thread
+ * and read on the BT RX thread: one pointer-sized store, the same reasoning
+ * as `link_lost`. */
+static struct bt_gatt_subscribe_params *ccc_waiting;
 
 /* ---- security (decision 34) ---------------------------------------- */
 
@@ -251,6 +261,13 @@ static void *drop_user_data;
  * ble_bridge_monitor_window_open() so main.c can close a window a study left
  * open. */
 static bool monitor_window_open;
+/* Set by disconnected_cb, cleared when a monitor walk starts: the connection
+ * the monitor subscriptions were made on is gone. The host dropped them on
+ * that disconnect (each is VOLATILE, so a bond does not keep them), so nothing
+ * may unsubscribe them afterwards, and the Stop that closes a window whose link
+ * dropped reports `Disconnected` instead of a capture that ended normally
+ * (decision 54). */
+static bool monitor_link_dropped;
 
 /* The (service, characteristic) UUID pair the last resolve_handles() settled
  * on, or NULL/NULL when nothing is cached -- what every DataExchange-side
@@ -558,9 +575,24 @@ static void release_pending_conn(bool cancel)
  * every pending request with it. */
 static void abandon(void *params)
 {
-	if (active_conn != NULL) {
-		bt_gatt_cancel(active_conn, params);
+	struct bt_conn *conn = active_conn;
+
+	if (conn != NULL) {
+		bt_gatt_cancel(conn, params);
 	}
+}
+
+/* Whether `conn` is still a live link. Read from Zephyr rather than from
+ * `link_lost`: the host cancels a dropped link's ATT requests, waking whoever
+ * waited on them, before disconnected_cb sets that flag. A snapshot of
+ * `active_conn` taken before the drop stays a valid pointer into Zephyr's
+ * static connection pool, so asking it is safe. */
+static bool conn_is_up(struct bt_conn *conn)
+{
+	struct bt_conn_info info;
+
+	return conn != NULL && bt_conn_get_info(conn, &info) == 0 &&
+	       info.state == BT_CONN_STATE_CONNECTED;
 }
 
 static void capture_reset(void)
@@ -615,6 +647,7 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 	if (active_conn == conn) {
 		bt_conn_unref(active_conn);
 		active_conn = NULL;
+		monitor_link_dropped = true;
 	}
 
 	/* Handles and subscriptions belong to the connection that's now gone. */
@@ -1448,12 +1481,127 @@ static struct outcome resolve_handles(const struct data_exchange_params *params,
 }
 
 /* Forward declaration: subscribe_cb is defined below (in the "GATT
- * operations" section), but execute_gatt_monitor_all -- which sits before
- * that section, alongside the rest of this file's discovery logic -- reuses
- * it for its own per-characteristic CCC-write callback (it only logs the ATT
- * result, no state specific to the single-subscription case below). */
+ * operations" section), but the monitor walk and the protocol subscribe --
+ * which sit before that section -- reuse it as their CCC-write callback. It
+ * records the ATT result for whichever params `ccc_waiting` names, and
+ * nothing for any other. */
 static void subscribe_cb(struct bt_conn *conn, uint8_t err,
 			  struct bt_gatt_subscribe_params *params);
+
+/* How one subscription attempt by the monitor walk or the protocol subscribe
+ * ended. Every way it can fail is its own value because each needs a
+ * different fix, and the transcript names which one it was (decision 54). */
+enum ccc_verdict {
+	CCC_SUBSCRIBED,
+	/* bt_gatt_subscribe refused to start; the errno is handed back. */
+	CCC_START_FAILED,
+	CCC_TIMED_OUT,
+	/* The DUT answered the CCC write with an ATT error (`ccc_att_err`). */
+	CCC_REJECTED,
+	/* No CCC descriptor in the characteristic's range. Zephyr says so only
+	 * by calling notify with NULL, never through the subscribe callback. */
+	CCC_NOT_FOUND,
+	/* A CCC was found, but the host ended the subscription before it
+	 * landed, with no ATT error to name. */
+	CCC_DROPPED,
+	/* BLE_MAX_MONITOR_SUBSCRIPTIONS already used; nothing was attempted. */
+	CCC_LIMIT,
+	CCC_LINK_LOST,
+	CCC_VERDICT_MAX,
+};
+
+/* What a transcript ERROR row says for a verdict. The rows that existed
+ * before the verdicts (start failed, timed out, limit) keep their text. */
+static const char *ccc_verdict_str(enum ccc_verdict verdict)
+{
+	switch (verdict) {
+	case CCC_SUBSCRIBED:
+		return "subscribed";
+	case CCC_START_FAILED:
+		return "bt_gatt_subscribe failed";
+	case CCC_TIMED_OUT:
+		return "CCC write timed out";
+	case CCC_REJECTED:
+		return "CCC write rejected";
+	case CCC_NOT_FOUND:
+		return "no CCC descriptor";
+	case CCC_DROPPED:
+		return "subscription dropped before it landed";
+	case CCC_LIMIT:
+		return "subscription limit reached";
+	case CCC_LINK_LOST:
+		return "link lost";
+	default:
+		__ASSERT(false, "%s: verdict %d", __func__, (int)verdict);
+		return "unknown";
+	}
+}
+
+/* The NULL arm of the monitor and protocol notify callbacks. A subscription
+ * ending wakes subscribe_and_wait only while it waits on that params: there,
+ * it is a missing CCC or a refused write, and a missing CCC has no other way
+ * to say so. Without the wake the wait sat out the rest of the step's budget.
+ * Any other time it is a disconnect, a server clearing the CCC, or a
+ * fire-and-forget unsubscribe completing, and nothing is waiting on it. */
+static void ccc_note_torn_down(struct bt_gatt_subscribe_params *params)
+{
+	if (params == ccc_waiting) {
+		ccc_torn_down = true;
+		k_sem_give(&ccc_sem);
+	}
+}
+
+/* Starts one subscription and waits for its CCC answer, the shared core of
+ * the monitor walk and the protocol subscribe. `sp` is fully filled in by the
+ * caller; `*start_err` gets bt_gatt_subscribe's errno on CCC_START_FAILED.
+ *
+ * Both answers are read when either wakes the wait: a refused write reaches
+ * notify(NULL) and then the subscribe callback, back to back on the BT RX
+ * thread, so the ATT error is checked first and a found-but-refused CCC is
+ * never reported as a missing one. */
+static enum ccc_verdict subscribe_and_wait(struct bt_gatt_subscribe_params *sp,
+					   int64_t deadline, int *start_err)
+{
+	struct bt_conn *conn = active_conn;
+
+	if (link_lost || !conn_is_up(conn)) {
+		return CCC_LINK_LOST;
+	}
+
+	ccc_att_err = 0;
+	ccc_torn_down = false;
+	k_sem_reset(&ccc_sem);
+	ccc_waiting = sp;
+
+	int err = bt_gatt_subscribe(conn, sp);
+	enum ccc_verdict verdict;
+
+	if (err == -EALREADY) {
+		/* Already in the host's list, so already armed. */
+		verdict = CCC_SUBSCRIBED;
+	} else if (err == -ENOTCONN) {
+		verdict = CCC_LINK_LOST;
+	} else if (err != 0) {
+		*start_err = err;
+		verdict = CCC_START_FAILED;
+	} else if (k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+		ccc_waiting = NULL;
+		abandon(sp);
+		verdict = (link_lost || !conn_is_up(conn)) ? CCC_LINK_LOST : CCC_TIMED_OUT;
+	} else if (link_lost || !conn_is_up(conn)) {
+		verdict = CCC_LINK_LOST;
+	} else if (ccc_att_err != 0) {
+		verdict = CCC_REJECTED;
+	} else if (ccc_torn_down) {
+		verdict = (sp->ccc_handle == BT_GATT_AUTO_DISCOVER_CCC_HANDLE) ? CCC_NOT_FOUND
+										: CCC_DROPPED;
+	} else {
+		verdict = CCC_SUBSCRIBED;
+	}
+
+	ccc_waiting = NULL;
+	return verdict;
+}
 
 /* ---- wildcard discovery (Action::GattDiscover/GattMonitorAll) ---------- */
 
@@ -1648,8 +1796,8 @@ static uint8_t monitor_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_
 	ARG_UNUSED(conn);
 
 	if (data == NULL) {
-		/* This one subscription was torn down (disconnect, or the server
-		 * clearing it) -- nothing to record; the rest keep running. */
+		/* This one subscription ended; the rest keep running. */
+		ccc_note_torn_down(params);
 		return BT_GATT_ITER_STOP;
 	}
 	ptrdiff_t idx_for_transcript = params - monitor_subscribe_params;
@@ -1702,19 +1850,28 @@ static int target_index_for(const struct gatt_monitor_selected_params *params,
  * leave them live across the steps that follow (MonitorStart/SelectedStart).
  *
  * **The two differ in what a characteristic that isn't subscribed means.**
- * Unfiltered, skipping one is routine -- nothing named it. Filtered, every
- * target is something the study said it expects, so a target that matched no
- * discovered characteristic, or matched one that can neither notify nor
- * indicate, fails the step naming it. Left as a skip it would be a study
- * that passes having captured nothing, which is the failure
- * `embarch-study-designer` decisions 36, 53 and 54, and this repo's own
- * decision 42, were each opened by. */
+ * Unfiltered, skipping one is routine -- nothing named it -- so a
+ * characteristic whose subscription failed gets an ERROR row naming why and
+ * the walk moves on; only a walk that subscribed to *nothing* fails, since
+ * the whole set is what it named (decision 54). Filtered, every target is
+ * something the study said it expects, so a target that matched no
+ * discovered characteristic, matched one that can neither notify nor
+ * indicate, or whose subscription did not land, fails the step naming it.
+ * Left as a skip it would be a study that passes having captured nothing,
+ * which is the failure `embarch-study-designer` decisions 36, 53 and 54, and
+ * this repo's own decision 42, were each opened by.
+ *
+ * A disconnect anywhere in the walk ends it as `Disconnected`. On any
+ * outcome but `Pass` the caller tears down what was subscribed before it. */
 static struct outcome monitor_subscribe_matching(int64_t deadline,
 						  const struct gatt_monitor_selected_params *params)
 {
 	if (active_conn == NULL) {
 		return outcome_fail("no active connection -- run a BleConnect step first");
 	}
+
+	/* From here a disconnect is this walk's, or the window's it opens. */
+	monitor_link_dropped = false;
 
 	struct outcome discover_result = run_gatt_discovery(deadline);
 
@@ -1724,12 +1881,18 @@ static struct outcome monitor_subscribe_matching(int64_t deadline,
 
 	monitor_subscribe_count = 0;
 
-	/* Per-target: did it match a discovered characteristic at all, and was
-	 * that characteristic subscribable. Both reported, because they are
-	 * different mistakes -- a typo'd UUID and a read-only characteristic
-	 * need different fixes. */
+	const bool filtered = params != NULL && params->targets_len > 0;
+	/* Per-target: did it match a discovered characteristic at all, was that
+	 * characteristic subscribable, and did a subscription land. All three
+	 * reported, because they are different mistakes -- a typo'd UUID, a
+	 * read-only characteristic and a CCC the DUT refused need different
+	 * fixes. */
 	bool target_found[BLE_MAX_MONITOR_TARGETS] = {false};
 	bool target_subscribable[BLE_MAX_MONITOR_TARGETS] = {false};
+	bool target_landed[BLE_MAX_MONITOR_TARGETS] = {false};
+	enum ccc_verdict target_verdict[BLE_MAX_MONITOR_TARGETS] = {CCC_SUBSCRIBED};
+	uint8_t target_att[BLE_MAX_MONITOR_TARGETS] = {0};
+	uint16_t capable = 0;
 
 	for (uint8_t s = 0; s < discovered_len; s++) {
 		struct ble_gatt_service_info *service = &discovered[s];
@@ -1738,115 +1901,152 @@ static struct outcome monitor_subscribe_matching(int64_t deadline,
 			uint8_t props = service->characteristics[c].properties;
 			bool notify = (props & BT_GATT_CHRC_NOTIFY) != 0;
 			bool indicate = (props & BT_GATT_CHRC_INDICATE) != 0;
-			int target = target_index_for(params, service->uuid,
-						       service->characteristics[c].uuid);
+			const uint8_t *char_uuid = service->characteristics[c].uuid;
+			int target = target_index_for(params, service->uuid, char_uuid);
 
 			if (target < 0) {
 				continue; /* not named by this step */
 			}
-			if (params != NULL && params->targets_len > 0) {
+			if (filtered) {
 				target_found[target] = true;
 				target_subscribable[target] = notify || indicate;
 			}
 			if (!notify && !indicate) {
 				continue;
 			}
+			capable++;
+
+			enum ccc_verdict verdict;
+
 			if (monitor_subscribe_count >= BLE_MAX_MONITOR_SUBSCRIPTIONS) {
 				/* BLE_MAX_MONITOR_SUBSCRIPTIONS's own doc comment:
-				 * log-and-skip further characteristics, not a failure.
-				 * Recorded in the transcript so a reader can see that
-				 * a characteristic was deliberately not subscribed
-				 * rather than silently producing nothing. */
-				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
-						service->uuid,
-						service->characteristics[c].uuid, 0,
-						"subscription limit reached", 26);
-				continue;
+				 * log-and-skip further characteristics, not a failure
+				 * unless a target is the one skipped. */
+				verdict = CCC_LIMIT;
+			} else {
+				struct bt_gatt_subscribe_params *sp =
+					&monitor_subscribe_params[monitor_subscribe_count];
+				int start_err = 0;
+
+				memset(sp, 0, sizeof(*sp));
+				sp->notify = monitor_notify_cb;
+				sp->subscribe = subscribe_cb;
+				sp->value_handle = char_value_handles[s][c];
+				sp->value = indicate ? BT_GATT_CCC_INDICATE : BT_GATT_CCC_NOTIFY;
+				sp->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
+				sp->end_handle = service_ranges[s].end;
+				sp->disc_params =
+					&monitor_ccc_discover_params[monitor_subscribe_count];
+				/* Dropped by the host on disconnect even when the peer
+				 * is bonded. A bonded peer's subscription otherwise
+				 * stays in the host's list across the drop, still
+				 * linked through this struct, which the next walk
+				 * zeroes -- and nothing may unsubscribe it with no
+				 * connection to write the CCC on. */
+				atomic_set_bit(sp->flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
+
+				verdict = subscribe_and_wait(sp, deadline, &start_err);
 			}
 
-			struct bt_gatt_subscribe_params *sp =
-				&monitor_subscribe_params[monitor_subscribe_count];
-
-			memset(sp, 0, sizeof(*sp));
-			sp->notify = monitor_notify_cb;
-			sp->subscribe = subscribe_cb; /* shared: only logs the ATT result */
-			sp->value_handle = char_value_handles[s][c];
-			sp->value = indicate ? BT_GATT_CCC_INDICATE : BT_GATT_CCC_NOTIFY;
-			sp->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
-			sp->end_handle = service_ranges[s].end;
-			sp->disc_params = &monitor_ccc_discover_params[monitor_subscribe_count];
-
-			ccc_att_err = 0;
-			ccc_torn_down = false;
-			k_sem_reset(&ccc_sem);
-
-			int err = bt_gatt_subscribe(active_conn, sp);
-
-			if (err != 0 && err != -EALREADY) {
-				/* This one characteristic's CCC write couldn't even
-				 * start -- move on to the next rather than failing
-				 * the whole step over one characteristic. */
-				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
-						service->uuid,
-						service->characteristics[c].uuid, 0,
-						"bt_gatt_subscribe failed", 24);
-				continue;
+			if (verdict == CCC_LINK_LOST) {
+				return outcome_disconnected("during monitor subscribe");
 			}
-			if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
-				abandon(sp);
+			if (verdict != CCC_SUBSCRIBED) {
+				const char *why = ccc_verdict_str(verdict);
+				uint8_t att = (verdict == CCC_REJECTED) ? ccc_att_err : 0;
+
+				/* Never SUBSCRIBED and never counted: the row says
+				 * which way it failed, with the ATT error in the
+				 * status byte when the DUT refused the write. */
 				transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR,
-						service->uuid,
-						service->characteristics[c].uuid, 0,
-						"CCC write timed out", 19);
+						service->uuid, char_uuid, att, why, strlen(why));
+				if (filtered) {
+					target_verdict[target] = verdict;
+					target_att[target] = att;
+				}
 				continue;
 			}
 
 			transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_SUBSCRIBED, service->uuid,
-					service->characteristics[c].uuid, 0, NULL, 0);
+					char_uuid, 0, NULL, 0);
 
 			monitor_char_index[monitor_subscribe_count] =
 				flat_characteristic_index(s, c);
 			monitor_subscribe_count++;
+			if (filtered) {
+				target_landed[target] = true;
+			}
 		}
 	}
 
-	if (params != NULL && params->targets_len > 0) {
-		for (size_t t = 0; t < params->targets_len; t++) {
-			if (!target_found[t]) {
-				return outcome_fail(
-					"target %u (%02x%02x..%02x%02x) is not on this DUT",
-					(unsigned int)t + 1,
-					params->targets[t].characteristic_uuid[0],
-					params->targets[t].characteristic_uuid[1],
-					params->targets[t].characteristic_uuid[14],
-					params->targets[t].characteristic_uuid[15]);
+	/* Every fail_reason below fits OUTCOME_MAX_FAIL_REASON_LEN (64) with a
+	 * two-digit count or target number; the ERROR rows carry the detail. */
+	if (!filtered) {
+		if (monitor_subscribe_count > 0) {
+			return outcome_pass();
+		}
+		if (capable == 0) {
+			return outcome_fail(
+				"nothing subscribed: no characteristic can notify or indicate");
+		}
+		return outcome_fail("nothing subscribed: all %u attempts failed (see transcript)",
+				    (unsigned int)capable);
+	}
+
+	for (size_t t = 0; t < params->targets_len; t++) {
+		const uint8_t *uuid = params->targets[t].characteristic_uuid;
+
+		if (!target_found[t]) {
+			return outcome_fail("target %u (%02x%02x..%02x%02x) is not on this DUT",
+					    (unsigned int)t + 1, uuid[0], uuid[1], uuid[14],
+					    uuid[15]);
+		}
+		if (!target_subscribable[t]) {
+			return outcome_fail(
+				"target %u (%02x%02x..%02x%02x) can neither notify nor indicate",
+				(unsigned int)t + 1, uuid[0], uuid[1], uuid[14], uuid[15]);
+		}
+		if (!target_landed[t]) {
+			/* "target 16 (abcd..ef01): " leaves 40 characters,
+			 * and the longest verdict is 37. */
+			if (target_verdict[t] == CCC_REJECTED) {
+				return outcome_fail("target %u (%02x%02x..%02x%02x): %s (ATT 0x%02x)",
+						    (unsigned int)t + 1, uuid[0], uuid[1], uuid[14],
+						    uuid[15], ccc_verdict_str(target_verdict[t]),
+						    target_att[t]);
 			}
-			if (!target_subscribable[t]) {
-				return outcome_fail(
-					"target %u (%02x%02x..%02x%02x) can neither notify nor indicate",
-					(unsigned int)t + 1,
-					params->targets[t].characteristic_uuid[0],
-					params->targets[t].characteristic_uuid[1],
-					params->targets[t].characteristic_uuid[14],
-					params->targets[t].characteristic_uuid[15]);
-			}
+			return outcome_fail("target %u (%02x%02x..%02x%02x): %s", (unsigned int)t + 1,
+					    uuid[0], uuid[1], uuid[14], uuid[15],
+					    ccc_verdict_str(target_verdict[t]));
 		}
 	}
 
 	return outcome_pass();
 }
 
-/* Tears down every subscription monitor_subscribe_all armed. Fire-and-forget:
- * by the time this runs the owning step's deadline has usually passed, so
- * there is no budget left to wait out each CCC-clear write's response. */
+/* Tears down every subscription monitor_subscribe_matching armed.
+ * Fire-and-forget: by the time this runs the owning step's deadline has
+ * usually passed, so there is no budget left to wait out each CCC-clear
+ * write's response.
+ *
+ * Calls into the GATT client only on the connection the subscriptions were
+ * made on. Once that link has dropped the host has already removed them
+ * (VOLATILE), and with no connection at all bt_gatt_unsubscribe would read
+ * through NULL. An UNSUBSCRIBED row is written only for a subscription this
+ * actually ended. */
 static void monitor_unsubscribe_all(void)
 {
-	for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
+	struct bt_conn *conn = active_conn;
+	const bool live = conn != NULL && !monitor_link_dropped;
+
+	for (uint8_t i = 0; live && i < monitor_subscribe_count; i++) {
 		const uint8_t *service_uuid = NULL;
 		const uint8_t *char_uuid = NULL;
 
+		if (bt_gatt_unsubscribe(conn, &monitor_subscribe_params[i]) != 0) {
+			continue;
+		}
 		(void)uuids_for_flat_index(monitor_char_index[i], &service_uuid, &char_uuid);
-		(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
 		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED, service_uuid,
 				char_uuid, 0, NULL, 0);
 	}
@@ -1875,9 +2075,15 @@ static struct outcome monitor_result(void)
 static struct outcome execute_gatt_monitor_window(
 	int64_t deadline, const struct gatt_monitor_selected_params *params)
 {
+	/* Before the walk, not after it: a disconnect during the walk gives
+	 * this semaphore too. Resetting it (and `link_lost`) after the walk is
+	 * what used to throw such a disconnect away and pass the step. */
+	k_sem_reset(&disconn_sem);
+
 	struct outcome subscribed_result = monitor_subscribe_matching(deadline, params);
 
 	if (subscribed_result.kind != OUTCOME_PASS) {
+		monitor_unsubscribe_all();
 		return subscribed_result;
 	}
 
@@ -1886,9 +2092,7 @@ static struct outcome execute_gatt_monitor_window(
 	 * own budget is the window" precedent as GATT_OP_STREAM_CAPTURE
 	 * (`embarch-study-designer` decisions 20/21). Ends on the deadline (the
 	 * normal case) or early if the DUT drops the link. */
-	link_lost = false;
-	k_sem_reset(&disconn_sem);
-	bool dropped = k_sem_take(&disconn_sem, remaining(deadline)) == 0;
+	bool dropped = link_lost || k_sem_take(&disconn_sem, remaining(deadline)) == 0;
 
 	/* Unsubscribe everything this step subscribed, regardless of outcome --
 	 * a later step shouldn't keep receiving this step's notifications.
@@ -1915,12 +2119,15 @@ static struct outcome execute_gatt_monitor_window_start(
 		/* Re-arming over a live window would silently orphan the first
 		 * set of subscriptions in Zephyr's host. Close it first. */
 		monitor_unsubscribe_all();
+		monitor_window_open = false;
 	}
 
 	struct outcome subscribed_result = monitor_subscribe_matching(deadline, params);
 
 	if (subscribed_result.kind != OUTCOME_PASS) {
-		monitor_window_open = false;
+		/* A walk that failed after some subscriptions landed leaves them
+		 * armed, and nothing would ever close them: no window opens. */
+		monitor_unsubscribe_all();
 		return subscribed_result;
 	}
 
@@ -1939,15 +2146,24 @@ static struct outcome execute_gatt_monitor_window_start(
 /* `embarch-study-designer` decision 36. A Stop with no open window is a
  * no-op Pass, not a Fail: a study that ends without one still has its
  * window closed for it (main.c), so an explicit-but-redundant Stop is a
- * harmless authoring pattern, not an error worth aborting a study over. */
+ * harmless authoring pattern, not an error worth aborting a study over.
+ *
+ * A window whose link dropped while it was open is closed without touching
+ * the GATT client, and the Stop says so as `Disconnected` (decision 54): the
+ * capture ended at the drop, not here, and a Pass would claim otherwise. */
 static struct outcome execute_gatt_monitor_stop(void)
 {
 	if (!monitor_window_open) {
 		return outcome_pass();
 	}
 
+	const bool dropped = monitor_link_dropped;
+
 	monitor_unsubscribe_all();
 	monitor_window_open = false;
+	if (dropped) {
+		return outcome_disconnected("in the monitor window");
+	}
 	return monitor_result();
 }
 
@@ -1986,8 +2202,12 @@ static void subscribe_cb(struct bt_conn *conn, uint8_t err,
 			 struct bt_gatt_subscribe_params *params)
 {
 	ARG_UNUSED(conn);
-	ARG_UNUSED(params);
 
+	if (params != ccc_waiting) {
+		/* A fire-and-forget unsubscribe's answer, or one for a wait
+		 * that already gave up: it belongs to no step running now. */
+		return;
+	}
 	ccc_att_err = err;
 	k_sem_give(&ccc_sem);
 }
@@ -2141,6 +2361,22 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 		return outcome_pass();
 	}
 
+	/* One snapshot for both calls below. A disconnect after it leaves a
+	 * pointer Zephyr answers -ENOTCONN for; `active_conn` itself can turn
+	 * NULL between a check and a call, and the GATT client reads through
+	 * it unchecked. */
+	struct bt_conn *conn = active_conn;
+
+	if (conn == NULL) {
+		return outcome_disconnected("before subscribing");
+	}
+
+	struct outcome result = outcome_pass();
+
+	/* subscribe_cb answers only the params named here (`ccc_waiting`), so
+	 * every exit below goes through `done` to clear it. */
+	ccc_waiting = &subscribe_params;
+
 	if (subscribe_params.value_handle != 0) {
 		/* Unconditional, not `if (subscribed)`: the host keeps a bonded
 		 * peer's subscription across a reconnect even though
@@ -2153,10 +2389,12 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 		k_sem_reset(&ccc_sem);
 		subscribed = false;
 
-		if (bt_gatt_unsubscribe(active_conn, &subscribe_params) == 0 &&
+		if (bt_gatt_unsubscribe(conn, &subscribe_params) == 0 &&
 		    k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+			ccc_waiting = NULL;
 			abandon(&subscribe_params);
-			return outcome_timed_out();
+			result = outcome_timed_out();
+			goto done;
 		}
 	}
 
@@ -2175,27 +2413,35 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 	ccc_torn_down = false;
 	k_sem_reset(&ccc_sem);
 
-	int err = bt_gatt_subscribe(active_conn, &subscribe_params);
+	int err = bt_gatt_subscribe(conn, &subscribe_params);
 
 	if (err != 0 && err != -EALREADY) {
-		return outcome_fail("bt_gatt_subscribe failed (%d)", err);
+		result = outcome_fail("bt_gatt_subscribe failed (%d)", err);
+		goto done;
 	}
 
 	if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+		ccc_waiting = NULL;
 		abandon(&subscribe_params);
-		return outcome_timed_out();
+		result = outcome_timed_out();
+		goto done;
 	}
 	if (ccc_torn_down) {
 		/* Zephyr reports a failed subscription (no CCC descriptor found, or a
 		 * rejected write) by calling notify with NULL data. */
-		return outcome_fail("subscribe failed — no writable CCC on that characteristic");
+		result = outcome_fail("subscribe failed — no writable CCC on that characteristic");
+		goto done;
 	}
 	if (ccc_att_err != 0) {
-		return outcome_fail("CCC write rejected (ATT 0x%02x)", ccc_att_err);
+		result = outcome_fail("CCC write rejected (ATT 0x%02x)", ccc_att_err);
+		goto done;
 	}
 
 	subscribed = true;
-	return outcome_pass();
+
+done:
+	ccc_waiting = NULL;
+	return result;
 }
 
 /* Waits for one pushed value from an already-subscribed characteristic.
@@ -2674,9 +2920,11 @@ static uint8_t protocol_notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe
 	ARG_UNUSED(conn);
 
 	if (data == NULL) {
-		/* This one subscription was torn down (disconnect, or the
-		 * server clearing it). Nothing to enqueue; the run's own step
-		 * timeout is what notices that frames stopped arriving. */
+		/* This one subscription ended. Nothing to enqueue; once the run
+		 * is under way its own step timeout is what notices that frames
+		 * stopped arriving. During the subscribe, it is how a source
+		 * with no CCC says so (ccc_note_torn_down). */
+		ccc_note_torn_down(params);
 		return BT_GATT_ITER_STOP;
 	}
 
@@ -2799,34 +3047,46 @@ static struct outcome protocol_subscribe_sources(const struct eap_protocol_def *
 
 		memset(sp, 0, sizeof(*sp));
 		sp->notify = protocol_notify_cb;
-		sp->subscribe = subscribe_cb; /* shared: only logs the ATT result */
+		sp->subscribe = subscribe_cb;
 		sp->value_handle = protocol_source_handle[i];
 		sp->value = indicate ? BT_GATT_CCC_INDICATE : BT_GATT_CCC_NOTIFY;
 		sp->ccc_handle = BT_GATT_AUTO_DISCOVER_CCC_HANDLE;
 		sp->end_handle = protocol_source_service_end[i];
 		sp->disc_params = &protocol_ccc_discover_params[protocol_subscribe_count];
+		/* The monitor walk's reason: a bonded peer's disconnect must not
+		 * leave this struct linked in the host's list. */
+		atomic_set_bit(sp->flags, BT_GATT_SUBSCRIBE_FLAG_VOLATILE);
 
-		ccc_att_err = 0;
-		ccc_torn_down = false;
-		k_sem_reset(&ccc_sem);
+		int start_err = 0;
+		enum ccc_verdict verdict = subscribe_and_wait(sp, deadline, &start_err);
 
-		int err = bt_gatt_subscribe(active_conn, sp);
-
-		if (err != 0 && err != -EALREADY) {
-			return outcome_fail("subscribe to protocol source %u failed (%d)",
-					    (unsigned int)i, err);
-		}
-		if (err == 0 && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
-			abandon(sp);
+		switch (verdict) {
+		case CCC_SUBSCRIBED:
+			break;
+		case CCC_LINK_LOST:
+			return outcome_disconnected("during protocol subscribe");
+		case CCC_TIMED_OUT:
 			return outcome_timed_out();
-		}
-		if (ccc_torn_down) {
-			return outcome_fail("protocol source %u has no writable CCC",
-					    (unsigned int)i);
-		}
-		if (ccc_att_err != 0) {
+		case CCC_START_FAILED:
+			return outcome_fail("subscribe to protocol source %u failed (%d)",
+					    (unsigned int)i, start_err);
+		case CCC_REJECTED:
 			return outcome_fail("protocol source %u CCC write rejected (ATT 0x%02x)",
 					    (unsigned int)i, ccc_att_err);
+		case CCC_NOT_FOUND:
+			/* Named at once. It used to time out: Zephyr reports a
+			 * missing CCC only through notify(NULL), whose arm here
+			 * woke nothing. */
+			return outcome_fail("protocol source %u has no CCC descriptor",
+					    (unsigned int)i);
+		case CCC_DROPPED:
+			return outcome_fail("protocol source %u subscription dropped",
+					    (unsigned int)i);
+		default:
+			/* CCC_LIMIT is the monitor walk's alone. */
+			__ASSERT(false, "%s: verdict %d", __func__, (int)verdict);
+			return outcome_fail("protocol source %u: %s", (unsigned int)i,
+					    ccc_verdict_str(verdict));
 		}
 
 		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_SUBSCRIBED,
@@ -2852,10 +3112,17 @@ static struct outcome protocol_subscribe_sources(const struct eap_protocol_def *
  * for the rest of the study. */
 static void protocol_unsubscribe_all(const struct eap_protocol_def *def)
 {
-	for (uint8_t i = 0; i < protocol_subscribe_count; i++) {
+	/* After a run whose link dropped there is no connection, and the host
+	 * has already removed these (VOLATILE); bt_gatt_unsubscribe would
+	 * read through NULL. A row is written only for what this ended. */
+	struct bt_conn *conn = active_conn;
+
+	for (uint8_t i = 0; conn != NULL && i < protocol_subscribe_count; i++) {
 		uint8_t src = protocol_subscribe_source[i];
 
-		(void)bt_gatt_unsubscribe(active_conn, &protocol_subscribe_params[i]);
+		if (bt_gatt_unsubscribe(conn, &protocol_subscribe_params[i]) != 0) {
+			continue;
+		}
 		transcript_emit(BLE_GATT_DIR_OUT, BLE_GATT_EVT_UNSUBSCRIBED,
 				def->sources[src].service_uuid,
 				def->sources[src].characteristic_uuid, 0, NULL, 0);
@@ -3183,18 +3450,23 @@ void ble_bridge_reset(void)
 	advertising = false;
 	streaming = false;
 
-	if (subscribe_params.value_handle != 0 && active_conn != NULL) {
-		(void)bt_gatt_unsubscribe(active_conn, &subscribe_params);
+	/* One snapshot: `active_conn` can turn NULL between a check and a
+	 * call, and the GATT client reads through it unchecked. */
+	struct bt_conn *conn = active_conn;
+
+	if (subscribe_params.value_handle != 0 && conn != NULL) {
+		(void)bt_gatt_unsubscribe(conn, &subscribe_params);
 	}
 	subscribed = false;
 	memset(&subscribe_params, 0, sizeof(subscribe_params));
 
 	/* GattMonitorAll's own subscription set (`embarch-study-designer`
 	 * decision 32) -- torn down here too, before the disconnect below,
-	 * same reasoning as the single subscribe_params case just above. */
-	if (active_conn != NULL) {
+	 * same reasoning as the single subscribe_params case just above. Not
+	 * after their own link dropped: the host removed them then. */
+	if (conn != NULL && !monitor_link_dropped) {
 		for (uint8_t i = 0; i < monitor_subscribe_count; i++) {
-			(void)bt_gatt_unsubscribe(active_conn, &monitor_subscribe_params[i]);
+			(void)bt_gatt_unsubscribe(conn, &monitor_subscribe_params[i]);
 		}
 	}
 	monitor_subscribe_count = 0;
