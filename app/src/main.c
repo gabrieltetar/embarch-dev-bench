@@ -1284,7 +1284,7 @@ static struct action step_to_action(const struct dbm_study_start *study,
 			action.data_exchange.operation.indicate.timeout_ms = de->operation.timeout_ms;
 			break;
 		default:
-			break; /* Read/Subscribe/StreamCapture: no operation fields */
+			break; /* Read/Subscribe: no operation fields */
 		}
 		break;
 	}

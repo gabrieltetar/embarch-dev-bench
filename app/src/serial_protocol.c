@@ -1093,7 +1093,7 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 					WRITE_VARINT(de->operation.timeout_ms);
 					break;
 				default:
-					break; /* Read/Subscribe/StreamCapture: no fields */
+					break; /* Read/Subscribe: no fields */
 				}
 				break;
 			}
@@ -1607,7 +1607,6 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 				}
 				case DBM_GATT_OP_READ:
 				case DBM_GATT_OP_SUBSCRIBE:
-				case DBM_GATT_OP_STREAM_CAPTURE:
 					break;
 				default:
 					/* A malformed/future GattOperation kind this decoder

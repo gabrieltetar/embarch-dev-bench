@@ -679,21 +679,16 @@ struct dbm_ble_connect_action {
 /* `GattOperation` (src/study.rs), values from the crate's declaration order.
  * `payload`/`payload_len` are valid only when `kind == DBM_GATT_OP_WRITE`;
  * `timeout_ms` only for `DBM_GATT_OP_NOTIFY`/`DBM_GATT_OP_INDICATE`.
- *
- * DBM_GATT_OP_STREAM_CAPTURE is the one value here the crate no longer has:
- * `embarch-study-designer` decision 39 retired `GattOperation::StreamCapture`
- * and removed the variant, so nothing the host sends carries a 5 today. It
- * stays typed by hand because this firmware still decodes it; the `_COUNT`
- * assert is what stops a variant the crate appends from landing on its slot
- * unread. ble_bridge.h's `gatt_operation_kind` carries the same values, and
- * main.c casts one to the other. */
+ * ble_bridge.h's `gatt_operation_kind` carries the same values, and main.c
+ * casts one to the other. Any other kind, including the 5 that the retired
+ * `GattOperation::StreamCapture` held (`embarch-study-designer` decision 39),
+ * is a decode error. */
 enum dbm_gatt_op_kind {
 	DBM_GATT_OP_READ = CRATE_GATT_OPERATION_READ,
 	DBM_GATT_OP_WRITE = CRATE_GATT_OPERATION_WRITE,
 	DBM_GATT_OP_NOTIFY = CRATE_GATT_OPERATION_NOTIFY,
 	DBM_GATT_OP_INDICATE = CRATE_GATT_OPERATION_INDICATE,
 	DBM_GATT_OP_SUBSCRIBE = CRATE_GATT_OPERATION_SUBSCRIBE,
-	DBM_GATT_OP_STREAM_CAPTURE = 5,
 };
 _Static_assert(CRATE_GATT_OPERATION_COUNT == 5, "GattOperation gained or lost a variant");
 

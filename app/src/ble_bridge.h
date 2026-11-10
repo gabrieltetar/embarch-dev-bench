@@ -40,15 +40,13 @@ enum ble_address_kind {
 
 /* `GattOperation` (embarch-study-designer/src/study.rs), values from the
  * crate's declaration order: main.c casts serial_protocol.h's
- * `dbm_gatt_op_kind` straight to this. GATT_OP_STREAM_CAPTURE is the variant
- * the crate retired (its decision 39) and is typed by hand, as it is there. */
+ * `dbm_gatt_op_kind` straight to this. */
 enum gatt_operation_kind {
 	GATT_OP_READ = CRATE_GATT_OPERATION_READ,
 	GATT_OP_WRITE = CRATE_GATT_OPERATION_WRITE,
 	GATT_OP_NOTIFY = CRATE_GATT_OPERATION_NOTIFY,
 	GATT_OP_INDICATE = CRATE_GATT_OPERATION_INDICATE,
 	GATT_OP_SUBSCRIBE = CRATE_GATT_OPERATION_SUBSCRIBE,
-	GATT_OP_STREAM_CAPTURE = 5,
 };
 _Static_assert(CRATE_GATT_OPERATION_COUNT == 5, "GattOperation gained or lost a variant");
 
@@ -314,21 +312,6 @@ int ble_bridge_init(void);
 /* Executes one action synchronously, bounded by timeout_ms
  * (`embarch-study-designer`'s `Step.timeout_ms`), returning its device-observed Outcome. */
 struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_ms);
-
-/* Sink for GATT_OP_STREAM_CAPTURE's continuous notifications, which — unlike
- * every other GattOperation — produce samples throughout the step rather than
- * one captured value at the end (embarch-study-designer/src/study.rs's
- * `GattOperation::StreamCapture`, landing in the `SensorWaveform` channel).
- *
- * `data`/`len` are one notification's raw ATT value, borrowed for the duration
- * of the call only. Invoked from Zephyr's BT RX thread, not from whichever
- * thread called ble_bridge_execute — a handler must not block. No handler
- * registered (the current default: nothing wires one up yet, since how raw
- * notification bytes map onto `Sample.value`'s single f32 is still open)
- * means captured samples are counted and
- * dropped, not buffered. */
-typedef void (*ble_stream_sample_handler)(const uint8_t *data, size_t len, void *user_data);
-void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data);
 
 /* ---- GATT transcript (`embarch-study-designer` decision 36) ------------------------ */
 

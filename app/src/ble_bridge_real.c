@@ -172,12 +172,6 @@ static bool scan_matched;
 static uint8_t captured[BLE_MAX_PAYLOAD_LEN];
 static size_t captured_len;
 
-static ble_stream_sample_handler stream_handler;
-static void *stream_user_data;
-/* True only while a GATT_OP_STREAM_CAPTURE step is running, which is what
- * routes notifications to stream_handler instead of into `captured`. */
-static bool streaming;
-
 static struct bt_gatt_discover_params discover_params;
 static struct bt_gatt_discover_params ccc_discover_params;
 static struct bt_gatt_read_params read_params;
@@ -1781,7 +1775,7 @@ static struct outcome execute_gatt_discover(int64_t deadline)
 
 /* GattMonitorAll's own notify callback -- deliberately not notify_cb (below):
  * that one serves the single shared subscribe_params ensure_subscribed()
- * manages for GATT_OP_NOTIFY/INDICATE/SUBSCRIBE/STREAM_CAPTURE, whereas this
+ * manages for GATT_OP_NOTIFY/INDICATE/SUBSCRIBE, whereas this
  * step subscribes to many characteristics concurrently, each with its own
  * `struct bt_gatt_subscribe_params` in monitor_subscribe_params -- `params`
  * is one of that array's elements, so pointer arithmetic recovers which one
@@ -2108,10 +2102,10 @@ static struct outcome execute_gatt_monitor_window(
 	}
 
 	/* Capture window: whatever's left of the step's own timeout_ms after
-	 * discovery+subscribe -- no separate duration field, same "the step's
-	 * own budget is the window" precedent as GATT_OP_STREAM_CAPTURE
-	 * (`embarch-study-designer` decisions 20/21). Ends on the deadline (the
-	 * normal case) or early if the DUT drops the link. */
+	 * discovery+subscribe -- no separate duration field; the step's own
+	 * budget is the window (`embarch-study-designer` decisions 20/21). Ends
+	 * on the deadline (the normal case) or early if the DUT drops the
+	 * link. */
 	bool dropped = link_lost || k_sem_take(&disconn_sem, remaining(deadline)) == 0;
 
 	/* Unsubscribe everything this step subscribed, regardless of outcome --
@@ -2251,21 +2245,6 @@ static uint8_t notify_cb(struct bt_conn *conn, struct bt_gatt_subscribe_params *
 	/* One notification, one row: a monitor subscription on the same
 	 * handle records it itself (monitor_holds). */
 	const bool record = !monitor_holds(params->value_handle);
-
-	if (streaming) {
-		if (stream_handler != NULL) {
-			stream_handler(data, length, stream_user_data);
-		}
-		/* Recorded even though the bytes also go to the stream handler:
-		 * "exhaustive" means the transcript accounts for every
-		 * notification, including the ones another channel consumes. */
-		if (record) {
-			transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION,
-					cached_service_uuid(), cached_characteristic_uuid(), 0,
-					data, length);
-		}
-		return BT_GATT_ITER_CONTINUE;
-	}
 
 	if (record) {
 		transcript_emit(BLE_GATT_DIR_IN, BLE_GATT_EVT_NOTIFICATION, cached_service_uuid(),
@@ -2483,7 +2462,8 @@ done:
  * Waits for a value pushed after the step began: ble_bridge_execute() resets
  * both the capture buffer and notify_sem on entry, so a notification that
  * arrived between steps (e.g. after an earlier Subscribe step) is not replayed
- * here. Continuous capture is GATT_OP_STREAM_CAPTURE's job, not this one's.
+ * here. Continuous capture is a study tap's job (`StreamSource::GattNotify`),
+ * not this one's.
  */
 static struct outcome await_notification(int64_t op_deadline, int64_t step_deadline)
 {
@@ -2539,38 +2519,9 @@ static struct outcome execute_data_exchange(const struct data_exchange_params *p
 
 	case GATT_OP_SUBSCRIBE:
 		/* Enable notifications without waiting for one; the subscription
-		 * deliberately outlives this step so a later Notify/Indicate or
-		 * StreamCapture step on the same characteristic reuses it. */
+		 * deliberately outlives this step so a later Notify/Indicate step
+		 * on the same characteristic reuses it. */
 		return ensure_subscribed(value_handle, BT_GATT_CCC_NOTIFY, deadline);
-
-	case GATT_OP_STREAM_CAPTURE: {
-		/* Continuous capture for the whole step (no separate duration field
-		 * in the crate's type — the step's timeout_ms is the window). Values
-		 * go to stream_handler as they arrive rather than into `captured`. */
-		struct outcome sub = ensure_subscribed(value_handle, BT_GATT_CCC_NOTIFY, deadline);
-
-		if (sub.kind != OUTCOME_PASS) {
-			return sub;
-		}
-
-		capture_reset();
-		link_lost = false;
-		k_sem_reset(&disconn_sem);
-		streaming = true;
-		/* The window ends either when the step's budget runs out (the normal
-		 * case, a timeout on this wait) or early if the DUT drops the link. */
-		const bool dropped = k_sem_take(&disconn_sem, remaining(deadline)) == 0;
-
-		streaming = false;
-
-		if (dropped) {
-			return outcome_disconnected("during stream capture");
-		}
-		/* Running the window to completion is the outcome; whether any
-		 * samples arrived is a host-side question
-		 * (`embarch-study-designer` decision 19). */
-		return outcome_pass();
-	}
 
 	default:
 		return outcome_fail("unknown GATT operation kind");
@@ -3495,12 +3446,6 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	return outcome;
 }
 
-void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data)
-{
-	stream_handler = handler;
-	stream_user_data = user_data;
-}
-
 void ble_bridge_set_drop_sink(ble_drop_sink sink, void *user_data)
 {
 	drop_sink = sink;
@@ -3524,7 +3469,6 @@ void ble_bridge_reset(void)
 	(void)bt_le_adv_stop();
 	release_pending_conn(true);
 	advertising = false;
-	streaming = false;
 
 	/* One snapshot: `active_conn` can turn NULL between a check and a
 	 * call, and the GATT client reads through it unchecked. */

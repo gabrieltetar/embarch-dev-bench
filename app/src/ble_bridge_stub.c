@@ -10,14 +10,8 @@
 
 #include "ble_bridge.h"
 
-/* Registered but never invoked: with no radio there are no notifications to
- * stream. Stored anyway so the setter behaves identically on both sides of the
- * decision-16 split. */
-static ble_stream_sample_handler stream_handler;
-static void *stream_user_data;
-
-/* Same posture for the GATT transcript (design.md §3 decision 36): stored so
- * the setter behaves identically on both sides of the decision-16 split, never
+/* The GATT transcript sink (design.md §3 decision 36): stored so the setter
+ * behaves identically on both sides of the decision-16 split, never
  * invoked, because a canned Pass observed no GATT traffic to transcribe.
  * Emitting invented entries here would let a native_sim run produce a
  * transcript indistinguishable from a real capture -- exactly the failure this
@@ -60,12 +54,6 @@ struct outcome ble_bridge_execute(const struct action *action, uint32_t timeout_
 	return (struct outcome){.kind = OUTCOME_PASS};
 }
 
-void ble_bridge_set_stream_handler(ble_stream_sample_handler handler, void *user_data)
-{
-	stream_handler = handler;
-	stream_user_data = user_data;
-}
-
 void ble_bridge_set_log_sink(ble_log_sink sink, void *user_data)
 {
 	log_sink = sink;
@@ -101,8 +89,6 @@ void ble_bridge_clear_bonds(void)
 
 void ble_bridge_reset(void)
 {
-	(void)stream_handler;
-	(void)stream_user_data;
 	(void)transcript_sink;
 	(void)transcript_user_data;
 }

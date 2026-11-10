@@ -1098,6 +1098,36 @@ ZTEST(serial_protocol, test_study_start_data_exchange_write_action_round_trip)
 	zassert_equal(de->operation.payload[1], 0xAD, "payload[1] mismatch");
 }
 
+/* Kind 5 was `GattOperation::StreamCapture`, which `embarch-study-designer`
+ * decision 39 retired and removed. Its encoding was field-less, so the
+ * encoder's default arm produces exactly the bytes an old host would have
+ * sent. The same frame with a kind the crate still has decodes, so what
+ * fails the second decode is the kind alone. */
+ZTEST(serial_protocol, test_study_start_refuses_the_retired_stream_capture_kind)
+{
+	memset(&study_start_msg, 0, sizeof(study_start_msg));
+	study_start_msg.tag = DBM_TAG_STUDY_START;
+	study_start_msg.study_start.steps_len = 1;
+	strcpy(study_start_msg.study_start.steps[0].name, "capture");
+	study_start_msg.study_start.steps[0].timeout_ms = 2000;
+	study_start_msg.study_start.steps[0].action_tag = DBM_ACTION_DATA_EXCHANGE;
+	memset(study_start_msg.study_start.steps[0].action.data_exchange.service_uuid, 0x11, 16);
+	memset(study_start_msg.study_start.steps[0].action.data_exchange.characteristic_uuid, 0x22,
+	       16);
+
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.kind = DBM_GATT_OP_READ;
+	zassert_equal(round_trip(&study_start_msg, &study_start_decoded), 0,
+		      "the control frame must decode");
+
+	/* The first kind past the crate's last: the slot StreamCapture held,
+	 * for as long as serial_protocol.h's `_COUNT` assert reads 5. */
+	study_start_msg.study_start.steps[0].action.data_exchange.operation.kind =
+		CRATE_GATT_OPERATION_COUNT;
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_not_equal(round_trip(&study_start_msg, &study_start_decoded), 0,
+			  "a GattOperation kind the crate does not have must fail the decode");
+}
+
 ZTEST(serial_protocol, test_study_start_gatt_discover_and_monitor_all_round_trip)
 {
 	memset(&study_start_msg, 0, sizeof(study_start_msg));
