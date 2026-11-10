@@ -923,11 +923,9 @@ int dbm_encode_transcript_entry(const struct dbm_gatt_transcript_entry *entry, u
 	return (int)pos;
 }
 
-static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap,
-			size_t *pos)
-{
-	uint8_t varint_buf[10];
-
+/* Appends `value` as a postcard varint at `out + *pos`, returning -1 from the
+ * enclosing function if it would pass `out_cap`. Every user declares its own
+ * `uint8_t varint_buf[10]`. */
 #define WRITE_VARINT(value)                                                                       \
 	do {                                                                                       \
 		size_t n = pc_write_varint((uint64_t)(value), varint_buf);                        \
@@ -938,6 +936,240 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		*pos += n;                                                                        \
 	} while (0)
 
+/* One encoder per variant the bench sends, each writing the variant's
+ * fields after the tag. encode_body and encode_tx_body both dispatch to
+ * these, so the two message types share one encoding of every variant. */
+
+static int encode_hello_ack(const struct dbm_hello_ack *m, uint8_t *out, size_t out_cap,
+			    size_t *pos)
+{
+	uint8_t varint_buf[10];
+
+	WRITE_VARINT(m->schema_version);
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = m->compatible ? 1 : 0;
+	if (pc_write_bytes((const uint8_t *)m->firmware_version, strlen(m->firmware_version), out,
+			   out_cap, pos) != 0) {
+		return -1;
+	}
+	/* schema v10 (`embarch-study-designer` decision 47).
+	 * An empty hardware_id still writes its length prefix -- an
+	 * absent field and a zero-length one are different bytes, and
+	 * only the latter leaves the frame walkable. */
+	return pc_write_bytes((const uint8_t *)m->hardware_id, strlen(m->hardware_id), out, out_cap,
+			      pos);
+}
+
+static int encode_stream_open(const struct dbm_stream_open *m, uint8_t *out, size_t out_cap,
+			      size_t *pos)
+{
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = m->id; /* u8: raw byte, not varint */
+	return 0;
+}
+
+static int encode_stream_chunk_batch(const struct dbm_stream_chunk_batch *batch, uint8_t *out,
+				     size_t out_cap, size_t *pos)
+{
+	uint8_t varint_buf[10];
+
+	/* embarch-study-designer schema v8, `embarch-study-designer` decision 39.
+	 * Arrival-stamped bytes, never decoded values -- this firmware
+	 * assigns no meaning to a record's payload at all; the tap's
+	 * declared `StreamEncoding` does that, host-side. */
+	if (batch->records_len > DBM_MAX_STREAM_RECORDS_PER_BATCH) {
+		return -1; /* would read past records[]'s own bound */
+	}
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = batch->id; /* u8: raw byte, not varint */
+	WRITE_VARINT(batch->records_len);
+	for (uint32_t i = 0; i < batch->records_len; i++) {
+		const struct dbm_stream_record *rec = &batch->records[i];
+
+		if (rec->bytes_len > DBM_MAX_STREAM_CHUNK_BYTES) {
+			return -1;
+		}
+		WRITE_VARINT(rec->rx_utc_ms);
+		if (pc_write_bytes(rec->bytes, rec->bytes_len, out, out_cap, pos) != 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int encode_stream_close(const struct dbm_stream_close *m, uint8_t *out, size_t out_cap,
+			       size_t *pos)
+{
+	uint8_t varint_buf[10];
+
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = m->id; /* u8: raw byte, not varint */
+	WRITE_VARINT(m->dropped);
+	return 0;
+}
+
+static int encode_log_line(const struct dbm_log_line *m, uint8_t *out, size_t out_cap,
+			   size_t *pos)
+{
+	return pc_write_bytes((const uint8_t *)m->text, strlen(m->text), out, out_cap, pos);
+}
+
+static int encode_step_result(const struct dbm_step_result *m, uint8_t *out, size_t out_cap,
+			      size_t *pos)
+{
+	uint8_t varint_buf[10];
+	const struct dbm_step_result_payload *r = &m->result;
+
+	WRITE_VARINT(m->step_index);
+	if (pc_write_bytes((const uint8_t *)r->step_name, strlen(r->step_name), out, out_cap,
+			    pos) != 0) {
+		return -1;
+	}
+	WRITE_VARINT(r->outcome.tag);
+	if (r->outcome.tag == 1 &&
+	    pc_write_bytes((const uint8_t *)r->outcome.fail_reason,
+			    strlen(r->outcome.fail_reason), out, out_cap, pos) != 0) {
+		return -1;
+	}
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = r->has_captured_data ? 1 : 0;
+	if (r->has_captured_data &&
+	    pc_write_bytes(r->captured_data, r->captured_data_len, out, out_cap, pos) != 0) {
+		return -1;
+	}
+	/* `power_samples_ref`/`waveform_ref` were encoded here as two
+	 * permanent `None` bytes. They are **retired** from `StepResult`
+	 * by `embarch-study-designer` decision 39 (schema v8) -- a capture belongs to
+	 * the study's declared taps, reported once as
+	 * `StudyResult.streams`, not to one step -- and this file kept
+	 * writing them anyway. Removed at v9, alongside `power_sample`:
+	 * two bytes Rust does not expect, on the one message this
+	 * firmware sends most.
+	 *
+	 * Found by walking this encoder against the Rust type while
+	 * implementing v9, not by a test: nothing pinned `StepResult`'s
+	 * bytes across the two languages, because it was not a *new*
+	 * record when decision 36's both-languages rule came in. The v9
+	 * pass adds that pin (app/tests/serial_protocol) so the gap
+	 * cannot reopen.
+	 *
+	 * gatt_services (`embarch-study-designer` decisions 31/32) -- unlike those
+	 * two, this firmware populates it for real. */
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = r->has_gatt_services ? 1 : 0;
+	if (r->has_gatt_services) {
+		if (r->gatt_services_len > DBM_MAX_DISCOVERED_SERVICES) {
+			return -1;
+		}
+		WRITE_VARINT(r->gatt_services_len);
+		for (uint32_t s = 0; s < r->gatt_services_len; s++) {
+			const struct dbm_gatt_service_info *svc = &r->gatt_services[s];
+
+			if (*pos + 16 > out_cap) {
+				return -1;
+			}
+			memcpy(out + *pos, svc->uuid, 16);
+			*pos += 16;
+			if (svc->characteristics_len > DBM_MAX_CHARS_PER_SERVICE) {
+				return -1;
+			}
+			WRITE_VARINT(svc->characteristics_len);
+			for (uint32_t c = 0; c < svc->characteristics_len; c++) {
+				const struct dbm_gatt_characteristic_info *chr =
+					&svc->characteristics[c];
+
+				if (*pos + 17 > out_cap) {
+					return -1;
+				}
+				memcpy(out + *pos, chr->uuid, 16);
+				*pos += 16;
+				out[(*pos)++] = chr->properties; /* u8: raw byte */
+			}
+		}
+	}
+
+	/* `gatt_activity`'s `Option` byte and its records were encoded
+	 * here. **Retired at schema v14**
+	 * (`embarch-study-designer` decision 54): the field
+	 * is gone from the Rust `StepResult`, so writing even the `None`
+	 * byte for it would shift `security_level` by one and decode as
+	 * a security level that was never reported -- the precise
+	 * failure the `power_samples_ref`/`waveform_ref` bytes caused
+	 * for a whole schema version before v9 caught them. The v14 wire
+	 * vector pins the 21-byte frame that proves it doesn't. */
+
+	/* `security_level: Option<SecurityLevel>` -- schema v12's
+	 * trailing field (`embarch-study-designer` decision
+	 * 44), and the last field of `StepResult` since v14. */
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = r->has_security_level ? 1 : 0;
+	if (r->has_security_level) {
+		WRITE_VARINT(r->security_level);
+	}
+
+	/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
+	 * field (`embarch-study-designer` decision 62), and
+	 * the last field of `StepResult` since v15.
+	 *
+	 * `None` for every action but `RunProtocol`, which is every
+	 * action that existed before it -- so on the message this
+	 * firmware sends most, this is one `0x00` byte. That is why the
+	 * field was appended rather than inserted: the wire diff a human
+	 * has to check is a suffix, and this decoder adopts it by
+	 * reading one more Option at the end rather than by re-walking
+	 * the message. */
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = r->has_protocol ? 1 : 0;
+	if (r->has_protocol) {
+		if (pc_write_bytes((const uint8_t *)r->protocol_final_state,
+				    strlen(r->protocol_final_state), out, out_cap,
+				    pos) != 0) {
+			return -1;
+		}
+		WRITE_VARINT(r->protocol_outcome.tag);
+		if (r->protocol_outcome.tag == 1 &&
+		    pc_write_bytes((const uint8_t *)r->protocol_outcome.fail_reason,
+				    strlen(r->protocol_outcome.fail_reason), out, out_cap,
+				    pos) != 0) {
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int encode_study_done(const struct dbm_study_done *m, uint8_t *out, size_t out_cap,
+			     size_t *pos)
+{
+	if (*pos + 1 > out_cap) {
+		return -1;
+	}
+	out[(*pos)++] = m->completed ? 1 : 0;
+	return 0;
+}
+
+/* Every message, including the two only Core sends (`Hello`, `StudyStart`):
+ * this suite's round-trip tests encode through it. */
+static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap,
+			size_t *pos)
+{
+	uint8_t varint_buf[10];
+
 	WRITE_VARINT(msg->tag);
 
 	switch (msg->tag) {
@@ -945,67 +1177,6 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		WRITE_VARINT(msg->hello.schema_version);
 		WRITE_VARINT(msg->hello.host_utc_ms);
 		return 0;
-	case DBM_TAG_HELLO_ACK:
-		WRITE_VARINT(msg->hello_ack.schema_version);
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = msg->hello_ack.compatible ? 1 : 0;
-		if (pc_write_bytes((const uint8_t *)msg->hello_ack.firmware_version,
-				   strlen(msg->hello_ack.firmware_version), out, out_cap,
-				   pos) != 0) {
-			return -1;
-		}
-		/* schema v10 (`embarch-study-designer` decision 47).
-		 * An empty hardware_id still writes its length prefix -- an
-		 * absent field and a zero-length one are different bytes, and
-		 * only the latter leaves the frame walkable. */
-		return pc_write_bytes((const uint8_t *)msg->hello_ack.hardware_id,
-				       strlen(msg->hello_ack.hardware_id), out, out_cap, pos);
-	case DBM_TAG_STREAM_OPEN:
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = msg->stream_open.id; /* u8: raw byte, not varint */
-		return 0;
-	case DBM_TAG_STREAM_CHUNK_BATCH: {
-		/* embarch-study-designer schema v8, `embarch-study-designer` decision 39.
-		 * Arrival-stamped bytes, never decoded values -- this firmware
-		 * assigns no meaning to a record's payload at all; the tap's
-		 * declared `StreamEncoding` does that, host-side. */
-		const struct dbm_stream_chunk_batch *batch = &msg->stream_chunk_batch;
-
-		if (batch->records_len > DBM_MAX_STREAM_RECORDS_PER_BATCH) {
-			return -1; /* would read past records[]'s own bound */
-		}
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = batch->id; /* u8: raw byte, not varint */
-		WRITE_VARINT(batch->records_len);
-		for (uint32_t i = 0; i < batch->records_len; i++) {
-			const struct dbm_stream_record *rec = &batch->records[i];
-
-			if (rec->bytes_len > DBM_MAX_STREAM_CHUNK_BYTES) {
-				return -1;
-			}
-			WRITE_VARINT(rec->rx_utc_ms);
-			if (pc_write_bytes(rec->bytes, rec->bytes_len, out, out_cap, pos) != 0) {
-				return -1;
-			}
-		}
-		return 0;
-	}
-	case DBM_TAG_STREAM_CLOSE:
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = msg->stream_close.id; /* u8: raw byte, not varint */
-		WRITE_VARINT(msg->stream_close.dropped);
-		return 0;
-	case DBM_TAG_LOG_LINE:
-		return pc_write_bytes((const uint8_t *)msg->log_line.text,
-				       strlen(msg->log_line.text), out, out_cap, pos);
 	case DBM_TAG_STUDY_START:
 		/* dev-bench never sends StudyStart in practice (Core is the only
 		 * sender) -- this encode path exists for this file's own
@@ -1210,167 +1381,59 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		WRITE_VARINT(0); /* protocols: Vec<ProtocolDef>, empty */
 		WRITE_VARINT(0); /* protocols_crc: CRC-32 of nothing */
 		return 0;
-	case DBM_TAG_STEP_RESULT: {
-		const struct dbm_step_result_payload *r = &msg->step_result.result;
-
-		WRITE_VARINT(msg->step_result.step_index);
-		if (pc_write_bytes((const uint8_t *)r->step_name, strlen(r->step_name), out, out_cap,
-				    pos) != 0) {
-			return -1;
-		}
-		WRITE_VARINT(r->outcome.tag);
-		if (r->outcome.tag == 1 &&
-		    pc_write_bytes((const uint8_t *)r->outcome.fail_reason,
-				    strlen(r->outcome.fail_reason), out, out_cap, pos) != 0) {
-			return -1;
-		}
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = r->has_captured_data ? 1 : 0;
-		if (r->has_captured_data &&
-		    pc_write_bytes(r->captured_data, r->captured_data_len, out, out_cap, pos) != 0) {
-			return -1;
-		}
-		/* `power_samples_ref`/`waveform_ref` were encoded here as two
-		 * permanent `None` bytes. They are **retired** from `StepResult`
-		 * by `embarch-study-designer` decision 39 (schema v8) -- a capture belongs to
-		 * the study's declared taps, reported once as
-		 * `StudyResult.streams`, not to one step -- and this file kept
-		 * writing them anyway. Removed at v9, alongside `power_sample`:
-		 * two bytes Rust does not expect, on the one message this
-		 * firmware sends most.
-		 *
-		 * Found by walking this encoder against the Rust type while
-		 * implementing v9, not by a test: nothing pinned `StepResult`'s
-		 * bytes across the two languages, because it was not a *new*
-		 * record when decision 36's both-languages rule came in. The v9
-		 * pass adds that pin (app/tests/serial_protocol) so the gap
-		 * cannot reopen.
-		 *
-		 * gatt_services (`embarch-study-designer` decisions 31/32) -- unlike those
-		 * two, this firmware populates it for real. */
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = r->has_gatt_services ? 1 : 0;
-		if (r->has_gatt_services) {
-			if (r->gatt_services_len > DBM_MAX_DISCOVERED_SERVICES) {
-				return -1;
-			}
-			WRITE_VARINT(r->gatt_services_len);
-			for (uint32_t s = 0; s < r->gatt_services_len; s++) {
-				const struct dbm_gatt_service_info *svc = &r->gatt_services[s];
-
-				if (*pos + 16 > out_cap) {
-					return -1;
-				}
-				memcpy(out + *pos, svc->uuid, 16);
-				*pos += 16;
-				if (svc->characteristics_len > DBM_MAX_CHARS_PER_SERVICE) {
-					return -1;
-				}
-				WRITE_VARINT(svc->characteristics_len);
-				for (uint32_t c = 0; c < svc->characteristics_len; c++) {
-					const struct dbm_gatt_characteristic_info *chr =
-						&svc->characteristics[c];
-
-					if (*pos + 17 > out_cap) {
-						return -1;
-					}
-					memcpy(out + *pos, chr->uuid, 16);
-					*pos += 16;
-					out[(*pos)++] = chr->properties; /* u8: raw byte */
-				}
-			}
-		}
-
-		/* `gatt_activity`'s `Option` byte and its records were encoded
-		 * here. **Retired at schema v14**
-		 * (`embarch-study-designer` decision 54): the field
-		 * is gone from the Rust `StepResult`, so writing even the `None`
-		 * byte for it would shift `security_level` by one and decode as
-		 * a security level that was never reported -- the precise
-		 * failure the `power_samples_ref`/`waveform_ref` bytes caused
-		 * for a whole schema version before v9 caught them. The v14 wire
-		 * vector pins the 21-byte frame that proves it doesn't. */
-
-		/* `security_level: Option<SecurityLevel>` -- schema v12's
-		 * trailing field (`embarch-study-designer` decision
-		 * 44), and the last field of `StepResult` since v14. */
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = r->has_security_level ? 1 : 0;
-		if (r->has_security_level) {
-			WRITE_VARINT(r->security_level);
-		}
-
-		/* `protocol: Option<ProtocolOutcome>` -- schema v15's trailing
-		 * field (`embarch-study-designer` decision 62), and
-		 * the last field of `StepResult` since v15.
-		 *
-		 * `None` for every action but `RunProtocol`, which is every
-		 * action that existed before it -- so on the message this
-		 * firmware sends most, this is one `0x00` byte. That is why the
-		 * field was appended rather than inserted: the wire diff a human
-		 * has to check is a suffix, and this decoder adopts it by
-		 * reading one more Option at the end rather than by re-walking
-		 * the message. */
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = r->has_protocol ? 1 : 0;
-		if (r->has_protocol) {
-			if (pc_write_bytes((const uint8_t *)r->protocol_final_state,
-					    strlen(r->protocol_final_state), out, out_cap,
-					    pos) != 0) {
-				return -1;
-			}
-			WRITE_VARINT(r->protocol_outcome.tag);
-			if (r->protocol_outcome.tag == 1 &&
-			    pc_write_bytes((const uint8_t *)r->protocol_outcome.fail_reason,
-					    strlen(r->protocol_outcome.fail_reason), out, out_cap,
-					    pos) != 0) {
-				return -1;
-			}
-		}
-		return 0;
-	}
+	case DBM_TAG_HELLO_ACK:
+		return encode_hello_ack(&msg->hello_ack, out, out_cap, pos);
+	case DBM_TAG_STREAM_OPEN:
+		return encode_stream_open(&msg->stream_open, out, out_cap, pos);
+	case DBM_TAG_STREAM_CHUNK_BATCH:
+		return encode_stream_chunk_batch(&msg->stream_chunk_batch, out, out_cap, pos);
+	case DBM_TAG_STREAM_CLOSE:
+		return encode_stream_close(&msg->stream_close, out, out_cap, pos);
+	case DBM_TAG_LOG_LINE:
+		return encode_log_line(&msg->log_line, out, out_cap, pos);
+	case DBM_TAG_STEP_RESULT:
+		return encode_step_result(&msg->step_result, out, out_cap, pos);
 	case DBM_TAG_STUDY_DONE:
-		if (*pos + 1 > out_cap) {
-			return -1;
-		}
-		out[(*pos)++] = msg->study_done.completed ? 1 : 0;
-		return 0;
+		return encode_study_done(&msg->study_done, out, out_cap, pos);
 	default:
 		return -1;
 	}
-
-#undef WRITE_VARINT
 }
 
-int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap)
+/* The same variants as encode_body's, from the message type that holds only
+ * them. */
+static int encode_tx_body(const struct dev_bench_tx_message *msg, uint8_t *out, size_t out_cap,
+			  size_t *pos)
 {
-	/* `static`, not a stack-local array: DBM_MAX_RAW_LEN now scales with
-	 * DBM_MAX_STEPS_PER_STUDY (StudyStart's own worst case), too large for
-	 * a small embedded call stack, especially with dbm_decode_frame's own
-	 * same-size scratch buffer potentially live in a caller's frame at the
-	 * same time (e.g. main.c's send_message_locked). Safe because every
-	 * caller holds main.c's link_tx_mutex -- which, as of `embarch-study-designer`
-	 * decision 36, is what serializes this static, not the old
-	 * single-threaded-link assumption: the transcript TX thread is a
-	 * second sender, and it has to keep draining while the dispatch loop
-	 * is blocked inside a long ble_bridge_execute(). Same posture as
-	 * receive_message's static rx_buf in main.c, which stays
-	 * single-reader. */
-	static uint8_t raw[DBM_MAX_RAW_LEN];
-	size_t raw_len = 0;
+	uint8_t varint_buf[10];
 
-	if (encode_body(msg, raw, sizeof(raw), &raw_len) != 0) {
+	WRITE_VARINT(msg->tag);
+
+	switch (msg->tag) {
+	case DBM_TAG_HELLO_ACK:
+		return encode_hello_ack(&msg->hello_ack, out, out_cap, pos);
+	case DBM_TAG_STREAM_OPEN:
+		return encode_stream_open(&msg->stream_open, out, out_cap, pos);
+	case DBM_TAG_STREAM_CHUNK_BATCH:
+		return encode_stream_chunk_batch(&msg->stream_chunk_batch, out, out_cap, pos);
+	case DBM_TAG_STREAM_CLOSE:
+		return encode_stream_close(&msg->stream_close, out, out_cap, pos);
+	case DBM_TAG_LOG_LINE:
+		return encode_log_line(&msg->log_line, out, out_cap, pos);
+	case DBM_TAG_STEP_RESULT:
+		return encode_step_result(&msg->step_result, out, out_cap, pos);
+	case DBM_TAG_STUDY_DONE:
+		return encode_study_done(&msg->study_done, out, out_cap, pos);
+	default:
 		return -1;
 	}
+}
 
+#undef WRITE_VARINT
+
+/* COBS-stuffs `raw` into `out` and appends the 0x00 delimiter. */
+static int frame_raw(const uint8_t *raw, size_t raw_len, uint8_t *out, size_t out_cap)
+{
 	/* cobs_encode's worst case output is raw_len + ceil(raw_len / 254) + 1. */
 	size_t cobs_cap = raw_len + (raw_len / 254) + 2;
 
@@ -1381,6 +1444,40 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
 
 	out[cobs_len] = 0x00;
 	return (int)(cobs_len + 1);
+}
+
+int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap)
+{
+	/* `static`, not a stack-local array: DBM_MAX_RAW_LEN scales with
+	 * DBM_MAX_STEPS_PER_STUDY (StudyStart's own worst case), too large for
+	 * a small embedded call stack. The firmware never calls this (it sends
+	 * through dbm_encode_tx_frame), so the link drops this buffer with the
+	 * function; only the round-trip tests carry it. */
+	static uint8_t raw[DBM_MAX_RAW_LEN];
+	size_t raw_len = 0;
+
+	if (encode_body(msg, raw, sizeof(raw), &raw_len) != 0) {
+		return -1;
+	}
+	return frame_raw(raw, raw_len, out, out_cap);
+}
+
+int dbm_encode_tx_frame(const struct dev_bench_tx_message *msg, uint8_t *out, size_t out_cap)
+{
+	/* `static` for the same reason as dbm_encode_frame's, and sized by what
+	 * the bench can send rather than by StudyStart. Safe because every
+	 * caller holds main.c's link_tx_mutex -- which, as of
+	 * `embarch-study-designer` decision 36, is what serializes this static:
+	 * the transcript TX thread is a second sender, and it has to keep
+	 * draining while the dispatch loop is blocked inside a long
+	 * ble_bridge_execute(). */
+	static uint8_t raw[DBM_MAX_OUTBOUND_RAW_LEN];
+	size_t raw_len = 0;
+
+	if (encode_tx_body(msg, raw, sizeof(raw), &raw_len) != 0) {
+		return -1;
+	}
+	return frame_raw(raw, raw_len, out, out_cap);
 }
 
 static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_message *msg)

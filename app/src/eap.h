@@ -25,7 +25,7 @@
  *    the crate's `Operand::Literal` is an `i64`, and an operand is the
  *    most-multiplied thing in a manifest: two per condition, two per
  *    expression, one per write field, times arms, times states, times
- *    protocols, times the two `struct dev_bench_message` statics. Naturally
+ *    protocols, times the `struct dev_bench_message` statics. Naturally
  *    aligned it is 16 bytes, six of them padding; packed it is 10, and that
  *    single attribute takes a two-protocol `StudyStart` from ~25 KB of SRAM
  *    to ~13 KB. The cost is byte-wise loads of `literal` on a target without
@@ -51,10 +51,10 @@
  * mirrors.
  * A `ProtocolDef` is the guard-reachable half of an `.eap` manifest (that
  * doc's decision 59 split) and rides in `StudyStart` all the way here, so
- * every constant below costs real ESP32-C5 SRAM twice over: `struct
- * dbm_study_start` is the largest member of `struct dev_bench_message`'s
- * union, and main.c holds two of those (`tx_scratch` and the dispatch loop's
- * `msg`).
+ * every constant below costs real ESP32-C5 SRAM: `struct dbm_study_start` is
+ * the largest member of `struct dev_bench_message`'s union, and main.c holds
+ * one of those (the dispatch loop's `msg`). It held two until decision 57
+ * gave `tx_scratch` a type without `StudyStart` in it.
  *
  * Every count below is the **crate's own** value except
  * EAP_MAX_EVENT_ARMS_PER_STATE -- see that constant for why it is the one
@@ -84,8 +84,8 @@
  * heaviest thing a state holds -- two `remember`s and two guarded `goto`s,
  * each carrying operands -- and it is multiplied by
  * EAP_MAX_STATES_PER_PROTOCOL, by DBM_MAX_PROTOCOLS_PER_STUDY, and again by
- * the two `struct dev_bench_message` statics, so the crate's 4 costs ~9 KB of
- * SRAM more than 2 does. `decision 41` records that both worked protocols use
+ * the `struct dev_bench_message` statics, so the crate's 4 cost ~9 KB of
+ * SRAM more than 2 when there were two of them (half that since decision 57). `decision 41` records that both worked protocols use
  * **one** arm per state; two is double the largest real case, and a study declaring
  * more is refused by name at decode rather than quietly losing a transition
  * (which would be a state machine that runs and branches wrongly -- strictly

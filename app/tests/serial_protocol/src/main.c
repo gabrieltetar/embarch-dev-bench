@@ -120,6 +120,84 @@ ZTEST(serial_protocol, test_hello_ack_encodes_to_the_pinned_wire_bytes)
 	zassert_mem_equal(frame, expected, sizeof(expected), "encoded frame mismatch");
 }
 
+/* The firmware sends through dbm_encode_tx_frame (decision 57), while every
+ * pinned-bytes test in this file encodes through dbm_encode_frame. This holds
+ * the two to the same bytes, so those pins still describe what reaches the
+ * wire. `static`: the general message embeds a full StudyStart. */
+static struct dev_bench_message general_msg;
+static struct dev_bench_tx_message tx_msg;
+
+static void assert_both_encoders_agree(void)
+{
+	static uint8_t general_frame[DBM_MAX_FRAME_LEN];
+	static uint8_t tx_frame[DBM_MAX_OUTBOUND_FRAME_LEN];
+	int general_len = dbm_encode_frame(&general_msg, general_frame, sizeof(general_frame));
+	int tx_len = dbm_encode_tx_frame(&tx_msg, tx_frame, sizeof(tx_frame));
+
+	zassert_true(general_len > 0, "general encode failed");
+	zassert_equal(tx_len, general_len, "frame length differs between the encoders");
+	zassert_mem_equal(tx_frame, general_frame, (size_t)general_len,
+			  "frame bytes differ between the encoders");
+}
+
+ZTEST(serial_protocol, test_the_tx_encoder_writes_what_the_general_one_does)
+{
+	memset(&general_msg, 0, sizeof(general_msg));
+	memset(&tx_msg, 0, sizeof(tx_msg));
+	general_msg.tag = DBM_TAG_HELLO_ACK;
+	general_msg.hello_ack.schema_version = 10;
+	general_msg.hello_ack.compatible = true;
+	strcpy(general_msg.hello_ack.firmware_version, "g1a2b3c");
+	strcpy(general_msg.hello_ack.hardware_id, "aaaaaaaabbbbbbbb");
+	tx_msg.tag = general_msg.tag;
+	tx_msg.hello_ack = general_msg.hello_ack;
+	assert_both_encoders_agree();
+
+	/* A StepResult with every optional field set: the largest message the
+	 * bench sends. */
+	struct dbm_step_result_payload *r = &general_msg.step_result.result;
+
+	memset(&general_msg, 0, sizeof(general_msg));
+	general_msg.tag = DBM_TAG_STEP_RESULT;
+	general_msg.step_result.step_index = 3;
+	strcpy(r->step_name, "handshake");
+	r->outcome.tag = 0; /* Pass */
+	r->has_captured_data = true;
+	r->captured_data[0] = 0xde;
+	r->captured_data_len = 1;
+	r->has_gatt_services = true;
+	r->gatt_services_len = 1;
+	memset(r->gatt_services[0].uuid, 0x01, 16);
+	r->gatt_services[0].characteristics_len = 1;
+	memset(r->gatt_services[0].characteristics[0].uuid, 0x02, 16);
+	r->gatt_services[0].characteristics[0].properties = 0x10; /* Notify */
+	r->has_security_level = true;
+	r->security_level = 3;
+	r->has_protocol = true;
+	strcpy(r->protocol_final_state, "done");
+	memset(&tx_msg, 0, sizeof(tx_msg));
+	tx_msg.tag = general_msg.tag;
+	tx_msg.step_result = general_msg.step_result;
+	assert_both_encoders_agree();
+
+	general_msg.tag = DBM_TAG_STUDY_DONE;
+	general_msg.study_done.completed = true;
+	tx_msg.tag = general_msg.tag;
+	tx_msg.study_done = general_msg.study_done;
+	assert_both_encoders_agree();
+}
+
+ZTEST(serial_protocol, test_the_tx_encoder_refuses_a_message_only_core_sends)
+{
+	memset(&tx_msg, 0, sizeof(tx_msg));
+	tx_msg.tag = DBM_TAG_STUDY_START;
+
+	uint8_t frame[DBM_MAX_OUTBOUND_FRAME_LEN];
+
+	zassert_true(dbm_encode_tx_frame(&tx_msg, frame, sizeof(frame)) < 0,
+		     "the TX encoder has no StudyStart to encode");
+}
+
 /* ---- Stream taps (embarch-study-designer schema v8, `embarch-study-designer`
  * decision 39) --------------------------------------------------------
  *

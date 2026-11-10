@@ -79,8 +79,13 @@ static const struct device *const link_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_con
  * `west build` failed with `region 'sram0_0_seg' overflowed`). Consolidating
  * to one shared instance (plus `receive_message`'s own separate inbound
  * buffer below, which must stay alive across a whole `dispatch_study` call
- * and so can't share this one) is what makes it fit. */
-static struct dev_bench_message tx_scratch;
+ * and so can't share this one) is what makes it fit.
+ *
+ * A `struct dev_bench_tx_message`, not a `struct dev_bench_message`
+ * (decision 57): the full union is sized by `StudyStart`, a message this
+ * bench only receives, so the shared buffer was holding its bound for a
+ * message nothing here can send. */
+static struct dev_bench_tx_message tx_scratch;
 
 /* Guards the link UART and send_message's own `frame` static.
  *
@@ -97,7 +102,7 @@ static K_MUTEX_DEFINE(link_tx_mutex);
  * every caller builds its message in before calling this. Locking inside here
  * instead would leave the build half unprotected, which is the half that
  * actually races. */
-static void send_message_locked(const struct dev_bench_message *msg)
+static void send_message_locked(const struct dev_bench_tx_message *msg)
 {
 	/* `static`, not a stack local: even at the outbound bound this is a
 	 * few KB, more than a small embedded call stack should hold. Safe
@@ -111,11 +116,11 @@ static void send_message_locked(const struct dev_bench_message *msg)
 	 * DBM_MAX_STUDY_START_LEN now carries the `.eap` protocols span too.
 	 * Exactly the same finding as `receive_message`'s RX buffer
 	 * (DBM_MAX_INBOUND_FRAME_LEN, decision 38's SRAM pass), in the other
-	 * direction; the general encoder's own staging buffer is deliberately
-	 * left alone, because the round-trip tests encode a StudyStart through
-	 * it. */
+	 * direction. dbm_encode_tx_frame stages at the same bound (decision
+	 * 57); the general encoder keeps StudyStart's, for the round-trip
+	 * tests, and is no longer linked here. */
 	static uint8_t frame[DBM_MAX_OUTBOUND_FRAME_LEN];
-	int frame_len = dbm_encode_frame(msg, frame, sizeof(frame));
+	int frame_len = dbm_encode_tx_frame(msg, frame, sizeof(frame));
 
 	if (frame_len < 0) {
 		return;
@@ -388,7 +393,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 
 		k_mutex_lock(&link_tx_mutex, K_FOREVER);
 
-		struct dev_bench_message *msg = &tx_scratch;
+		struct dev_bench_tx_message *msg = &tx_scratch;
 
 		/* Re-checked here rather than trusted from queue time: the
 		 * window can close while an entry is still queued, and a
@@ -435,7 +440,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 					continue;
 				}
 
-				struct dev_bench_message *nmsg = &tx_scratch;
+				struct dev_bench_tx_message *nmsg = &tx_scratch;
 
 				memset(nmsg, 0, sizeof(*nmsg));
 				nmsg->tag = DBM_TAG_STREAM_CHUNK_BATCH;
@@ -539,7 +544,7 @@ K_THREAD_DEFINE(transcript_tx_tid, 2048, transcript_tx_thread, NULL, NULL, NULL,
  * k_mutex_lock is illegal. Everything else locks. */
 static void send_log_line_ex(const char *text, bool skip_lock)
 {
-	struct dev_bench_message *msg = &tx_scratch;
+	struct dev_bench_tx_message *msg = &tx_scratch;
 
 	if (!skip_lock) {
 		k_mutex_lock(&link_tx_mutex, K_FOREVER);
@@ -584,7 +589,7 @@ static void log_backend_sink(const char *line, bool panic)
  * needed to protect the array itself. */
 static void set_tap_open(uint32_t index, bool open, uint32_t dropped)
 {
-	struct dev_bench_message *msg = &tx_scratch;
+	struct dev_bench_tx_message *msg = &tx_scratch;
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
 	memset(msg, 0, sizeof(*msg));
@@ -698,7 +703,7 @@ static void load_study_taps(const struct dbm_study_start *study)
 
 static void send_study_done(bool completed)
 {
-	struct dev_bench_message *msg = &tx_scratch;
+	struct dev_bench_tx_message *msg = &tx_scratch;
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
 	memset(msg, 0, sizeof(*msg));
@@ -718,7 +723,7 @@ static void send_study_done(bool completed)
 static void send_step_result(uint32_t step_index, const char *step_name,
 			      const struct outcome *bridge_outcome)
 {
-	struct dev_bench_message *msg = &tx_scratch;
+	struct dev_bench_tx_message *msg = &tx_scratch;
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
 	memset(msg, 0, sizeof(*msg));
@@ -1137,7 +1142,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
 
 	uint32_t our_schema = DEV_BENCH_WIRE_SCHEMA_VERSION;
-	struct dev_bench_message *ack = &tx_scratch;
+	struct dev_bench_tx_message *ack = &tx_scratch;
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
 	memset(ack, 0, sizeof(*ack));

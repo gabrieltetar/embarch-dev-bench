@@ -226,11 +226,11 @@ _Static_assert(DBM_MAX_STREAM_CHUNK_BYTES <= DBM_CRATE_MAX_STREAM_CHUNK_BYTES,
  * since DBM_MAX_STUDY_START_LEN now carries DBM_MAX_PROTOCOLS_WIRE_LEN as
  * well -- growth in a buffer for a message this node cannot produce.
  *
- * Scoped to the *application's* TX buffer for the same reason its inbound
- * twin is scoped to the application's RX buffer: `dbm_encode_frame`'s own
- * staging buffer stays at DBM_MAX_RAW_LEN, because this suite's round-trip
- * tests encode a StudyStart through it precisely to prove encode and decode
- * agree, and narrowing it would trade a real test for RAM. */
+ * It sizes main.c's TX frame buffer and dbm_encode_tx_frame's staging
+ * buffer. `dbm_encode_frame`'s own staging buffer stays at DBM_MAX_RAW_LEN,
+ * because this suite's round-trip tests encode a StudyStart through it to
+ * prove encode and decode agree; the firmware no longer calls it (decision
+ * 57). */
 #define DBM_MAX_OUTBOUND_RAW_LEN DBM_MAX_STEP_RESULT_LEN
 #define DBM_MAX_OUTBOUND_FRAME_LEN \
 	(DBM_MAX_OUTBOUND_RAW_LEN + (DBM_MAX_OUTBOUND_RAW_LEN / 254) + 2)
@@ -913,18 +913,36 @@ struct dbm_study_done {
 	bool completed;
 };
 
+/* Every `DevBenchMessage` variant this bench sends: all but `Hello` and
+ * `StudyStart`, which only Core sends. Listed once, so the two message types
+ * below cannot disagree about them. */
+#define DBM_TX_VARIANTS                                                                          \
+	struct dbm_hello_ack hello_ack;                                                          \
+	struct dbm_stream_open stream_open;                                                      \
+	struct dbm_stream_chunk_batch stream_chunk_batch;                                        \
+	struct dbm_stream_close stream_close;                                                    \
+	struct dbm_log_line log_line;                                                            \
+	struct dbm_step_result step_result;                                                      \
+	struct dbm_study_done study_done;
+
+/* Any message, in either direction: what the decoder fills, and what the
+ * round-trip tests encode. Sized by `StudyStart`. */
 struct dev_bench_message {
 	enum dbm_tag tag;
 	union {
 		struct dbm_hello hello;
-		struct dbm_hello_ack hello_ack;
-		struct dbm_stream_open stream_open;
-		struct dbm_stream_chunk_batch stream_chunk_batch;
-		struct dbm_stream_close stream_close;
-		struct dbm_log_line log_line;
 		struct dbm_study_start study_start;
-		struct dbm_step_result step_result;
-		struct dbm_study_done study_done;
+		DBM_TX_VARIANTS
+	};
+};
+
+/* A message this bench sends, sized by the largest of those rather than by
+ * `StudyStart`, which only arrives (decision 57). main.c's `tx_scratch` is
+ * one, and dbm_encode_tx_frame is its encoder. */
+struct dev_bench_tx_message {
+	enum dbm_tag tag;
+	union {
+		DBM_TX_VARIANTS
 	};
 };
 
@@ -944,8 +962,14 @@ int dbm_encode_transcript_entry(const struct dbm_gatt_transcript_entry *entry, u
 
 /* Encodes `msg` as postcard bytes wrapped in a COBS frame, including the
  * trailing 0x00 delimiter. Returns the frame length (> 0) on success, or a
- * negative value if `out_cap` is too small for the encoded frame. */
+ * negative value if `out_cap` is too small for the encoded frame. Encodes
+ * any message, including `Hello` and `StudyStart`; the round-trip tests use
+ * it, and the firmware sends through dbm_encode_tx_frame. */
 int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t out_cap);
+
+/* dbm_encode_frame for a message this bench sends: the same bytes, staged in
+ * a buffer sized by DBM_MAX_OUTBOUND_RAW_LEN. */
+int dbm_encode_tx_frame(const struct dev_bench_tx_message *msg, uint8_t *out, size_t out_cap);
 
 /* Decodes one COBS-stuffed frame into `out`. `in`/`in_len` must be exactly one
  * frame's stuffed bytes, WITHOUT the trailing 0x00 delimiter — the caller (the
