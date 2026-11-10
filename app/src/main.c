@@ -1408,23 +1408,23 @@ static void dispatch_study(const struct dbm_study_start *study)
 		send_study_done(false);
 		return;
 	}
-	if (!study->steps_crc_valid) {
-		send_log_line("StudyStart steps_crc mismatch; aborting without running any step");
-		send_study_done(false);
-		return;
-	}
-	/* The sibling seal over `streams` (`embarch-study-designer`
-	 * decision 39's 2026-08-25 amendment). Checked separately and reported
-	 * separately, which is the point of there being two: the log line names
-	 * which half of the Study arrived corrupt.
+	/* All three seals gate here, each named on its own
+	 * (`embarch-study-designer` interfaces/seals.md): the log line says
+	 * which span of the Study arrived corrupt -- `steps`, `streams` (its
+	 * decision 39's 2026-08-25 amendment) or `protocols` (its decision 58).
 	 *
-	 * Aborting on it, rather than only computing it, even though this
-	 * firmware does not open taps yet: a Study whose tap declarations are
-	 * corrupt would otherwise run to completion and produce results with
-	 * captures silently missing or wrong, which is the exact failure this
-	 * suite keeps arriving at from other directions. */
-	if (!study->streams_crc_valid) {
-		send_log_line("StudyStart streams_crc mismatch; aborting without running any step");
+	 * Aborting on a tap or protocol seal, rather than only computing it: a
+	 * Study whose taps are corrupt would run to completion with captures
+	 * silently missing or wrong, and one whose protocols are corrupt would
+	 * run a state machine that is not the one the host sealed. */
+	const char *broken_seal = dbm_study_start_broken_seal(study);
+
+	if (broken_seal != NULL) {
+		char line[DBM_MAX_LOG_LINE_LEN + 1];
+
+		snprintk(line, sizeof(line), "StudyStart %s mismatch; aborting without running any step",
+			 broken_seal);
+		send_log_line(line);
 		send_study_done(false);
 		return;
 	}

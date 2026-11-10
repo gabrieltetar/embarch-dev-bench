@@ -425,6 +425,8 @@ ZTEST(serial_protocol, test_study_start_round_trip_one_step)
 		      "corrupted steps_crc should not validate");
 	zassert_true(study_start_decoded.study_start.streams_crc_valid,
 		     "a corrupted steps_crc must not implicate streams_crc");
+	zassert_str_equal(dbm_study_start_broken_seal(&study_start_decoded.study_start), "steps_crc",
+			  "the gate must refuse it by the steps seal's name");
 }
 
 ZTEST(serial_protocol, test_study_start_round_trip_two_steps)
@@ -1032,6 +1034,8 @@ ZTEST(serial_protocol, test_a_corrupted_streams_crc_is_caught_without_implicatin
 	const struct dbm_study_start *ss = &study_start_decoded.study_start;
 
 	zassert_false(ss->streams_crc_valid, "corrupted streams must not validate");
+	zassert_str_equal(dbm_study_start_broken_seal(ss), "streams_crc",
+			  "the gate must refuse it by the streams seal's name");
 	zassert_true(ss->steps_crc_valid,
 		     "a corrupted tap must not implicate steps_crc -- saying which half is "
 		     "corrupt is why there are two seals rather than one widened one");
@@ -1893,6 +1897,7 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_carrying_a_protocol)
 	zassert_equal(ss->protocols_crc, 0xEFF3E046, "protocols_crc mismatch");
 	zassert_true(ss->protocols_crc_valid,
 		     "protocols_crc computed over the crate's own manifest bytes must validate");
+	zassert_is_null(dbm_study_start_broken_seal(ss), "all three seals hold, so the gate passes");
 
 	zassert_equal(ss->protocols_len, 1, "protocols_len mismatch");
 
@@ -1995,6 +2000,8 @@ ZTEST(serial_protocol, test_a_corrupt_protocol_span_fails_only_its_own_seal)
 	zassert_true(ss->steps_crc_valid, "steps_crc is unaffected by a corrupt protocol");
 	zassert_true(ss->streams_crc_valid, "streams_crc is unaffected by a corrupt protocol");
 	zassert_false(ss->protocols_crc_valid, "protocols_crc must not validate");
+	zassert_str_equal(dbm_study_start_broken_seal(ss), "protocols_crc",
+			  "the gate must refuse it by the protocols seal's name");
 }
 
 ZTEST(serial_protocol, test_step_result_with_a_protocol_outcome_encodes_to_the_pinned_wire_bytes)

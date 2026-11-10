@@ -1020,4 +1020,11 @@ struct dbm_decode_refusal {
 int dbm_decode_frame_why(const uint8_t *in, size_t in_len, struct dev_bench_message *out,
 			 struct dbm_decode_refusal *why);
 
+/* The first of a decoded `StudyStart`'s three seals that does not hold, by
+ * its wire field name -- "steps_crc", "streams_crc", then "protocols_crc" --
+ * or NULL when all three hold. Each seal covers its own span
+ * (`embarch-study-designer` interfaces/seals.md), so the name says which part
+ * of the study arrived corrupt. main.c refuses a study this names. */
+const char *dbm_study_start_broken_seal(const struct dbm_study_start *ss);
+
 #endif /* EMBARCH_DEV_BENCH_SERIAL_PROTOCOL_H_ */

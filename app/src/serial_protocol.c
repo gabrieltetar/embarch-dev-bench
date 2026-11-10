@@ -2212,3 +2212,17 @@ int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message 
 {
 	return dbm_decode_frame_why(in, in_len, out, NULL);
 }
+
+const char *dbm_study_start_broken_seal(const struct dbm_study_start *ss)
+{
+	if (!ss->steps_crc_valid) {
+		return "steps_crc";
+	}
+	if (!ss->streams_crc_valid) {
+		return "streams_crc";
+	}
+	if (!ss->protocols_crc_valid) {
+		return "protocols_crc";
+	}
+	return NULL;
+}
