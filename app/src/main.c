@@ -177,18 +177,33 @@ static volatile bool transcript_tap_open;
  * here would mislabel one transcript row, not corrupt the link. */
 static volatile uint32_t transcript_step_index;
 
-/* Counts entries dropped because the queue was full -- reported over LogLine
- * at the end of a study rather than silently swallowed, since a transcript
- * that quietly lost rows while claiming to be exhaustive is exactly the
- * failure mode decision 36 exists to remove. */
-static volatile uint32_t transcript_dropped;
+/* Entries lost, by cause -- reported over LogLine at the end of a study
+ * rather than silently swallowed, since a transcript that quietly lost rows
+ * while claiming to be exhaustive is exactly the failure mode decision 36
+ * exists to remove. Two counters rather than one so that line names the cause
+ * of each drop (decision 53): until then one total was reported as "(queue
+ * full)" while every full-MTU notification was being dropped for not fitting
+ * its record. `queue_full` is the sink's; `unfit` is the TX thread's, a
+ * record it could not build. */
+static volatile uint32_t transcript_dropped_queue_full;
+static volatile uint32_t transcript_dropped_unfit;
+
+/* Entries the sink put on `transcript_q`, and entries the TX thread has
+ * finished with (sent or dropped). The end-of-study drain waits for the two
+ * to match rather than for the queue to read empty: the queue is empty the
+ * moment the TX thread takes the last entry, before that entry is on the
+ * wire, and closing the taps in that gap drops it at the tap-open check. The
+ * last entry of a study is usually the bond-clear disconnect, which is the one
+ * row decision 37 says must reach Core (decision 53). */
+static atomic_t transcript_queued;
+static atomic_t transcript_handled;
 
 /* Per-tap loss, by index into `study_taps`, sent on that tap's own
  * `StreamClose.dropped` and turned into `StreamRef.truncated` by Core.
  *
  * This array is the fix for the asymmetry row 73 records: `transcript_dropped`
- * above was this firmware's *only* drop counter and the transcript tap its
- * only possible subject, so every `StreamSource::GattNotify` tap reported 0
+ * (split by cause since, above) was this firmware's *only* drop counter and
+ * the transcript tap its only possible subject, so every `StreamSource::GattNotify` tap reported 0
  * unconditionally -- including the ones that had genuinely lost data. A
  * capture reported 28,548 bytes and `truncated: false` while 275
  * notifications were missing from it.
@@ -334,9 +349,15 @@ static void transcript_sink_cb(const struct ble_transcript_entry *entry, void *u
 
 	/* K_NO_WAIT: blocking the BT RX thread on a full queue would stall the
 	 * very notifications being recorded. A dropped row is counted and
-	 * reported instead. */
+	 * reported instead.
+	 *
+	 * `transcript_queued` is counted before the put, and taken back if it
+	 * fails, so the TX thread can never have handled an entry the count
+	 * does not include yet. */
+	atomic_inc(&transcript_queued);
 	if (k_msgq_put(&transcript_q, &item, K_NO_WAIT) != 0) {
-		transcript_dropped++;
+		atomic_dec(&transcript_queued);
+		transcript_dropped_queue_full++;
 		charge_drop_to_taps(entry);
 	}
 }
@@ -404,7 +425,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 					 * capture never reads as complete --
 					 * on **this tap**, which is the one
 					 * whose file would be short. */
-					transcript_dropped++;
+					transcript_dropped_unfit++;
 					tap_dropped[i]++;
 					continue;
 				}
@@ -437,8 +458,7 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 		}
 
 		if (!want_transcript) {
-			k_mutex_unlock(&link_tx_mutex);
-			continue;
+			goto handled;
 		}
 
 		/* One entry, encoded to bare postcard bytes, carried as the
@@ -481,21 +501,28 @@ static void transcript_tx_thread(void *a, void *b, void *c)
 							     sizeof(record->bytes));
 
 		if (entry_len < 0) {
-			/* Cannot happen for an entry this firmware produced --
-			 * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is one ATT MTU and
-			 * DBM_MAX_STREAM_CHUNK_BYTES is larger -- but counted
-			 * rather than silently skipped, so the study's own
-			 * "NOT exhaustive" report stays true if it ever does.
-			 */
-			transcript_dropped++;
+			/* Cannot happen for an entry this firmware produced:
+			 * DBM_MAX_STREAM_CHUNK_BYTES is defined as the largest
+			 * encoded entry (DBM_MAX_TRANSCRIPT_RECORD_LEN), and
+			 * test_a_full_mtu_transcript_entry_fits_a_stream_record
+			 * pins that. It did happen, for every notification over
+			 * about 210 bytes, while the record was sized against
+			 * the payload alone (decision 53). Still counted, under
+			 * its own cause, so the study's "NOT exhaustive" report
+			 * stays true if it ever does again. */
+			transcript_dropped_unfit++;
 			tap_dropped[tap_index]++;
-			k_mutex_unlock(&link_tx_mutex);
-			continue;
+			goto handled;
 		}
 		record->bytes_len = (uint32_t)entry_len;
 
 		send_message_locked(msg);
+
+handled:
+		/* The one exit for every entry, sent or dropped, so the
+		 * end-of-study drain's count cannot miss a path. */
 		k_mutex_unlock(&link_tx_mutex);
+		atomic_inc(&transcript_handled);
 	}
 }
 
@@ -1417,7 +1444,8 @@ static void dispatch_study(const struct dbm_study_start *study)
 
 	bool completed = true;
 
-	transcript_dropped = 0;
+	transcript_dropped_queue_full = 0;
+	transcript_dropped_unfit = 0;
 
 	/* Taps before steps: a WholeStudy tap has to be open before the first
 	 * action runs, or the first thing it was declared to capture is the
@@ -1499,10 +1527,29 @@ static void dispatch_study(const struct dbm_study_start *study)
 		send_log_line("closed a GATT capture window the study left open");
 	}
 
+	/* **A study is a bond's lifetime** (decision 37). Cleared here so a
+	 * second run of a study behaves like the first -- a bench that
+	 * silently pairs differently on the second run is the failure
+	 * study-scoped bonding exists to avoid, and it is the reading the
+	 * repo owner asked for by name.
+	 *
+	 * Before the transcript drain below rather than after it: clearing a
+	 * bond disconnects the peer (Zephyr's bt_unpair does), and the
+	 * disconnect produces a transcript entry that deserves to reach Core
+	 * with everything else rather than arriving after its own StreamClose.
+	 * ble_bridge_clear_bonds() waits for that disconnect, and the bridge
+	 * emits the row before it releases the wait, so the row is queued by
+	 * the time this returns (decision 53).
+	 *
+	 * If "persist for a study" ever turns out to mean *across* studies,
+	 * this call is the one line that moves. */
+	ble_bridge_clear_bonds();
+
 	/* Drain whatever the TX thread hasn't sent yet before StudyDone, so
 	 * Core never sees the study end with transcript entries still in
-	 * flight behind it. */
-	while (k_msgq_num_used_get(&transcript_q) > 0) {
+	 * flight behind it. Waits for every queued entry to be *handled*, not
+	 * for the queue to read empty: see `transcript_handled`. */
+	while (atomic_get(&transcript_handled) != atomic_get(&transcript_queued)) {
 		k_sleep(K_MSEC(5));
 	}
 
@@ -1515,28 +1562,18 @@ static void dispatch_study(const struct dbm_study_start *study)
 	 * same reason. */
 	close_all_taps();
 
-	/* **A study is a bond's lifetime** (decision 37). Cleared here so a
-	 * second run of a study behaves like the first -- a bench that
-	 * silently pairs differently on the second run is the failure
-	 * study-scoped bonding exists to avoid, and it is the reading the
-	 * repo owner asked for by name.
-	 *
-	 * Before the transcript drain below rather than after it: clearing a
-	 * bond disconnects the peer (Zephyr's bt_unpair does), and the
-	 * disconnect produces a transcript entry that deserves to reach Core
-	 * with everything else rather than arriving after its own StreamClose.
-	 *
-	 * If "persist for a study" ever turns out to mean *across* studies,
-	 * this call is the one line that moves. */
-	ble_bridge_clear_bonds();
+	uint32_t lost_queue_full = transcript_dropped_queue_full;
+	uint32_t lost_unfit = transcript_dropped_unfit;
 
-	if (transcript_dropped > 0) {
+	if (lost_queue_full + lost_unfit > 0) {
 		char note[DBM_MAX_LOG_LINE_LEN + 1];
 
+		/* Each cause named, never merged (decision 53). */
 		snprintk(note, sizeof(note),
-			 "GATT transcript dropped %u entries (queue full) -- this capture is "
-			 "NOT exhaustive",
-			 (unsigned int)transcript_dropped);
+			 "GATT transcript dropped %u entries (%u queue full, %u did not fit a "
+			 "record) -- this capture is NOT exhaustive",
+			 (unsigned int)(lost_queue_full + lost_unfit),
+			 (unsigned int)lost_queue_full, (unsigned int)lost_unfit);
 		send_log_line(note);
 	}
 

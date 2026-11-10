@@ -582,11 +582,20 @@ static void capture_append(const void *data, uint16_t len)
 
 /* ---- connection callbacks ---------------------------------------------- */
 
+/* Connection rows (decision 53): every connection the bridge sees, and every
+ * disconnect, is a transcript row, `Local` because neither is an ATT PDU.
+ * A failed connection attempt is not a connection and gets none; the step
+ * that asked for it reports the failure. Emitted before the semaphores are
+ * given, so a waiter that wakes on them finds the row already queued -- the
+ * end-of-study bond clear relies on that for its disconnect. */
 static void connected_cb(struct bt_conn *conn, uint8_t err)
 {
 	conn_err = err;
 	advertising = false; /* a connectable advertiser stops on connection */
 
+	if (err == 0) {
+		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_CONNECTED, NULL, NULL, 0, NULL, 0);
+	}
 	if (err == 0 && active_conn == NULL) {
 		active_conn = bt_conn_ref(conn);
 	}
@@ -595,6 +604,12 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 {
+	/* The HCI disconnect reason rides in `att_status`, the entry's one
+	 * status byte: a disconnect has no ATT status of its own, and the
+	 * crate already reads that byte per event kind (a discovered
+	 * characteristic's properties). */
+	transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_DISCONNECTED, NULL, NULL, reason, NULL, 0);
+
 	link_lost_reason = reason;
 
 	if (active_conn == conn) {

@@ -1344,6 +1344,61 @@ ZTEST(serial_protocol, test_gatt_transcript_entry_with_no_uuids_encodes_to_the_p
 	zassert_mem_equal(bytes, expected, sizeof(expected), "encoded entry mismatch");
 }
 
+ZTEST(serial_protocol, test_a_full_mtu_transcript_entry_fits_a_stream_record)
+{
+	/* The worst case decision 53 sized the record for: a full ATT MTU
+	 * notification (DBM_MAX_TRANSCRIPT_PAYLOAD_LEN bytes) with both UUIDs,
+	 * and every varint at its longest. Encoded into a real
+	 * `dbm_stream_record`'s `bytes` -- the buffer the transcript TX thread
+	 * encodes into -- not a larger stand-in. Until decision 53 that buffer
+	 * was 256 bytes and this entry did not fit. */
+	static struct dbm_gatt_transcript_entry entry;
+	static struct dbm_stream_record record;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.rx_utc_ms = UINT64_MAX;
+	entry.direction = DBM_GATT_DIR_IN;
+	entry.kind = DBM_GATT_EVT_NOTIFICATION;
+	entry.has_service_uuid = true;
+	memset(entry.service_uuid, 0xAA, sizeof(entry.service_uuid));
+	entry.has_characteristic_uuid = true;
+	memset(entry.characteristic_uuid, 0xBB, sizeof(entry.characteristic_uuid));
+	entry.att_status = 0xFF;
+	entry.payload_len = DBM_MAX_TRANSCRIPT_PAYLOAD_LEN;
+	memset(entry.payload, 0x5A, DBM_MAX_TRANSCRIPT_PAYLOAD_LEN);
+
+	int len = dbm_encode_transcript_entry(&entry, record.bytes, sizeof(record.bytes));
+
+	zassert_true(len > 0, "a full-MTU entry did not fit a stream record");
+	/* Exactly the bound, which pins DBM_TRANSCRIPT_ENTRY_ENVELOPE_LEN's
+	 * arithmetic as well as the fit. */
+	zassert_equal(len, DBM_MAX_TRANSCRIPT_RECORD_LEN, "worst-case entry length mismatch");
+	zassert_true(len <= (int)sizeof(record.bytes), "entry overran the record");
+}
+
+ZTEST(serial_protocol, test_a_disconnect_row_carries_its_hci_reason_in_att_status)
+{
+	/* Decision 53's connection row: `Local`, `Disconnected`, no UUIDs, and
+	 * the HCI reason (here 0x13, remote user terminated) in the entry's one
+	 * status byte, with no payload. */
+	static struct dbm_gatt_transcript_entry entry;
+
+	memset(&entry, 0, sizeof(entry));
+	entry.rx_utc_ms = 5;
+	entry.direction = DBM_GATT_DIR_LOCAL;
+	entry.kind = DBM_GATT_EVT_DISCONNECTED;
+	entry.att_status = 0x13;
+	entry.payload_len = 0;
+
+	static const uint8_t expected[] = {0x05, 0x02, 0x01, 0x00, 0x00, 0x13, 0x00};
+
+	static uint8_t bytes[DBM_MAX_TRANSCRIPT_RECORD_LEN];
+	int len = dbm_encode_transcript_entry(&entry, bytes, sizeof(bytes));
+
+	zassert_equal(len, (int)sizeof(expected), "entry length mismatch");
+	zassert_mem_equal(bytes, expected, sizeof(expected), "encoded entry mismatch");
+}
+
 ZTEST(serial_protocol, test_study_start_gatt_monitor_start_and_stop_round_trip)
 {
 	/* `embarch-study-designer` decision 36's two new Action tags must decode as

@@ -78,11 +78,20 @@
 /* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES /
  * MAX_STREAM_RECORDS_PER_BATCH (schema v8, `embarch-study-designer` decision 39).
  * Deliberately *smaller* than the crate's own 512/4 for the same reason
- * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is smaller than DBM_MAX_PAYLOAD_LEN: this
- * firmware never produces a record larger than one ATT MTU's worth of
- * notification, and sending fewer bytes than the receiving type can hold is
- * always wire-legal -- the reverse is not. */
-#define DBM_MAX_STREAM_CHUNK_BYTES 256
+ * DBM_MAX_TRANSCRIPT_PAYLOAD_LEN is smaller than DBM_MAX_PAYLOAD_LEN: the
+ * largest record this firmware produces is one encoded transcript entry
+ * (DBM_MAX_TRANSCRIPT_RECORD_LEN, a full ATT MTU notification *plus* the
+ * entry's own envelope), and sending fewer bytes than the receiving type can
+ * hold is always wire-legal -- the reverse is not.
+ *
+ * It was 256 until decision 53: sized against the payload alone, it left no
+ * room for the entry's envelope (up to 49 bytes), so every notification over
+ * about 210 bytes failed to encode and was dropped. Defined from the record it must hold so
+ * the two cannot drift apart again. */
+#define DBM_MAX_STREAM_CHUNK_BYTES DBM_MAX_TRANSCRIPT_RECORD_LEN
+/* Mirrors embarch-study-designer's limits::MAX_STREAM_CHUNK_BYTES, only so the
+ * fork above can be checked against it at build time. */
+#define DBM_CRATE_MAX_STREAM_CHUNK_BYTES 512
 #define DBM_MAX_STREAM_RECORDS_PER_BATCH 4
 /* Mirrors embarch-study-designer's limits::MAX_STREAMS_PER_STUDY (schema
  * v9). At its full value rather than shrunk, unlike DBM_MAX_STEPS_PER_STUDY:
@@ -171,11 +180,21 @@
 #define DBM_MAX_STEP_RESULT_LEN                                                                  \
 	(24 + DBM_MAX_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + DBM_MAX_PAYLOAD_LEN +                  \
 	 DBM_MAX_GATT_SERVICES_LEN + EAP_MAX_STATE_NAME_LEN + DBM_MAX_FAIL_REASON_LEN + 8)
-/* A transcript record is tiny next to either of the two above -- a fixed
- * header plus one bounded payload -- so it never moves DBM_MAX_RAW_LEN.
- * Stated as its own constant anyway so the encoder has something real to
- * bounds-check against rather than borrowing an unrelated message's bound. */
-#define DBM_MAX_TRANSCRIPT_RECORD_LEN (64 + DBM_MAX_TRANSCRIPT_PAYLOAD_LEN)
+/* The most bytes one encoded `GattTranscriptEntry` can take, field by field
+ * in `encode_transcript_entry_at`'s order: rx_utc_ms as a u64 varint (10),
+ * direction and kind (1 each), two Option<Uuid>s (1 + 16 each), att_status
+ * (1), and the payload's length varint (2, asserted below), then the payload.
+ * A stream record has to hold this, which is why DBM_MAX_STREAM_CHUNK_BYTES
+ * is defined from it. It is tiny next to either bound above, so it never moves
+ * DBM_MAX_RAW_LEN. */
+#define DBM_TRANSCRIPT_ENTRY_ENVELOPE_LEN (10 + 1 + 1 + 2 * (1 + 16) + 1 + 2)
+#define DBM_MAX_TRANSCRIPT_RECORD_LEN                                                            \
+	(DBM_TRANSCRIPT_ENTRY_ENVELOPE_LEN + DBM_MAX_TRANSCRIPT_PAYLOAD_LEN)
+/* A postcard varint carries 7 bits a byte, so a length under 2^14 is 2 bytes. */
+_Static_assert(DBM_MAX_TRANSCRIPT_PAYLOAD_LEN < (1 << 14),
+	       "the envelope counts the payload length as a 2-byte varint");
+_Static_assert(DBM_MAX_STREAM_CHUNK_BYTES <= DBM_CRATE_MAX_STREAM_CHUNK_BYTES,
+	       "a stream record must fit the crate's MAX_STREAM_CHUNK_BYTES");
 #define DBM_MAX_RAW_LEN (DBM_MAX_STUDY_START_LEN > DBM_MAX_STEP_RESULT_LEN ? DBM_MAX_STUDY_START_LEN \
 										  : DBM_MAX_STEP_RESULT_LEN)
 /* COBS worst case adds one overhead byte per 254 payload bytes, plus a leading code byte
