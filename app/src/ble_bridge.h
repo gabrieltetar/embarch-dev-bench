@@ -4,12 +4,8 @@
  *   - ble_bridge_real.c: real Zephyr BT host calls (workspaces/nordic/)
  *   - ble_bridge_stub.c: canned Outcomes, no BLE host (workspaces/native_sim/)
  *
- * Decision 16. Field-level Study/Step
- * decoding doesn't exist yet (study_ffi.c is a stub, decision 20) — nothing
- * currently constructs a `struct action` from real wire data. This header
- * exists so main.c's fixed bring-up demo sequence (decision 20's "even
- * against fixed/fake decode results") has a real boundary to call through,
- * matching the shape that a future real Study-dispatch loop will use.
+ * Decision 16. main.c builds each `struct action` from a `StudyStart` step
+ * serial_protocol.c decoded off the wire.
  */
 #ifndef EMBARCH_DEV_BENCH_BLE_BRIDGE_H_
 #define EMBARCH_DEV_BENCH_BLE_BRIDGE_H_

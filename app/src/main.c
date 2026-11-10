@@ -33,7 +33,12 @@
 #include "ble_bridge.h"
 #include "dev_bench_log.h"
 #include "serial_protocol.h"
-#include "study_ffi.h"
+
+/* The wire schema version `HelloAck` reports, read out of the crate's own
+ * source at configure time for every board (decision 20). */
+#ifndef DEV_BENCH_WIRE_SCHEMA_VERSION
+#error "DEV_BENCH_WIRE_SCHEMA_VERSION must come from app/CMakeLists.txt"
+#endif
 
 /* This application's own log module.
  *
@@ -1131,7 +1136,7 @@ static bool handle_hello(const struct dbm_hello *hello)
 	 * must not leave the next one running at its level. */
 	dev_bench_log_set_level(DEV_BENCH_LOG_BOOT_LEVEL);
 
-	uint32_t our_schema = study_ffi_schema_version();
+	uint32_t our_schema = DEV_BENCH_WIRE_SCHEMA_VERSION;
 	struct dev_bench_message *ack = &tx_scratch;
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
@@ -1387,9 +1392,8 @@ static struct action step_to_action(const struct dbm_study_start *study,
  * `steps_crc` was already verified during decode (serial_protocol.c's own
  * CRC-32 over the raw wire bytes of `steps`, independently reproducing
  * embarch-study-designer's `steps_crc()` — see serial_protocol.h's doc
- * comment on `dbm_decode_frame` for why this needs no FFI round-trip into
- * that crate to get the identical answer `essd_study_decode_and_verify`
- * would). This function only needs to act on the verdict.
+ * comment on `dbm_decode_frame` for why that is the crate's own answer).
+ * This function only needs to act on the verdict.
  */
 static void dispatch_study(const struct dbm_study_start *study)
 {
@@ -1607,7 +1611,7 @@ int main(void)
 	 * stays off (prj.conf) so the banner's raw printk can never reach this
 	 * link ahead of the logging subsystem. */
 	LOG_INF("dev-bench up: fw %s, wire schema v%u", APP_FIRMWARE_VERSION,
-		(unsigned int)study_ffi_schema_version());
+		(unsigned int)DEV_BENCH_WIRE_SCHEMA_VERSION);
 
 	if (ble_bridge_init() != 0) {
 		LOG_ERR("ble_bridge_init failed; this bench cannot run a study");

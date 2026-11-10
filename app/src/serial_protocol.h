@@ -4,9 +4,9 @@
  * embarch-study-designer's `protocol::DevBenchMessage` field-for-field and
  * byte-for-byte (postcard varint/fixint rules) so this hand-written C
  * implementation and the Rust crate's own round-trip tests both describe the
- * identical wire format. `embarch-study-designer`'s FFI surface doesn't cover
- * DevBenchMessage encode/decode (only `Study` decode+CRC, see study_ffi.h) —
- * that's this file's job.
+ * identical wire format. The firmware links no Rust: every encode and decode
+ * is this file's job, and the crate's limits and wire enum values reach it
+ * through crate_limits.h (decision 56).
  *
  * Pure encode/decode logic only, no I/O — keeps this unit-testable on any
  * host (see app/tests/serial_protocol) independent of a real UART.
@@ -651,7 +651,7 @@ static inline uint8_t dbm_security_level_number(uint8_t level)
 	return (uint8_t)(level + 1);
 }
 
-/* Mirrors the FFI-side EssdBleAdvertiseAction shape 1:1 -- see study_ffi.h. */
+/* Mirrors `Action::BleAdvertise` (src/study.rs). */
 struct dbm_ble_advertise_action {
 	char local_name[DBM_MAX_LOCAL_NAME_LEN + 1]; /* NUL-terminated */
 	bool has_local_name;
@@ -736,7 +736,7 @@ struct dbm_gatt_monitor_selected_action {
 
 /* Action::GattDiscover/GattMonitorAll (`embarch-study-designer` decisions 31/32) are both
  * field-less -- no struct needed; `dbm_step.action_tag` alone identifies
- * them, matching this crate's "simplest possible FFI/wire surface" framing
+ * them, matching the crate's "simplest possible wire surface" framing
  * for both. */
 
 struct dbm_step {
@@ -973,10 +973,8 @@ int dbm_encode_frame(const struct dev_bench_message *msg, uint8_t *out, size_t o
  * embarch-study-designer's own `steps_crc()` (src/crc.rs), which hashes each
  * step's postcard encoding concatenated in order; since postcard's encoding
  * is canonical, hashing each step's original as-received bytes is bit-for-bit
- * identical to hashing a fresh re-encoding of the same decoded value, so this
- * needs no FFI round-trip into embarch-study-designer to get the identical
- * answer (see study_ffi.h's own note on why study_ffi_decode_study --
- * decoding a `Study`, not a `StudyStart` -- doesn't fit this call site). */
+ * identical to hashing a fresh re-encoding of the same decoded value, so the
+ * firmware gets the crate's answer without linking the crate. */
 int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out);
 
 /* Returned for a `StudyStart` that decodes as far as one of this bench's
