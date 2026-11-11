@@ -1,0 +1,15 @@
+sample:
+  name: PD bench
+  description: A USB Power Delivery partner scripted over its shell
+common:
+  build_only: true
+  platform_allow: nucleo_g0b1re
+  integration_platforms:
+    - nucleo_g0b1re
+  tags: pd_bench
+tests:
+  pd_bench.snk1m1:
+    tags: snk1m1
+  pd_bench.drp1m1:
+    tags: drp1m1
+    extra_args: SHIELD=x_nucleo_drp1m1

@@ -13,5 +13,5 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(pd_bench)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE src/main.c src/pd_logic.c)
 target_sources_ifdef(CONFIG_USBC_CSM_DRP app PRIVATE src/tcpp03.c)

@@ -174,6 +174,27 @@ embarch-api build-and-flash pd-bench
 
 The ST-LINK's mass-storage drive refuses this image: it reports 32 KB.
 
+## Tests
+
+Both need no board, and run from `workspaces/pd-bench/` after
+`west patch apply`:
+
+```sh
+west twister -T pd-bench -p nucleo_g0b1re
+west twister -T pd-bench/tests/logic -p native_sim
+```
+
+The first builds both shields (`sample.yaml`, build only). The second runs
+a ztest suite against `src/pd_logic.c`, the RDO and PDO arithmetic and the
+shell's choice rules, which hold no shell, kernel or device call. Twister
+needs Zephyr's `scripts/requirements-run-test.txt` in the venv that runs
+`west`. Without it, build the suite with
+`west build -b native_sim -d build/pd-logic -s pd-bench/tests/logic` and
+run `build/pd-logic/zephyr/zephyr.exe`.
+
+The USB-C stack itself runs only on hardware: Zephyr v4.4.2 has no TCPC
+emulator to run it against.
+
 ## Shell
 
 Every `pd` command ends its output with one line, `pd: ok` or

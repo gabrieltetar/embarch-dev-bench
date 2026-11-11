@@ -29,6 +29,7 @@
 #include <zephyr/shell/shell.h>
 #include <zephyr/usb_c/usbc.h>
 
+#include "pd_logic.h"
 #ifdef CONFIG_USBC_CSM_DRP
 #include "tcpp03.h"
 #endif
@@ -48,10 +49,6 @@ BUILD_ASSERT(DT_ENUM_HAS_VALUE(PORT_NODE, power_role, sink), "a sink-only build 
 
 /* A PPS Sink sends a Request at least every tPPSRequest, 10 s (USB PD R3.2 p237) */
 #define PPS_KEEPALIVE_MS 8000
-/* What a 5 V Request asks for when nothing better is valid */
-#define SAFE_MA 500
-/* `pd max` never asks for more than a cable without an e-marker carries */
-#define CABLE_MA 3000
 /* A PR_Swap's AMS and power transition end well within this */
 #define SWAP_WINDOW_MS 2000
 /* How long `pd ask` waits for the partner's answer */
@@ -118,19 +115,6 @@ static const struct {
 	[ASK_SNK_CAPS] = {"snkcaps", REQUEST_GET_SNK_CAPS},
 };
 
-enum want_kind {
-	WANT_MAX,
-	WANT_FIXED,
-	WANT_PPS,
-};
-
-struct want {
-	enum want_kind kind;
-	int pos;
-	int mv;
-	int ma;
-};
-
 /* What `pd status` and `pd role` show of the roles and the contract */
 struct role {
 	bool attached;
@@ -169,7 +153,7 @@ static struct {
 	struct k_spinlock lock;
 	uint32_t src_caps[PDO_MAX_DATA_OBJECTS];
 	int src_cap_cnt;
-	struct want want;
+	struct pd_logic_want want;
 	/* The last Request sent, and the PDO it named */
 	uint32_t sent_rdo;
 	uint32_t sent_pdo;
@@ -246,143 +230,6 @@ static struct {
 #endif
 };
 
-static bool pdo_is_fixed(uint32_t pdo)
-{
-	union pd_fixed_supply_pdo_source fixed = {.raw_value = pdo};
-
-	return fixed.type == PDO_FIXED;
-}
-
-static bool pdo_is_pps(uint32_t pdo)
-{
-	union pd_augmented_supply_pdo_source aug = {.raw_value = pdo};
-
-	return aug.type == PDO_AUGMENTED &&
-	       ((pdo >> PDO_APDO_TYPE_SHIFT) & PDO_APDO_TYPE_MASK) == APDO_TYPE_PPS;
-}
-
-static int fixed_mv(uint32_t pdo)
-{
-	union pd_fixed_supply_pdo_source fixed = {.raw_value = pdo};
-
-	return PD_CONVERT_FIXED_PDO_VOLTAGE_TO_MV(fixed.voltage);
-}
-
-static int fixed_ma(uint32_t pdo)
-{
-	union pd_fixed_supply_pdo_source fixed = {.raw_value = pdo};
-
-	return PD_CONVERT_FIXED_PDO_CURRENT_TO_MA(fixed.max_current);
-}
-
-static uint32_t rdo_fixed(int pos, int ma)
-{
-	union pd_rdo rdo = {.raw_value = 0};
-
-	rdo.fixed.object_pos = pos;
-	rdo.fixed.operating_current = PD_CONVERT_MA_TO_FIXED_PDO_CURRENT(ma);
-	rdo.fixed.min_or_max_operating_current = PD_CONVERT_MA_TO_FIXED_PDO_CURRENT(ma);
-	rdo.fixed.no_usb_suspend = 1;
-
-	return rdo.raw_value;
-}
-
-static uint32_t rdo_pps(int pos, int mv, int ma)
-{
-	union pd_rdo rdo = {.raw_value = 0};
-
-	rdo.augmented.object_pos = pos;
-	rdo.augmented.output_voltage = mv / 20;
-	rdo.augmented.operating_current = PD_CONVERT_MA_TO_AUGMENTED_PDO_CURRENT(ma);
-	rdo.augmented.no_usb_suspend = 1;
-
-	return rdo.raw_value;
-}
-
-static int rdo_pos(uint32_t rdo)
-{
-	union pd_rdo r = {.raw_value = rdo};
-
-	return r.fixed.object_pos;
-}
-
-/* The highest power fixed PDO, at most 3 A; ties go to the lower voltage */
-static uint32_t rdo_max_locked(void)
-{
-	int best_pos = 1;
-	int best_mw = -1;
-	int best_ma = SAFE_MA;
-
-	for (int i = 0; i < self.src_cap_cnt; i++) {
-		uint32_t pdo = self.src_caps[i];
-		int ma;
-		int mw;
-
-		if (!pdo_is_fixed(pdo)) {
-			continue;
-		}
-		ma = MIN(fixed_ma(pdo), CABLE_MA);
-		mw = fixed_mv(pdo) * ma / 1000;
-		if (mw > best_mw) {
-			best_mw = mw;
-			best_pos = i + 1;
-			best_ma = ma;
-		}
-	}
-
-	return rdo_fixed(best_pos, best_ma);
-}
-
-/* The RDO for a choice against the caps held, or 0 with the reason it is not valid */
-static uint32_t rdo_for_locked(const struct want *w, const char **why)
-{
-	uint32_t pdo;
-
-	if (self.src_cap_cnt == 0) {
-		*why = "no source caps";
-		return 0;
-	}
-	if (w->kind == WANT_MAX) {
-		return rdo_max_locked();
-	}
-	if (w->pos < 1 || w->pos > self.src_cap_cnt) {
-		*why = "position not offered";
-		return 0;
-	}
-
-	pdo = self.src_caps[w->pos - 1];
-	if (w->kind == WANT_FIXED) {
-		if (!pdo_is_fixed(pdo)) {
-			*why = "not a fixed PDO";
-			return 0;
-		}
-		if (w->ma > fixed_ma(pdo)) {
-			*why = "current above the PDO";
-			return 0;
-		}
-		return rdo_fixed(w->pos, w->ma > 0 ? w->ma : MIN(fixed_ma(pdo), CABLE_MA));
-	}
-
-	if (!pdo_is_pps(pdo)) {
-		*why = "not a PPS APDO";
-		return 0;
-	}
-
-	union pd_augmented_supply_pdo_source aug = {.raw_value = pdo};
-
-	if (w->mv < PD_CONVERT_AUGMENTED_PDO_VOLTAGE_TO_MV(aug.min_voltage) ||
-	    w->mv > PD_CONVERT_AUGMENTED_PDO_VOLTAGE_TO_MV(aug.max_voltage)) {
-		*why = "voltage outside the APDO";
-		return 0;
-	}
-	if (w->ma > PD_CONVERT_AUGMENTED_PDO_CURRENT_TO_MA(aug.max_current)) {
-		*why = "current above the APDO";
-		return 0;
-	}
-
-	return rdo_pps(w->pos, w->mv, w->ma);
-}
-
 static int policy_get_snk_cap(const struct device *dev, uint32_t **pdos, int *num_pdos)
 {
 	ARG_UNUSED(dev);
@@ -407,7 +254,7 @@ static void policy_set_src_cap(const struct device *dev, const uint32_t *pdos, c
 static uint32_t policy_get_rdo(const struct device *dev)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
-	int cpos = rdo_pos(self.contract_rdo);
+	int cpos = PdLogicRdoPos(self.contract_rdo);
 	const char *why = NULL;
 	uint32_t rdo;
 
@@ -417,16 +264,17 @@ static uint32_t policy_get_rdo(const struct device *dev)
 	    self.src_caps[cpos - 1] == self.contract_pdo) {
 		rdo = self.contract_rdo;
 	} else {
-		rdo = rdo_for_locked(&self.want, &why);
+		rdo = PdLogicRdoFor(self.src_caps, self.src_cap_cnt, &self.want, &why);
 	}
 	self.refresh = false;
 	if (rdo == 0) {
 		/* The caps changed under the choice: vSafe5V rather than no Request */
-		rdo = rdo_fixed(1, self.src_cap_cnt > 0 ? MIN(SAFE_MA, fixed_ma(self.src_caps[0]))
-							: SAFE_MA);
+		rdo = PdLogicRdoFixed(1, self.src_cap_cnt > 0
+					      ? MIN(PD_LOGIC_SAFE_MA, PdLogicFixedMa(self.src_caps[0]))
+					      : PD_LOGIC_SAFE_MA);
 	}
 	self.sent_rdo = rdo;
-	self.sent_pdo = self.src_caps[rdo_pos(rdo) - 1];
+	self.sent_pdo = self.src_caps[PdLogicRdoPos(rdo) - 1];
 	k_spin_unlock(&self.lock, key);
 
 	if (why != NULL) {
@@ -440,7 +288,7 @@ static uint32_t policy_get_rdo(const struct device *dev)
 static void keepalive_handler(struct k_work *work)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
-	bool pps = self.contract && pdo_is_pps(self.contract_pdo) && !self.keepalive_off;
+	bool pps = self.contract && PdLogicPdoIsPps(self.contract_pdo) && !self.keepalive_off;
 
 	ARG_UNUSED(work);
 
@@ -743,7 +591,7 @@ static int policy_src_en(const struct device *dev, bool en)
 /* The Type-C Current Rp advertises: as much as the 5 V PDO offers */
 static int src_rp_ma_locked(void)
 {
-	int ma = fixed_ma(self.offer[0]);
+	int ma = PdLogicFixedMa(self.offer[0]);
 
 	return ma >= 3000 ? 3000 : ma >= 1500 ? 1500 : 500;
 }
@@ -777,27 +625,18 @@ static int policy_get_src_caps(const struct device *dev, const uint32_t **pdos, 
 	return 0;
 }
 
-/* A Request fits a fixed PDO when its operating current is within the PDO's */
-static bool request_fits(uint32_t pdo, uint32_t request)
-{
-	union pd_rdo rdo = {.raw_value = request};
-	union pd_fixed_supply_pdo_source fixed = {.raw_value = pdo};
-
-	return pdo != 0 && pdo_is_fixed(pdo) && rdo.fixed.operating_current <= fixed.max_current;
-}
-
 /* The answer the host set, but never Accept for more than the caps sent offer */
 static enum usbc_snk_req_reply_t policy_check_sink_request(const struct device *dev,
 							   const uint32_t request)
 {
-	int pos = rdo_pos(request);
+	int pos = PdLogicRdoPos(request);
 	uint32_t pdo = pos >= 1 && pos <= self.sent_cap_cnt ? self.sent_caps[pos - 1] : 0;
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
 	enum usbc_snk_req_reply_t reply = self.req_answer;
 
 	ARG_UNUSED(dev);
 
-	if (reply == SNK_REQUEST_VALID && !request_fits(pdo, request)) {
+	if (reply == SNK_REQUEST_VALID && !PdLogicRequestFits(pdo, request)) {
 		reply = SNK_REQUEST_REJECT;
 	}
 	if (reply == SNK_REQUEST_VALID) {
@@ -816,9 +655,9 @@ static enum usbc_snk_req_reply_t policy_check_sink_request(const struct device *
 static bool policy_present_contract_is_valid(const struct device *dev, const uint32_t contract)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
-	int pos = rdo_pos(contract);
+	int pos = PdLogicRdoPos(contract);
 	bool valid =
-		pos >= 1 && pos <= self.offer_cnt && request_fits(self.offer[pos - 1], contract);
+		pos >= 1 && pos <= self.offer_cnt && PdLogicRequestFits(self.offer[pos - 1], contract);
 
 	ARG_UNUSED(dev);
 	k_spin_unlock(&self.lock, key);
@@ -1142,22 +981,22 @@ static void print_contract(const struct shell *sh, const struct role *r)
 
 	if (!r->contract) {
 		shell_print(sh, "contract: none");
-	} else if (pdo_is_pps(r->pdo)) {
+	} else if (PdLogicPdoIsPps(r->pdo)) {
 		shell_print(sh, "contract: pps pos %d %d mV %d mA", rdo.augmented.object_pos,
-			    rdo.augmented.output_voltage * 20,
+			    PD_LOGIC_PPS_RDO_VOLTAGE_TO_MV(rdo.augmented.output_voltage),
 			    PD_CONVERT_AUGMENTED_PDO_CURRENT_TO_MA(rdo.augmented.operating_current));
 	} else {
 		shell_print(sh, "contract: fixed pos %d %d mV %d mA", rdo.fixed.object_pos,
-			    fixed_mv(r->pdo),
+			    PdLogicFixedMv(r->pdo),
 			    PD_CONVERT_FIXED_PDO_CURRENT_TO_MA(rdo.fixed.operating_current));
 	}
 }
 
 static void print_pdo(const struct shell *sh, int pos, uint32_t pdo)
 {
-	if (pdo_is_fixed(pdo)) {
-		shell_print(sh, "%d: fixed %d mV %d mA", pos, fixed_mv(pdo), fixed_ma(pdo));
-	} else if (pdo_is_pps(pdo)) {
+	if (PdLogicPdoIsFixed(pdo)) {
+		shell_print(sh, "%d: fixed %d mV %d mA", pos, PdLogicFixedMv(pdo), PdLogicFixedMa(pdo));
+	} else if (PdLogicPdoIsPps(pdo)) {
 		union pd_augmented_supply_pdo_source aug = {.raw_value = pdo};
 
 		shell_print(sh, "%d: pps %d-%d mV %d mA%s", pos,
@@ -1338,12 +1177,12 @@ static int dpm_request(const struct shell *sh, enum usbc_policy_request_t req)
 }
 
 /* A choice is checked against the caps held now, then asked for at once */
-static int want_set(const struct shell *sh, const struct want *w)
+static int want_set(const struct shell *sh, const struct pd_logic_want *w)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
 	bool source = self.source;
 	const char *why = NULL;
-	uint32_t rdo = rdo_for_locked(w, &why);
+	uint32_t rdo = PdLogicRdoFor(self.src_caps, self.src_cap_cnt, w, &why);
 
 	if (source) {
 		rdo = 0;
@@ -1364,21 +1203,17 @@ static int want_set(const struct shell *sh, const struct want *w)
 
 static int parse_int(const struct shell *sh, const char *s, int *val)
 {
-	char *end;
-	long v = strtol(s, &end, 10);
-
-	if (*s == '\0' || *end != '\0' || v < 0 || v > 100000) {
+	if (PdLogicParseInt(s, val) < 0) {
 		shell_print(sh, "pd: error bad number '%s'", s);
 		return -EINVAL;
 	}
-	*val = (int)v;
 
 	return 0;
 }
 
 static int cmd_req(const struct shell *sh, size_t argc, char **argv)
 {
-	struct want w = {.kind = WANT_FIXED};
+	struct pd_logic_want w = {.kind = PD_LOGIC_WANT_FIXED};
 
 	if (parse_int(sh, argv[1], &w.pos) < 0 ||
 	    (argc > 2 && parse_int(sh, argv[2], &w.ma) < 0)) {
@@ -1390,7 +1225,7 @@ static int cmd_req(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_pps(const struct shell *sh, size_t argc, char **argv)
 {
-	struct want w = {.kind = WANT_PPS};
+	struct pd_logic_want w = {.kind = PD_LOGIC_WANT_PPS};
 
 	ARG_UNUSED(argc);
 	if (parse_int(sh, argv[1], &w.pos) < 0 || parse_int(sh, argv[2], &w.mv) < 0 ||
@@ -1403,7 +1238,7 @@ static int cmd_pps(const struct shell *sh, size_t argc, char **argv)
 
 static int cmd_max(const struct shell *sh, size_t argc, char **argv)
 {
-	struct want w = {.kind = WANT_MAX};
+	struct pd_logic_want w = {.kind = PD_LOGIC_WANT_HIGHEST_POWER};
 
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
@@ -1686,39 +1521,38 @@ static int cmd_answer(const struct shell *sh, size_t argc, char **argv)
 /* One <mV>:<mA> PDO, a fixed one of the devicetree's at no more than its current */
 static int offer_pdo(const struct shell *sh, char *arg, int prev_mv, uint32_t *pdo, int *mv)
 {
-	char *colon = strchr(arg, ':');
-	int ma;
+	struct pd_logic_offer_refusal refusal;
 
-	if (colon == NULL) {
-		shell_print(sh, "pd: error a PDO is <mV>:<mA>");
-		return -EINVAL;
-	}
-	*colon = '\0';
-	if (parse_int(sh, arg, mv) < 0 || parse_int(sh, colon + 1, &ma) < 0) {
-		return -EINVAL;
-	}
-	if (prev_mv == 0 && *mv != 5000) {
-		shell_print(sh, "pd: error the first PDO is 5000 mV");
-		return -EINVAL;
-	}
-	if (*mv <= prev_mv) {
-		shell_print(sh, "pd: error voltages rise PDO by PDO");
-		return -EINVAL;
-	}
-	for (int i = 0; i < ARRAY_SIZE(offer_max); i++) {
-		if (!pdo_is_fixed(offer_max[i]) || fixed_mv(offer_max[i]) != *mv) {
-			continue;
-		}
-		if (ma < 10 || ma > fixed_ma(offer_max[i])) {
-			shell_print(sh, "pd: error %d mV offers 10 to %d mA", *mv,
-				    fixed_ma(offer_max[i]));
-			return -EINVAL;
-		}
-		*pdo = (offer_max[i] & ~(PDO_CURR_MASK << PDO_FIXED_CURR_SHIFT)) |
-		       PDO_FIXED_CURR(ma);
+	if (PdLogicOfferPdo(arg, prev_mv, offer_max, ARRAY_SIZE(offer_max), pdo, mv, &refusal) ==
+	    0) {
 		return 0;
 	}
-	shell_print(sh, "pd: error %d mV not in the devicetree's source-pdos", *mv);
+
+	__ASSERT_NO_MSG(refusal.err < PD_LOGIC_OFFER_ERR_MAX);
+	switch (refusal.err) {
+	case PD_LOGIC_OFFER_NO_COLON:
+		shell_print(sh, "pd: error a PDO is <mV>:<mA>");
+		break;
+	case PD_LOGIC_OFFER_BAD_NUMBER:
+		shell_print(sh, "pd: error bad number '%s'", refusal.bad_number);
+		break;
+	case PD_LOGIC_OFFER_FIRST_NOT_5V:
+		shell_print(sh, "pd: error the first PDO is %d mV", PD_LOGIC_FIRST_PDO_MV);
+		break;
+	case PD_LOGIC_OFFER_NOT_RISING:
+		shell_print(sh, "pd: error voltages rise PDO by PDO");
+		break;
+	case PD_LOGIC_OFFER_CURRENT_OUT_OF_RANGE:
+		shell_print(sh, "pd: error %d mV offers %d to %d mA", refusal.mv,
+			    PD_LOGIC_OFFER_MIN_MA, refusal.max_ma);
+		break;
+	case PD_LOGIC_OFFER_NOT_IN_DEVICETREE:
+		shell_print(sh, "pd: error %d mV not in the devicetree's source-pdos", refusal.mv);
+		break;
+	default:
+		__ASSERT(false, "%s: refusal %d without a message", __FUNCTION__, refusal.err);
+		break;
+	}
 
 	return -EINVAL;
 }
@@ -1825,7 +1659,7 @@ int main(void)
 	__ASSERT(device_is_ready(vprov_dev), "CN3 monitor not ready");
 	/* The provider path switches CN3 onto VBUS unregulated: it can only be vSafe5V */
 	for (int i = 0; i < ARRAY_SIZE(offer_max); i++) {
-		__ASSERT(pdo_is_fixed(offer_max[i]) && fixed_mv(offer_max[i]) == 5000,
+		__ASSERT(PdLogicPdoIsFixed(offer_max[i]) && PdLogicFixedMv(offer_max[i]) == 5000,
 			 "source PDO %d is not a fixed 5 V PDO", i + 1);
 	}
 	/* The TCPP03 leaves its dead-battery Rd to the UCPD before the stack starts */
