@@ -1,0 +1,116 @@
+patches:
+  - path: zephyr/upstream/usbc-pdo-enum-bitfields.patch
+    sha256sum: c7a5a73dea974c9eed6e71b99a634f8e0235137a1b927230c01194ae12b71958
+    module: zephyr
+    author: Max Campbell
+    email: git@0m.ax
+    date: 2026-10-05
+    upstreamable: true
+    merge-pr: https://github.com/zephyrproject-rtos/zephyr/pull/121386
+    merge-status: true
+    merge-commit: 8a87e3bde92dcf389be8c64a5af479a20a1eaaeb
+    merge-date: 2026-10-08
+    apply-command: git apply
+    comments: |
+      Backport from main. With arm-zephyr-eabi's short enums, the 2-bit
+      frs_required in union pd_fixed_supply_pdo_sink straddles a byte and
+      moves up a bit, so every field above it reads one bit high. Without
+      it the stack reads the Dual-Role Data bit of the bench's first sink
+      PDO from bit 26 instead of 25, so a sink bench never supports
+      DR_Swap and `pd dr` changes nothing. Drop when the pin moves to a
+      release that contains 8a87e3bde92d.
+  - path: zephyr/local/ucpd-stm32-fixes.patch
+    sha256sum: 094c50e1eb63f72e5febcc6d607070da4f5d45f06e5353e97cc699f6c0a401b8
+    module: zephyr
+    author: Gabriel Tetar
+    email: gabriel@intercreate.io
+    date: 2026-10-12
+    upstreamable: true
+    merge-status: false
+    apply-command: git apply
+    comments: |
+      Not upstream. Three STM32 UCPD driver fixes. Part 3 is the one that
+      matters here: without it a Message whose byte the UCPD overran
+      (RXOVR) still gets a GoodCRC a byte short, so the bench reads a
+      partner's Source_Capabilities or Accept with its objects shifted.
+      Part 1 (the shared IRQ) changes nothing with only UCPD1 enabled, and
+      part 2 (the prescaler shift) nothing with the Nucleo overlay's
+      psc-ucpdclk = <1>. ucpd-stm32-dma.patch does not apply without this
+      patch. Drop part 2 when the pin moves to a release that contains
+      9719cc9cbe4f (v4.5.0), which fixes it another way; drop the rest
+      when a release contains parts 1 and 3.
+  - path: zephyr/local/tc-vconn-enotsup.patch
+    sha256sum: 0cf2a92a1f62f3ef9820b3ee3f17a3f1b67ad147a83697361f5bac51c2fc7e37
+    module: zephyr
+    author: Gabriel Tetar
+    email: gabriel@intercreate.io
+    date: 2026-10-06
+    upstreamable: true
+    merge-status: false
+    apply-command: git apply
+    comments: |
+      Not upstream. The Type-C CC-open entry and the Attached.SRC exit
+      accept only -ENOSYS from tcpc_set_vconn(false), and the STM32 UCPD
+      returns -ENOTSUP without a VCONN callback. Without it, in the DRP1M1
+      build, ErrorRecovery never opens CC, and the bench requests
+      ErrorRecovery on every TCPP03 fault and failed source turn-on. The
+      sink-only SNK1M1 build is not affected. Drop when the pin moves to a
+      release that contains it.
+  - path: zephyr/local/usbc-pd-r32.patch
+    sha256sum: ad35f75d6a32fc02a612aa88c7bbbfcdad5bfe740ac29936b928e712490a1fa4
+    module: zephyr
+    author: Gabriel Tetar
+    email: gabriel@intercreate.io
+    date: 2026-10-12
+    upstreamable: true
+    merge-status: false
+    apply-command: git apply
+    comments: |
+      Not upstream; zephyrproject main has none of it. Sixteen changes to
+      the USB-C stack for USB PD R3.2; the patch's message describes each
+      part. pd-bench does not build without it: it calls the DPM requests
+      and callbacks this adds (REQUEST_PE_GET_STATUS, _GET_PPS_STATUS,
+      _GET_BATTERY_STATUS, _PR_SWAP, _SEND_SRC_CAPS, _SNK_REQUEST,
+      usbc_set_policy_cb_set_status, _set_pps_status,
+      _set_battery_status) and uses union pd_sdb, pd_ppssdb, pd_bsdo and
+      PD_V_SAFE_5V_MAX_MV. Its shell also relies on the stack fixes: PR_Swap,
+      Wait handling, the PPS keep-alive and DR_Swap support from the
+      Dual-Role Data bit. Applies alone on v4.4.2. Drop when the pin moves
+      to a release that contains it.
+  - path: zephyr/local/ucpd-stm32-dma.patch
+    sha256sum: 72eb2be0d16d87bd704372b6df4a95ec9b083d2a5574bf35e00ea3f05fb5727a
+    module: zephyr
+    author: Gabriel Tetar
+    email: gabriel@intercreate.io
+    date: 2026-10-14
+    upstreamable: true
+    merge-status: false
+    apply-command: git apply
+    comments: |
+      Not upstream; zephyrproject main moves every UCPD byte through the
+      interrupt handler. With "rx" and "tx" DMA channels on the UCPD node,
+      which pd-bench's Nucleo overlay names, CONFIG_USBC_TCPC_STM32_DMA
+      moves Messages by DMA. Without it the bench still builds, because
+      `dmas` is in base.yaml, but the channels go unused: a byte the
+      handler writes late underruns the transmitter, and on the STM32G0B1
+      some such Messages leave with a zero byte under a valid CRC (a PPS
+      APDO read as 12.8 V, Messages with MessageID 0). Needs
+      ucpd-stm32-fixes.patch. Drop when the pin moves to a release that
+      contains it.
+  - path: zephyr/local/ucpd-stm32-tx-discard.patch
+    sha256sum: 194946c1413fc0cf14c5494609c2d0c0eecacf12cb60b9da2b986d1ec4520918
+    module: zephyr
+    author: Gabriel Tetar
+    email: gabriel@intercreate.io
+    date: 2026-10-19
+    upstreamable: true
+    merge-status: false
+    apply-command: git apply
+    comments: |
+      Not upstream. The STM32 UCPD raises TXMSGDISC late, after the
+      GoodCRC for the partner's Message has started, and the handler took
+      it as the end of that GoodCRC. Without it, any collision on CC, as
+      a sink or as a DRP, leaves the bench's Message without a result, and
+      every later Message stays queued until a Hard Reset. Needs
+      ucpd-stm32-dma.patch. Drop when the pin moves to a release that
+      contains it.

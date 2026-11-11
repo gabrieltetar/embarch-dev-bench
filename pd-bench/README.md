@@ -119,27 +119,57 @@ fault opens both paths until the recovery word `0x18` clears it.
 
 ## Build and flash
 
-It needs a Zephyr USB-C stack carrying the PD fixes that are not upstream
-yet, so it builds from a west workspace that has them, not from
-`workspaces/`. The SNK1M1 build is the default; the DRP1M1 build names its
-shield:
+It needs a Zephyr USB-C stack carrying PD fixes that are not upstream yet,
+so it builds from its own west workspace, `workspaces/pd-bench/`: Zephyr
+v4.4.2 plus six patches in `manifest/zephyr/patches.yml`, applied by
+`west patch` (decision 58). The SNK1M1 build is the default; the DRP1M1
+build names its shield:
 
 ```sh
-cd <that workspace>
-west build -b nucleo_g0b1re -d build/pd-bench <path to>/embarch-dev-bench/pd-bench
-west build -b nucleo_g0b1re -d build/pd-bench-drp <path to>/embarch-dev-bench/pd-bench -- -DSHIELD=x_nucleo_drp1m1
+cd workspaces/pd-bench
+west init -l manifest
+west update
+west patch apply
+west build -b nucleo_g0b1re -d build/pd-bench -s pd-bench
+west build -b nucleo_g0b1re -d build/pd-bench-drp -s pd-bench -- -DSHIELD=x_nucleo_drp1m1
 ```
+
+`west patch apply` runs once after `west update`; after the pin or a patch
+changes, run `west patch clean && west update && west patch apply`.
 
 The DRP1M1 build enables `CONFIG_USBC_CSM_DRP`, I2C and a 2 KB USB-C
 thread stack (`boards/shields/x_nucleo_drp1m1/x_nucleo_drp1m1.conf`).
 
 Enrol the Nucleo as a **bench board** (no role, `embarch-topology`
-decision 41) and flash it through a project that names its probe serial;
-a project for the DRP1M1 build passes `-DSHIELD=x_nucleo_drp1m1`:
+decision 41) and flash it through an `embarch-api` project that names its
+probe serial, one project per shield. `west` is not on a bare `PATH`, so
+`build_command` names it in full:
+
+```toml
+[[projects]]
+name = "pd-bench"
+source_path = "/path/to/embarch-dev-bench/workspaces/pd-bench"
+build_command = ["/path/to/venv/bin/west", "build", "-b", "nucleo_g0b1re", "-d", "build/pd-bench", "-s", "pd-bench"]
+artifact_path = "build/pd-bench/zephyr/zephyr.hex"
+chip = "STM32G0B1VE"
+flash_format = "hex"
+serial_baud = 115200
+probe_serial = "<ST-LINK serial>"
+
+[[projects]]
+name = "pd-bench-drp"
+source_path = "/path/to/embarch-dev-bench/workspaces/pd-bench"
+build_command = ["/path/to/venv/bin/west", "build", "-b", "nucleo_g0b1re", "-d", "build/pd-bench-drp", "-s", "pd-bench", "--", "-DSHIELD=x_nucleo_drp1m1"]
+artifact_path = "build/pd-bench-drp/zephyr/zephyr.hex"
+chip = "STM32G0B1VE"
+flash_format = "hex"
+serial_baud = 115200
+probe_serial = "<ST-LINK serial>"
+```
 
 ```sh
 embarch-api enroll-probe --chip STM32G0B1VE --probe-serial <ST-LINK serial> --name pd-bench
-embarch-api build-and-flash <project>
+embarch-api build-and-flash pd-bench
 ```
 
 The ST-LINK's mass-storage drive refuses this image: it reports 32 KB.

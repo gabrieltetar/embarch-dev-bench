@@ -1,0 +1,216 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriel Tetar <gabriel@intercreate.io>
+Date: Mon, 12 Oct 2026 12:05:00 -0600
+Subject: [PATCH] drivers: usb_c: tcpc: stm32: fix the shared IRQ, prescaler
+ and RX overrun
+
+Three fixes to the STM32 UCPD driver, carried as one patch. Each part
+was a separate patch; they apply in this order:
+
+1. service every UCPD port with a pending IRQ
+2. shift the clock prescaler into its field
+3. drop a Message whose byte was overrun
+
+1. service every UCPD port with a pending IRQ
+
+The UCPD peripherals share one interrupt line. The handler picked the
+port to service from the raw status register, UCPD1 first. UCPD_SR also
+carries TYPEC_VSTATE_CC1/CC2, which are non-zero whenever port 1 is
+attached, so a pending UCPD2 interrupt was handled as UCPD1's, never
+cleared, and the line re-entered forever.
+
+Mask each port's status with its interrupt enables and service every
+port that has a pending interrupt.
+
+2. shift the clock prescaler into its field
+
+LL_UCPD_Init() takes the UCPD_CFG1 PSC_UCPDCLK value already shifted
+into place (LL_UCPD_PSC_DIV2 is UCPD_CFG1_PSC_UCPDCLK_0, bit 17), but the
+driver passed ilog2(psc-ucpdclk) unshifted. The prescaler bits landed in
+HBITCLKDIV instead, so the prescaler stayed at /1 for every value but 1.
+
+With the binding defaults (psc-ucpdclk 2, hbitclkdiv 14) ucpd_clk was
+HSI16 / 1 and hbit_clk 16 MHz / 14 = 1.14 MHz: the port sent BMC at
+about 571 kbps, outside fBitRate (270 to 330 kbps, USB PD R3.2).
+Shifted, the defaults give 16 MHz / 2 / 14 = 571 kHz, 286 kbps. Seen on
+a bench: a sink that decoded the Source_Capabilities had its GoodCRC and
+Request missed, and fell into Soft and Hard Resets.
+
+Upstream main no longer has the bug: commit 9719cc9cbe4f ("drivers: usb_c:
+tcpc: stm32: drop usage of LL_UCPD_Init()") shifts the value itself.
+
+3. drop a Message whose byte was overrun
+
+The UCPD receives a Message a byte at a time through UCPD_RXDR and
+flags RXOVR when a byte arrives before the previous one was read. The
+peripheral checks the CRC on the line, not on what software read, so a
+Message with an overwritten byte still ends with RXMSGEND and no RXERR.
+The driver ignored RXOVR: it handed the Protocol Layer a Message a byte
+short, its objects shifted, and sent the GoodCRC that told the sender
+it had arrived.
+
+The interrupt handler now notes RXOVR for the Message in progress and,
+at its end, drops it without a GoodCRC, as for a Message with a bad CRC:
+the sender's CRCReceiveTimer expires and it retries the same Message
+(USB PD R3.2).
+
+Seen on a NUCLEO-G0B1RE sink: a Source_Capabilities whose fourth object
+lost a byte left the sink with an AVS and a PPS APDO read as garbage
+fixed PDOs, and an Accept overran once in about 30 transitions.
+
+Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
+---
+ drivers/usb_c/tcpc/ucpd_stm32.c      | 84 ++++++++++++++--------------
+ drivers/usb_c/tcpc/ucpd_stm32_priv.h |  2 +
+ 2 files changed, 43 insertions(+), 43 deletions(-)
+
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32.c b/drivers/usb_c/tcpc/ucpd_stm32.c
+index 0bfb60ce14c..a7961bf951b 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32.c
++++ b/drivers/usb_c/tcpc/ucpd_stm32.c
+@@ -1054,11 +1054,10 @@ static int ucpd_set_bist_test_mode(const struct device *dev, bool enable)
+ }
+ 
+ /**
+- * @brief UCPD interrupt handler
++ * @brief Handle the pending interrupts of one UCPD port
+  */
+-static void ucpd_isr(const struct device *dev_inst[])
++static void ucpd_isr_port(const struct device *dev)
+ {
+-	const struct device *dev;
+ 	const struct tcpc_config *config;
+ 	struct tcpc_data *data;
+ 	uint32_t sr;
+@@ -1066,43 +1065,6 @@ static void ucpd_isr(const struct device *dev_inst[])
+ 	uint32_t tx_done_mask = UCPD_SR_TXUND | UCPD_SR_TXMSGSENT | UCPD_SR_TXMSGABT |
+ 				UCPD_SR_TXMSGDISC | UCPD_SR_HRSTSENT | UCPD_SR_HRSTDISC;
+ 
+-#if DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 1
+-	/*
+-	 * Multiple UCPD ports are available
+-	 */
+-
+-	uint32_t sr0;
+-	uint32_t sr1;
+-
+-	/*
+-	 * Since the UCPD peripherals share the same interrupt line, determine
+-	 * which one generated the interrupt.
+-	 */
+-
+-	/* Read UCPD1 and UCPD2 Status Registers */
+-
+-	sr0 = stm32_reg_read(&((const struct tcpc_config *)dev_inst[0]->config)->ucpd_port->SR);
+-	sr1 = stm32_reg_read(&((const struct tcpc_config *)dev_inst[1]->config)->ucpd_port->SR);
+-
+-	if (sr0) {
+-		dev = dev_inst[0];
+-	} else if (sr1) {
+-		dev = dev_inst[1];
+-	} else {
+-		/*
+-		 * The interrupt was triggered by some other device sharing this
+-		 * interrupt line.
+-		 */
+-		return;
+-	}
+-#else
+-	/*
+-	 * Only one UCPD port available
+-	 */
+-
+-	dev = dev_inst[0];
+-#endif /* Get the UCPD port that initiated that interrupt  */
+-
+ 	config = dev->config;
+ 	data = dev->data;
+ 	info = &data->alert_info;
+@@ -1153,17 +1115,31 @@ static void ucpd_isr(const struct device *dev_inst[])
+ 
+ 		data->ucpd_rx_byte_count = 2;
+ 		data->ucpd_rx_msg_active = true;
++		data->ucpd_rx_ovr = false;
+ 	}
+ 	/* Check for byte received */
+ 	if (sr & UCPD_SR_RXNE) {
+ 		ucpd_rx_data_byte(dev);
+ 	}
++	/*
++	 * A byte overwritten before it was read leaves the Message a byte
++	 * short, although its CRC, which the peripheral checks, is good
++	 */
++	if (sr & UCPD_SR_RXOVR) {
++		data->ucpd_rx_ovr = true;
++	}
+ 
+ 	/* Check for end of message */
+ 	if (sr & UCPD_SR_RXMSGEND) {
+ 		data->ucpd_rx_msg_active = false;
+-		/* Check for errors */
+-		if (!(sr & UCPD_SR_RXERR)) {
++		/*
++		 * Check for errors. A Message with a lost byte gets no GoodCRC,
++		 * so its sender retries it (USB PD
++		 * specification)
++		 */
++		if (data->ucpd_rx_ovr) {
++			LOG_WRN("ucpd: rx overrun, message dropped");
++		} else if (!(sr & UCPD_SR_RXERR)) {
+ 			enum pd_packet_type type;
+ 			union pd_header rx_header;
+ 			int good_crc;
+@@ -1215,6 +1191,27 @@ static void ucpd_isr(const struct device *dev_inst[])
+ 	k_work_submit(&info->work);
+ }
+ 
++/**
++ * @brief UCPD interrupt handler
++ *
++ * The UCPD peripherals share one interrupt line, and their status registers
++ * also carry the CC line states (TYPEC_VSTATE_CCx), which are non-zero while
++ * a port is attached. So each port is serviced when its status, masked by its
++ * interrupt enables, shows a pending interrupt.
++ */
++static void ucpd_isr(const struct device *dev_inst[])
++{
++	for (int i = 0; i < DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT); i++) {
++		const struct tcpc_config *config = dev_inst[i]->config;
++		uint32_t pending = stm32_reg_read(&config->ucpd_port->SR) &
++				   stm32_reg_read(&config->ucpd_port->IMR);
++
++		if (pending != 0) {
++			ucpd_isr_port(dev_inst[i]);
++		}
++	}
++}
++
+ /**
+  * @brief Dump a set of TCPC registers
+  *
+@@ -1432,7 +1429,8 @@ BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0, "No compatible STM32 TC
+ 	static const struct tcpc_config drv_config_##inst = {                                      \
+ 		.ucpd_pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(inst),                                 \
+ 		.ucpd_port = (UCPD_TypeDef *)DT_INST_REG_ADDR(inst),                               \
+-		.ucpd_params.psc_ucpdclk = ilog2(DT_INST_PROP(inst, psc_ucpdclk)),                 \
++		.ucpd_params.psc_ucpdclk =                                                         \
++			ilog2(DT_INST_PROP(inst, psc_ucpdclk)) << UCPD_CFG1_PSC_UCPDCLK_Pos,       \
+ 		.ucpd_params.transwin = DT_INST_PROP(inst, transwin) - 1,                          \
+ 		.ucpd_params.IfrGap = DT_INST_PROP(inst, ifrgap) - 1,                              \
+ 		.ucpd_params.HbitClockDiv = DT_INST_PROP(inst, hbitclkdiv) - 1,                    \
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32_priv.h b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+index 29cc62f56ee..e059a35d96e 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32_priv.h
++++ b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+@@ -297,6 +297,8 @@ struct tcpc_data {
+ 	bool ucpd_rx_sop_prime_enabled;
+ 	/* Flag set to true when receiving a message */
+ 	bool ucpd_rx_msg_active;
++	/* A byte of the Message in progress was overwritten before it was read */
++	bool ucpd_rx_ovr;
+ 	/* Flag set to true when in RX BIST Mode */
+ 	bool ucpd_rx_bist_mode;
+ 
+-- 
+2.43.0
+

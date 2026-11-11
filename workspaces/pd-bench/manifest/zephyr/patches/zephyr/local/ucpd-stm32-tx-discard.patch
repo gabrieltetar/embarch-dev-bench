@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriel Tetar <gabriel@intercreate.io>
+Date: Mon, 19 Oct 2026 11:42:22 -0600
+Subject: [PATCH] drivers: usb_c: tcpc: stm32: take a late discard as our
+ Message's result
+
+A Message the driver starts while the partner's is still on CC, during
+its preamble before RXORDDET or as a retry, which checks for nothing, is
+discarded by the UCPD. The UCPD raises TXMSGDISC only once the line is
+idle, after the partner's Message has ended, and by then the interrupt
+handler has started our GoodCRC for that Message at RXMSGEND.
+
+The handler matched a TX result to the active buffer, so the late
+TXMSGDISC was taken as the end of the GoodCRC: TX interrupts were masked
+and the TX DMA stopped before the GoodCRC went out, so the partner got
+no GoodCRC either. A TXMSGDISC that rose between the handler's status
+read and the start of the GoodCRC, which clears every TX flag, was lost.
+Either way our Message never got its result. The driver stayed in its
+transmit state and queued every later Message behind it, the Protocol
+Layer reported a transmit error after its timeout, the Soft Reset that
+followed was stuck too, and the port ended in a Hard Reset.
+
+The driver now marks our Message as on the PHY until its result is
+recorded. While it is, starting the GoodCRC keeps a pending TXMSGDISC,
+and a TXMSGDISC seen while the GoodCRC is active is reported as our
+Message's discard; the GoodCRC goes on unless the same status also ends
+it. A Hard Reset sent or received, and the state reset, clear the mark.
+
+Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
+---
+ drivers/usb_c/tcpc/ucpd_stm32.c      | 72 ++++++++++++++++++++++------
+ drivers/usb_c/tcpc/ucpd_stm32_priv.h |  2 +
+ 2 files changed, 59 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32.c b/drivers/usb_c/tcpc/ucpd_stm32.c
+index 3bee541bc12..10dea178396 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32.c
++++ b/drivers/usb_c/tcpc/ucpd_stm32.c
+@@ -337,13 +337,20 @@ static bool ucpd_rx_lost(const struct device *dev, uint32_t sr)
+ static void ucpd_tx_interrupts_enable(const struct device *dev, bool enable)
+ {
+ 	const struct tcpc_config *const config = dev->config;
++	const struct tcpc_data *data = dev->data;
+ 	uint32_t imr;
+ 
+ 	imr = stm32_reg_read(&config->ucpd_port->IMR);
+ 
+ 	if (enable) {
+-		/* By DMA, no interrupt per byte */
+-		stm32_reg_write(&config->ucpd_port->ICR, UCPD_ICR_TX_INT_MASK);
++		/*
++		 * A discard of our Message still due when our GoodCRC starts is
++		 * raised once the line is idle, so its flag is kept. By DMA, no
++		 * interrupt per byte.
++		 */
++		stm32_reg_write(&config->ucpd_port->ICR,
++				data->ucpd_tx_tcpm_phy ? UCPD_ICR_TX_INT_MASK & ~UCPD_ICR_TXMSGDISCCF
++						       : UCPD_ICR_TX_INT_MASK);
+ 		stm32_reg_write(&config->ucpd_port->IMR,
+ 				imr | (ucpd_tx_by_dma(config) ? UCPD_IMR_TX_INT_MASK & ~UCPD_IMR_TXISIE
+ 							      : UCPD_IMR_TX_INT_MASK));
+@@ -363,6 +370,7 @@ static void stm32_ucpd_state_init(const struct device *dev)
+ 	data->ucpd_tx_request = 0;
+ 	data->tx_retry_count = 0;
+ 	data->ucpd_tx_state = STATE_IDLE;
++	data->ucpd_tx_tcpm_phy = false;
+ 
+ 	/* Init variables used to manage rx */
+ 	data->ucpd_rx_sop_prime_enabled = false;
+@@ -856,6 +864,9 @@ static void ucpd_start_transmit(const struct device *dev, enum ucpd_tx_msg msg_t
+ 		 * enable hard reset interrupts, and then set a bit in the CR
+ 		 * register to initiate.
+ 		 */
++		/* Hard Reset Signaling cuts our Message short: no result follows */
++		data->ucpd_tx_tcpm_phy = false;
++
+ 		/* Enable interrupt for Hard Reset sent/discarded */
+ 		stm32_reg_write(&config->ucpd_port->ICR, UCPD_ICR_HRSTDISCCF | UCPD_ICR_HRSTSENTCF);
+ 
+@@ -919,9 +930,18 @@ static void ucpd_start_transmit(const struct device *dev, enum ucpd_tx_msg msg_t
+ 		}
+ #endif
+ 
++		/* A new attempt of our Message: a result still due is stale */
++		if (msg_type == TX_MSG_TCPM) {
++			data->ucpd_tx_tcpm_phy = false;
++		}
++
+ 		/* Enable interrupts */
+ 		ucpd_tx_interrupts_enable(dev, 1);
+ 
++		if (msg_type == TX_MSG_TCPM) {
++			data->ucpd_tx_tcpm_phy = true;
++		}
++
+ 		/* Trigger ucpd peripheral to start pd message transmit */
+ 		LL_UCPD_SendMessage(config->ucpd_port);
+ 	}
+@@ -1514,6 +1534,8 @@ static void ucpd_isr_port(const struct device *dev)
+ 	 * machine that transmit operation is complete.
+ 	 */
+ 	if (sr & tx_done_mask) {
++		bool tx_done = true;
++
+ 		/*
+ 		 * Check for tx message complete. Hard Reset results come first:
+ 		 * a discarded Hard Reset is not a discarded message.
+@@ -1523,24 +1545,43 @@ static void ucpd_isr_port(const struct device *dev)
+ 		} else if (sr & UCPD_SR_HRSTDISC) {
+ 			atomic_set_bit(&info->evt, UCPD_EVT_HR_FAIL);
+ 		} else if (data->ucpd_tx_active_buffer == &data->ucpd_tx_buffers[TX_MSG_GOOD_CRC]) {
++			/*
++			 * Our Message, discarded by the one our GoodCRC answers,
++			 * gets its TXMSGDISC once the line is idle, after the
++			 * GoodCRC started: that is our Message's result, and the
++			 * GoodCRC goes on
++			 */
++			if ((sr & UCPD_SR_TXMSGDISC) && data->ucpd_tx_tcpm_phy) {
++				data->ucpd_tx_tcpm_phy = false;
++				atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_DISC);
++				tx_done = (sr & (UCPD_SR_TXMSGSENT | UCPD_SR_TXMSGABT |
++						 UCPD_SR_TXUND)) != 0;
++			}
+ 			/* Our GoodCRC's end is not our Message's */
+-			atomic_set_bit(&info->evt, UCPD_EVT_GOOD_CRC_DONE);
+-		} else if (sr & UCPD_SR_TXMSGSENT) {
+-			atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_SUCCESS);
+-		} else if (sr & (UCPD_SR_TXMSGABT | UCPD_SR_TXUND)) {
+-			atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_FAIL);
+-		} else if (sr & UCPD_SR_TXMSGDISC) {
+-			atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_DISC);
++			if (tx_done) {
++				atomic_set_bit(&info->evt, UCPD_EVT_GOOD_CRC_DONE);
++			}
++		} else {
++			data->ucpd_tx_tcpm_phy = false;
++			if (sr & UCPD_SR_TXMSGSENT) {
++				atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_SUCCESS);
++			} else if (sr & (UCPD_SR_TXMSGABT | UCPD_SR_TXUND)) {
++				atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_FAIL);
++			} else if (sr & UCPD_SR_TXMSGDISC) {
++				atomic_set_bit(&info->evt, UCPD_EVT_TX_MSG_DISC);
++			}
+ 		}
+ 
+-		/* Disable Tx interrupts */
+-		ucpd_tx_interrupts_enable(dev, 0);
++		if (tx_done) {
++			/* Disable Tx interrupts */
++			ucpd_tx_interrupts_enable(dev, 0);
+ #ifdef CONFIG_USBC_TCPC_STM32_DMA
+-		/* A Message cut short leaves the DMA waiting for the next byte */
+-		if (ucpd_tx_by_dma(config)) {
+-			(void)dma_stop(config->tx_dma_dev, config->tx_dma_channel);
+-		}
++			/* A Message cut short leaves the DMA waiting for the next byte */
++			if (ucpd_tx_by_dma(config)) {
++				(void)dma_stop(config->tx_dma_dev, config->tx_dma_channel);
++			}
+ #endif
++		}
+ 	}
+ 
+ 	/* Check for data register empty; the DMA fills it */
+@@ -1674,6 +1715,7 @@ static void ucpd_isr_port(const struct device *dev)
+ 	if (sr & UCPD_SR_RXHRSTDET) {
+ 		/* hard reset received: a Message it cut off never ends */
+ 		data->ucpd_rx_msg_active = false;
++		data->ucpd_tx_tcpm_phy = false;
+ 		atomic_set_bit(&info->evt, UCPD_EVT_HARD_RESET_RECEIVED);
+ #ifdef CONFIG_USBC_TCPC_STM32_DMA
+ 		if (ucpd_rx_by_dma(config)) {
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32_priv.h b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+index 0939bef0140..fcbe601073b 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32_priv.h
++++ b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+@@ -357,6 +357,8 @@ struct tcpc_data {
+ 	struct ucpd_tx_desc ucpd_tx_buffers[TX_MSG_TOTAL];
+ 	/* Current buffer being transmitted */
+ 	struct ucpd_tx_desc *ucpd_tx_active_buffer;
++	/* Our Message went to the PHY and its result is still due */
++	bool ucpd_tx_tcpm_phy;
+ 	/* Request to send a transmission message */
+ 	int ucpd_tx_request;
+ 	/* State of the TX state machine */
+-- 
+2.43.0
+

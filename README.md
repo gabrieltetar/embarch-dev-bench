@@ -21,6 +21,14 @@ workspaces:
   `nordic`). Stood in as the bench for one milestone; stays in the tree and
   working, but not currently flashed (decision 43).
 
+A second app, `pd-bench/`, is a USB Power Delivery partner scripted over its
+shell (decision 48). It shares no code with `app/` and has a workspace of
+its own:
+
+- `workspaces/pd-bench/` — vanilla Zephyr v4.4.2 plus six USB-C patches
+  carried as a `west patch` set, targets the NUCLEO-G0B1RE (decision 58).
+  Build and flash: [pd-bench/README.md](pd-bench/README.md).
+
 ## Prerequisites
 
 Standard Zephyr toolchain setup — see
@@ -95,11 +103,16 @@ See
 for the full annotated tree. Short version: `app/` is the one shared,
 vendor-agnostic C application; each `workspaces/<vendor>/` directory is an
 independent west topdir with its own manifest, symlinking in `app/` rather
-than copying it.
+than copying it. `workspaces/pd-bench/` is the same shape, symlinking in
+`pd-bench/` instead.
 
 ## License
 
 MIT — see [LICENSE](LICENSE). That covers this repo's own contents
-(`app/` and each `workspaces/<vendor>/` manifest); the west-managed trees
+(`app/`, `pd-bench/` and each workspace's manifest); the west-managed trees
 `west update` fetches into those workspaces are not checked in here and keep
 their upstream licenses.
+
+The patches under `workspaces/pd-bench/manifest/zephyr/patches/` are the
+exception: they modify Zephyr's sources, which are Apache-2.0, and keep that
+license, not this repo's MIT.

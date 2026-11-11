@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriel Tetar <gabriel@intercreate.io>
+Date: Tue, 6 Oct 2026 01:06:14 -0600
+Subject: [PATCH] usb: usb_c: tc: accept -ENOTSUP when disabling VCONN
+
+A TCPC without a VCONN supply reports tcpc_set_vconn() as -ENOTSUP:
+the STM32 UCPD driver does so when no VCONN control callback is
+registered. tc_init() already accepts it, but the CC-open entry and the
+Attached.SRC exit accept only -ENOSYS. In a source-capable build on
+such a TCPC every ErrorRecovery entry therefore logged an error,
+requested ErrorRecovery again and returned before opening the CC lines,
+so the port kept presenting Rp through tErrorRecovery, and every source
+detach logged "Couldn't disable VCONN source".
+
+Accept -ENOTSUP in both places, as tc_init() does.
+
+Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
+---
+ subsys/usb/usb_c/usbc_tc_common.c     | 2 +-
+ subsys/usb/usb_c/usbc_tc_src_states.c | 2 +-
+ 2 files changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/subsys/usb/usb_c/usbc_tc_common.c b/subsys/usb/usb_c/usbc_tc_common.c
+index 6a41686c9d9..84c0aecda39 100644
+--- a/subsys/usb/usb_c/usbc_tc_common.c
++++ b/subsys/usb/usb_c/usbc_tc_common.c
+@@ -288,7 +288,7 @@ static void tc_cc_open_entry(void *obj)
+ 	if (IS_ENABLED(CONFIG_USBC_CSM_SUPPORTS_SOURCE)) {
+ 		/* Disable VCONN */
+ 		ret = tcpc_set_vconn(tcpc, false);
+-		if (ret != 0 && ret != -ENOSYS) {
++		if (ret != 0 && ret != -ENOSYS && ret != -ENOTSUP) {
+ 			LOG_ERR("Couldn't disable vconn: %d", ret);
+ 			tc_set_state(dev, TC_ERROR_RECOVERY_STATE);
+ 			return;
+diff --git a/subsys/usb/usb_c/usbc_tc_src_states.c b/subsys/usb/usb_c/usbc_tc_src_states.c
+index cacb32d162b..b35e6f8c5b9 100644
+--- a/subsys/usb/usb_c/usbc_tc_src_states.c
++++ b/subsys/usb/usb_c/usbc_tc_src_states.c
+@@ -355,7 +355,7 @@ void tc_attached_src_exit(void *obj)
+ 
+ 	/* Stop sourcing VCONN */
+ 	ret = tcpc_set_vconn(tcpc, false);
+-	if (ret != 0 && ret != -ENOSYS) {
++	if (ret != 0 && ret != -ENOSYS && ret != -ENOTSUP) {
+ 		LOG_ERR("Couldn't disable VCONN source");
+ 	}
+ }
+-- 
+2.43.0
+

@@ -1,0 +1,35 @@
+# Manifest for workspaces/pd-bench (embarch-dev-bench decision 50) --
+# vanilla Zephyr plus a carried USB-C patch set, for pd-bench/ only.
+#
+# Named for the app, not for a vendor family as decision 2 groups the other
+# three: its Zephyr is patched, and app/ is not built against that tree.
+#
+# Lives in this manifest/ subdirectory for the same reason as
+# workspaces/native_sim/manifest/west.yml: `west init -l manifest` (run from
+# within workspaces/pd-bench/) creates `.west/` next to manifest/, so
+# `.west/`, `zephyr/` and `modules/` all land inside workspaces/pd-bench/.
+#
+# v4.4.2 is the release the six patches in zephyr/patches.yml were written
+# against, and every one applies cleanly to it. The pin moves only with the
+# patch set: after a move, `west patch clean && west patch apply`, and drop
+# every patch the new release already carries (decision 50's drop rule).
+#
+# A trimmed name-allowlist rather than `import: true`: pd-bench builds for
+# nucleo_g0b1re only, which needs the STM32 HAL and CMSIS and nothing else.
+# `west-commands` brings in Zephyr's `west build`, `west patch` and
+# `west twister`.
+manifest:
+  remotes:
+    - name: zephyrproject-rtos
+      url-base: https://github.com/zephyrproject-rtos
+  projects:
+    - name: zephyr
+      remote: zephyrproject-rtos
+      revision: v4.4.2
+      west-commands: scripts/west-commands.yml
+      import:
+        name-allowlist:
+          - cmsis_6
+          - hal_stm32
+  self:
+    path: manifest

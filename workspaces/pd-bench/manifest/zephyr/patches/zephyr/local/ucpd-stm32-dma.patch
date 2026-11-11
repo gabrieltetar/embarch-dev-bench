@@ -1,0 +1,572 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gabriel Tetar <gabriel@intercreate.io>
+Date: Wed, 14 Oct 2026 13:15:31 -0600
+Subject: [PATCH] drivers: usb_c: tcpc: stm32: move Messages by DMA
+
+The driver moves every byte of a Message through its interrupt handler,
+one UCPD interrupt per byte, about every 33 us at 300 kbps, on a line the
+STM32G0 shares between UCPD1, UCPD2 and USB. Under load the handler falls
+behind:
+
+- A byte it writes late underruns the transmitter. The reference manual
+  says the peripheral then makes the CRC wrong, but on an STM32G0B1 some
+  underrun Messages leave with a byte set to zero under a valid CRC, and
+  the partner takes them: a Request read as GotoMin, an Accept or a
+  PS_RDY with MessageID 0, a PPS APDO's Maximum Voltage cut from 21 V to
+  12.8 V. Measured: 6 transmit underruns in 30 Get_Sink_Cap exchanges,
+  matching the 4 CRC errors and 2 zeroed Messages the partner received.
+- A byte it reads late is overrun, and the Message is dropped.
+
+With DMA channels named "rx" and "tx" on a UCPD node,
+CONFIG_USBC_TCPC_STM32_DMA moves Messages by DMA instead:
+
+- Reception: the channel stays armed at the buffer after the ordered set,
+  for more than the longest Message. At RXMSGEND its count must equal
+  RXPAYSZ, or the Message is dropped without a GoodCRC so that its sender
+  retries it. The channel is armed again after each Message, a Hard
+  Reset, or a Message that never ended.
+- Transmission: the channel is pointed at the Message before TXSEND, and
+  TXIS is no longer enabled.
+
+RXDMAEN and TXDMAEN are set at init, while the port is disabled. The TCPM
+initializes the port again, and the STM32 DMA driver keeps a configured
+channel allocated, so a channel is configured once.
+
+Seen with DMA on both a NUCLEO-G0B1RE partner and a second STM32G0 board:
+30 Get_Sink_Cap, 30 Get_Source_Cap, Source_Capabilities changes, a Hard
+Reset, 14 PR_Swaps and a PPS contract with its keep-alives, with no
+underrun, overrun, CRC error or zeroed Message on either side.
+
+Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
+---
+ drivers/usb_c/tcpc/Kconfig.tcpc_stm32 |  13 ++
+ drivers/usb_c/tcpc/ucpd_stm32.c       | 313 ++++++++++++++++++++++++--
+ drivers/usb_c/tcpc/ucpd_stm32_priv.h  |  24 ++
+ dts/bindings/tcpc/st,stm32-ucpd.yaml  |  13 ++
+ 4 files changed, 349 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/usb_c/tcpc/Kconfig.tcpc_stm32 b/drivers/usb_c/tcpc/Kconfig.tcpc_stm32
+index b4d891954d1..280cdc23ccf 100644
+--- a/drivers/usb_c/tcpc/Kconfig.tcpc_stm32
++++ b/drivers/usb_c/tcpc/Kconfig.tcpc_stm32
+@@ -12,3 +12,16 @@ config USBC_TCPC_STM32
+ 	help
+ 	  Enable USB-C TCPC support on the STM32 G0, G4, L5, and U5 family of
+ 	  processors.
++
++config USBC_TCPC_STM32_DMA
++	bool "Move USB PD Messages by DMA"
++	default $(dt_compat_any_has_prop,$(DT_COMPAT_ST_STM32_UCPD),dmas)
++	depends on USBC_TCPC_STM32
++	select DMA
++	help
++	  Read UCPD_RXDR and write UCPD_TXDR by DMA on each port whose
++	  devicetree node names an "rx" or "tx" DMA channel, instead of in
++	  the interrupt handler once per byte. A byte the handler reads late
++	  is lost; a byte it writes late underruns the transmitter, which can
++	  send a zero byte under a valid CRC. The DMA keeps pace with the line
++	  whatever the interrupt latency.
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32.c b/drivers/usb_c/tcpc/ucpd_stm32.c
+index 449132b1fa8..3bee541bc12 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32.c
++++ b/drivers/usb_c/tcpc/ucpd_stm32.c
+@@ -19,6 +19,8 @@ LOG_MODULE_REGISTER(ucpd_stm32, CONFIG_USBC_LOG_LEVEL);
+ #include <zephyr/math/ilog2.h>
+ #include <stm32_ll_system.h>
+ #include <zephyr/irq.h>
++#include <zephyr/drivers/dma.h>
++#include <zephyr/drivers/dma/dma_stm32.h>
+ 
+ #include "ucpd_stm32_priv.h"
+ 
+@@ -122,6 +124,213 @@ static void ucpd_rx_data_byte(const struct device *dev)
+ 	}
+ }
+ 
++static bool ucpd_rx_by_dma(const struct tcpc_config *config)
++{
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	return config->rx_dma_dev != NULL;
++#else
++	ARG_UNUSED(config);
++	return false;
++#endif
++}
++
++static bool ucpd_tx_by_dma(const struct tcpc_config *config)
++{
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	return config->tx_dma_dev != NULL;
++#else
++	ARG_UNUSED(config);
++	return false;
++#endif
++}
++
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++/* Room after the ordered set: more than the longest Message */
++#define UCPD_RX_DMA_LEN (UCPD_BUF_LEN - PACKET_TYPE_SIZE)
++
++/* Reads of the DMA count while its last byte may still be on its way */
++#define UCPD_RX_DMA_SETTLE_READS 16
++
++/**
++ * @brief Points the RX DMA at the buffer after the ordered set, ready for the
++ *        next Message
++ */
++static void ucpd_rx_dma_arm(const struct device *dev)
++{
++	const struct tcpc_config *const config = dev->config;
++	struct tcpc_data *data = dev->data;
++	int ret;
++
++	ret = dma_reload(config->rx_dma_dev, config->rx_dma_channel,
++			 (uint32_t)&config->ucpd_port->RXDR,
++			 (uint32_t)&data->ucpd_rx_buffer[PACKET_TYPE_SIZE], UCPD_RX_DMA_LEN);
++	if (ret == 0) {
++		ret = dma_start(config->rx_dma_dev, config->rx_dma_channel);
++	}
++	if (ret != 0) {
++		LOG_ERR("ucpd: rx DMA not armed: %d", ret);
++	}
++}
++
++/**
++ * @brief Bytes the RX DMA moved for the Message that just ended
++ *
++ * Its read of the last byte lands slightly after the peripheral has it
++ * (reference manual), so a count short of RXPAYSZ is read again a few times.
++ */
++static int ucpd_rx_dma_count(const struct device *dev, uint32_t paysz)
++{
++	const struct tcpc_config *const config = dev->config;
++	struct dma_status st;
++	int count = -1;
++
++	for (int i = 0; i < UCPD_RX_DMA_SETTLE_READS; i++) {
++		if (dma_get_status(config->rx_dma_dev, config->rx_dma_channel, &st) != 0) {
++			return -1;
++		}
++		count = UCPD_RX_DMA_LEN - (int)st.pending_length;
++		if (count >= (int)paysz) {
++			break;
++		}
++	}
++
++	return count;
++}
++
++/**
++ * @brief Points the TX DMA at a Message, header first, before TXSEND
++ */
++static int ucpd_tx_dma_arm(const struct device *dev, const struct ucpd_tx_desc *desc)
++{
++	const struct tcpc_config *const config = dev->config;
++	int ret;
++
++	ret = dma_reload(config->tx_dma_dev, config->tx_dma_channel, (uint32_t)desc->data.msg,
++			 (uint32_t)&config->ucpd_port->TXDR, desc->msg_len);
++	if (ret == 0) {
++		ret = dma_start(config->tx_dma_dev, config->tx_dma_channel);
++	}
++
++	return ret;
++}
++
++/*
++ * Configures a DMA channel once. The TCPM initializes the port again, and the
++ * DMA driver keeps a configured channel allocated, so later calls only stop it.
++ */
++static int ucpd_dma_channel_init(const struct device *dma_dev, uint32_t channel,
++				 struct dma_config *cfg, bool *configured)
++{
++	int ret;
++
++	if (*configured) {
++		return dma_stop(dma_dev, channel);
++	}
++
++	if (!device_is_ready(dma_dev)) {
++		return -ENODEV;
++	}
++
++	ret = dma_config(dma_dev, channel, cfg);
++	*configured = ret == 0;
++
++	return ret;
++}
++
++static int ucpd_dma_init(const struct device *dev)
++{
++	const struct tcpc_config *const config = dev->config;
++	struct tcpc_data *data = dev->data;
++	int ret = 0;
++
++	if (config->rx_dma_dev != NULL) {
++		data->rx_dma_blk = (struct dma_block_config){
++			.source_address = (uint32_t)&config->ucpd_port->RXDR,
++			.dest_address = (uint32_t)&data->ucpd_rx_buffer[PACKET_TYPE_SIZE],
++			.block_size = UCPD_RX_DMA_LEN,
++			.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
++			.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT,
++		};
++		data->rx_dma_cfg = (struct dma_config){
++			.dma_slot = config->rx_dma_slot,
++			.channel_direction = PERIPHERAL_TO_MEMORY,
++			.source_data_size = 1,
++			.dest_data_size = 1,
++			.source_burst_length = 1,
++			.dest_burst_length = 1,
++			.channel_priority =
++				STM32_DMA_CONFIG_PRIORITY(config->rx_dma_channel_config),
++			.block_count = 1,
++			.head_block = &data->rx_dma_blk,
++		};
++		ret = ucpd_dma_channel_init(config->rx_dma_dev, config->rx_dma_channel,
++					    &data->rx_dma_cfg, &data->rx_dma_configured);
++	}
++
++	if (ret == 0 && config->tx_dma_dev != NULL) {
++		data->tx_dma_blk = (struct dma_block_config){
++			.source_address = (uint32_t)data->ucpd_tx_buffers[TX_MSG_TCPM].data.msg,
++			.dest_address = (uint32_t)&config->ucpd_port->TXDR,
++			.block_size = MSG_HEADER_SIZE,
++			.source_addr_adj = DMA_ADDR_ADJ_INCREMENT,
++			.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE,
++		};
++		data->tx_dma_cfg = (struct dma_config){
++			.dma_slot = config->tx_dma_slot,
++			.channel_direction = MEMORY_TO_PERIPHERAL,
++			.source_data_size = 1,
++			.dest_data_size = 1,
++			.source_burst_length = 1,
++			.dest_burst_length = 1,
++			.channel_priority =
++				STM32_DMA_CONFIG_PRIORITY(config->tx_dma_channel_config),
++			.block_count = 1,
++			.head_block = &data->tx_dma_blk,
++		};
++		ret = ucpd_dma_channel_init(config->tx_dma_dev, config->tx_dma_channel,
++					    &data->tx_dma_cfg, &data->tx_dma_configured);
++	}
++
++	return ret;
++}
++#endif /* CONFIG_USBC_TCPC_STM32_DMA */
++
++/**
++ * @brief Whether the Message that just ended lost a byte on its way to the
++ *        buffer; by DMA, also sets the byte count
++ *
++ * A Message with a lost byte gets no GoodCRC, so its sender retries it (USB PD
++ * specification).
++ */
++static bool ucpd_rx_lost(const struct device *dev, uint32_t sr)
++{
++	const struct tcpc_config *const config = dev->config;
++	struct tcpc_data *data = dev->data;
++
++	if (data->ucpd_rx_ovr) {
++		LOG_WRN("ucpd: rx overrun, message dropped");
++		return true;
++	}
++
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	if (ucpd_rx_by_dma(config) && !(sr & UCPD_SR_RXERR)) {
++		uint32_t paysz = LL_UCPD_ReadRxPaySize(config->ucpd_port);
++		int count = ucpd_rx_dma_count(dev, paysz);
++
++		if (count != (int)paysz) {
++			LOG_WRN("ucpd: rx DMA took %d of %u bytes, message dropped", count, paysz);
++			return true;
++		}
++		data->ucpd_rx_byte_count = PACKET_TYPE_SIZE + count;
++	}
++#else
++	ARG_UNUSED(config);
++	ARG_UNUSED(sr);
++#endif
++
++	return false;
++}
++
+ /**
+  * @brief Enables or Disables TX interrupts
+  */
+@@ -133,8 +342,11 @@ static void ucpd_tx_interrupts_enable(const struct device *dev, bool enable)
+ 	imr = stm32_reg_read(&config->ucpd_port->IMR);
+ 
+ 	if (enable) {
++		/* By DMA, no interrupt per byte */
+ 		stm32_reg_write(&config->ucpd_port->ICR, UCPD_ICR_TX_INT_MASK);
+-		stm32_reg_write(&config->ucpd_port->IMR, imr | UCPD_IMR_TX_INT_MASK);
++		stm32_reg_write(&config->ucpd_port->IMR,
++				imr | (ucpd_tx_by_dma(config) ? UCPD_IMR_TX_INT_MASK & ~UCPD_IMR_TXISIE
++							      : UCPD_IMR_TX_INT_MASK));
+ 	} else {
+ 		stm32_reg_write(&config->ucpd_port->IMR, imr & ~UCPD_IMR_TX_INT_MASK);
+ 	}
+@@ -545,9 +757,18 @@ static int ucpd_set_rx_enable(const struct device *dev, bool enable)
+ 			ucpd_rx_ids_reset(data);
+ 		}
+ 
+-		/* Clear the RX alerts bits */
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		if (ucpd_rx_by_dma(config) &&
++		    (stm32_reg_read(&config->ucpd_port->CR) & UCPD_CR_PHYRXEN) == 0U) {
++			ucpd_rx_dma_arm(dev);
++		}
++#endif
++
++		/* Clear the RX alerts bits; by DMA, no interrupt per byte */
+ 		stm32_reg_write(&config->ucpd_port->ICR, UCPD_ICR_RX_INT_MASK);
+-		stm32_reg_set_bits(&config->ucpd_port->IMR, UCPD_IMR_RX_INT_MASK);
++		stm32_reg_set_bits(&config->ucpd_port->IMR,
++				   ucpd_rx_by_dma(config) ? UCPD_IMR_RX_INT_MASK & ~UCPD_IMR_RXNEIE
++							  : UCPD_IMR_RX_INT_MASK);
+ 		stm32_reg_set_bits(&config->ucpd_port->CR, UCPD_CR_PHYRXEN);
+ 	} else {
+ 		struct tcpc_data *data = dev->data;
+@@ -556,6 +777,11 @@ static int ucpd_set_rx_enable(const struct device *dev, bool enable)
+ 		stm32_reg_clear_bits(&config->ucpd_port->CR, UCPD_CR_PHYRXEN);
+ 		/* A Message cut off by the disable never ends */
+ 		data->ucpd_rx_msg_active = false;
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		if (ucpd_rx_by_dma(config)) {
++			(void)dma_stop(config->rx_dma_dev, config->rx_dma_channel);
++		}
++#endif
+ 	}
+ 
+ 	return 0;
+@@ -683,6 +909,16 @@ static void ucpd_start_transmit(const struct device *dev, enum ucpd_tx_msg msg_t
+ 		/* Reset msg byte index */
+ 		data->ucpd_tx_active_buffer->msg_index = 0;
+ 
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		if (ucpd_tx_by_dma(config) && msg_len > 0) {
++			int ret = ucpd_tx_dma_arm(dev, data->ucpd_tx_active_buffer);
++
++			if (ret != 0) {
++				LOG_ERR("ucpd: tx DMA not armed: %d", ret);
++			}
++		}
++#endif
++
+ 		/* Enable interrupts */
+ 		ucpd_tx_interrupts_enable(dev, 1);
+ 
+@@ -1299,16 +1535,28 @@ static void ucpd_isr_port(const struct device *dev)
+ 
+ 		/* Disable Tx interrupts */
+ 		ucpd_tx_interrupts_enable(dev, 0);
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		/* A Message cut short leaves the DMA waiting for the next byte */
++		if (ucpd_tx_by_dma(config)) {
++			(void)dma_stop(config->tx_dma_dev, config->tx_dma_channel);
++		}
++#endif
+ 	}
+ 
+-	/* Check for data register empty */
+-	if (sr & UCPD_SR_TXIS) {
++	/* Check for data register empty; the DMA fills it */
++	if ((sr & UCPD_SR_TXIS) && !ucpd_tx_by_dma(config)) {
+ 		ucpd_tx_data_byte(dev);
+ 	}
+ 
+ 	/* Check for Rx Events */
+ 	/* Check first for start of new message */
+ 	if (sr & UCPD_SR_RXORDDET) {
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		/* A Message that never ended left the DMA part way along */
++		if (ucpd_rx_by_dma(config) && data->ucpd_rx_msg_active) {
++			ucpd_rx_dma_arm(dev);
++		}
++#endif
+ 		/* Add message type to pd message buffer */
+ 		*(uint16_t *)data->ucpd_rx_buffer = LL_UCPD_ReadRxOrderSet(config->ucpd_port);
+ 
+@@ -1316,8 +1564,8 @@ static void ucpd_isr_port(const struct device *dev)
+ 		data->ucpd_rx_msg_active = true;
+ 		data->ucpd_rx_ovr = false;
+ 	}
+-	/* Check for byte received */
+-	if (sr & UCPD_SR_RXNE) {
++	/* Check for byte received; the DMA takes it when it reads RXDR */
++	if ((sr & UCPD_SR_RXNE) && !ucpd_rx_by_dma(config)) {
+ 		ucpd_rx_data_byte(dev);
+ 	}
+ 	/*
+@@ -1331,13 +1579,9 @@ static void ucpd_isr_port(const struct device *dev)
+ 	/* Check for end of message */
+ 	if (sr & UCPD_SR_RXMSGEND) {
+ 		data->ucpd_rx_msg_active = false;
+-		/*
+-		 * Check for errors. A Message with a lost byte gets no GoodCRC,
+-		 * so its sender retries it (USB PD
+-		 * specification)
+-		 */
+-		if (data->ucpd_rx_ovr) {
+-			LOG_WRN("ucpd: rx overrun, message dropped");
++		/* Check for errors */
++		if (ucpd_rx_lost(dev, sr)) {
++			/* Logged, and no GoodCRC */
+ 		} else if (!(sr & UCPD_SR_RXERR)) {
+ 			enum pd_packet_type type;
+ 			union pd_header rx_header;
+@@ -1419,12 +1663,23 @@ static void ucpd_isr_port(const struct device *dev)
+ 			/* Rx message is complete, but there were bit errors */
+ 			LOG_ERR("ucpd: rx message error");
+ 		}
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		/* The next Message starts no sooner than our GoodCRC has gone */
++		if (ucpd_rx_by_dma(config)) {
++			ucpd_rx_dma_arm(dev);
++		}
++#endif
+ 	}
+ 	/* Check for fault conditions */
+ 	if (sr & UCPD_SR_RXHRSTDET) {
+ 		/* hard reset received: a Message it cut off never ends */
+ 		data->ucpd_rx_msg_active = false;
+ 		atomic_set_bit(&info->evt, UCPD_EVT_HARD_RESET_RECEIVED);
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++		if (ucpd_rx_by_dma(config)) {
++			ucpd_rx_dma_arm(dev);
++		}
++#endif
+ 	}
+ 
+ 	/* Clear interrupts now that PD events have been set */
+@@ -1580,6 +1835,14 @@ static int ucpd_init(const struct device *dev)
+ 		return ret;
+ 	}
+ 
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	ret = ucpd_dma_init(dev);
++	if (ret != 0) {
++		LOG_ERR("%s: DMA setup failed (%d)", dev->name, ret);
++		return ret;
++	}
++#endif
++
+ 	/*
+ 	 * The UCPD port is disabled in the LL_UCPD_Init function
+ 	 *
+@@ -1601,6 +1864,13 @@ static int ucpd_init(const struct device *dev)
+ 		cfg1 = stm32_reg_read(&config->ucpd_port->CFG1);
+ 		cfg1 |= LL_UCPD_ORDERSET_SOP | LL_UCPD_ORDERSET_SOP1 | LL_UCPD_ORDERSET_SOP2 |
+ 			LL_UCPD_ORDERSET_HARDRST;
++		/* RXDMAEN and TXDMAEN can only be written with the port disabled */
++		if (ucpd_rx_by_dma(config)) {
++			cfg1 |= UCPD_CFG1_RXDMAEN;
++		}
++		if (ucpd_tx_by_dma(config)) {
++			cfg1 |= UCPD_CFG1_TXDMAEN;
++		}
+ 		stm32_reg_write(&config->ucpd_port->CFG1, cfg1);
+ 
+ 		/* Enable UCPD port */
+@@ -1666,6 +1936,19 @@ static void config_tcpc_irq(void)
+ 
+ BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0, "No compatible STM32 TCPC instance found");
+ 
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++#define UCPD_DMA_INIT(inst, dir)                                                                   \
++	COND_CODE_1(DT_INST_DMAS_HAS_NAME(inst, dir),                                              \
++		    (.dir##_dma_dev = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(inst, dir)),         \
++		     .dir##_dma_channel = DT_INST_DMAS_CELL_BY_NAME(inst, dir, channel),           \
++		     .dir##_dma_slot = DT_INST_DMAS_CELL_BY_NAME(inst, dir, slot),                 \
++		     .dir##_dma_channel_config =                                                   \
++			     DT_INST_DMAS_CELL_BY_NAME(inst, dir, channel_config),),               \
++		    ())
++#else
++#define UCPD_DMA_INIT(inst, dir)
++#endif
++
+ #define TCPC_DRIVER_INIT(inst)                                                                     \
+ 	PINCTRL_DT_INST_DEFINE(inst);                                                              \
+ 	static struct tcpc_data drv_data_##inst;                                                   \
+@@ -1678,6 +1961,8 @@ BUILD_ASSERT(DT_NUM_INST_STATUS_OKAY(DT_DRV_COMPAT) > 0, "No compatible STM32 TC
+ 		.ucpd_params.IfrGap = DT_INST_PROP(inst, ifrgap) - 1,                              \
+ 		.ucpd_params.HbitClockDiv = DT_INST_PROP(inst, hbitclkdiv) - 1,                    \
+ 		.ucpd_dead_battery = DT_INST_PROP(inst, dead_battery),                             \
++		UCPD_DMA_INIT(inst, rx)                                                            \
++		UCPD_DMA_INIT(inst, tx)                                                            \
+ 	};                                                                                         \
+ 	DEVICE_DT_INST_DEFINE(inst, &ucpd_init, NULL, &drv_data_##inst, &drv_config_##inst,        \
+ 			      POST_KERNEL, CONFIG_USBC_TCPC_INIT_PRIORITY, &driver_api);
+diff --git a/drivers/usb_c/tcpc/ucpd_stm32_priv.h b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+index 170c050d45b..0939bef0140 100644
+--- a/drivers/usb_c/tcpc/ucpd_stm32_priv.h
++++ b/drivers/usb_c/tcpc/ucpd_stm32_priv.h
+@@ -11,6 +11,7 @@
+ #include <zephyr/sys/util.h>
+ #include <zephyr/drivers/usb_c/usbc_tcpc.h>
+ #include <zephyr/drivers/pinctrl.h>
++#include <zephyr/drivers/dma.h>
+ #include <stm32_ll_ucpd.h>
+ 
+ /**
+@@ -278,6 +279,19 @@ struct tcpc_config {
+ 	LL_UCPD_InitTypeDef ucpd_params;
+ 	/* STM32 UCPD dead battery support */
+ 	bool ucpd_dead_battery;
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	/* DMA controller reading UCPD_RXDR, NULL to read it in the ISR */
++	const struct device *rx_dma_dev;
++	/* Its channel, request line and channel configuration cell */
++	uint32_t rx_dma_channel;
++	uint32_t rx_dma_slot;
++	uint32_t rx_dma_channel_config;
++	/* DMA controller writing UCPD_TXDR, NULL to write it in the ISR */
++	const struct device *tx_dma_dev;
++	uint32_t tx_dma_channel;
++	uint32_t tx_dma_slot;
++	uint32_t tx_dma_channel_config;
++#endif
+ };
+ 
+ /**
+@@ -326,6 +340,16 @@ struct tcpc_data {
+ 	bool ucpd_rx_ovr;
+ 	/* Flag set to true when in RX BIST Mode */
+ 	bool ucpd_rx_bist_mode;
++#ifdef CONFIG_USBC_TCPC_STM32_DMA
++	/* Reception by DMA into ucpd_rx_buffer, after the ordered set */
++	struct dma_config rx_dma_cfg;
++	struct dma_block_config rx_dma_blk;
++	bool rx_dma_configured;
++	/* Transmission by DMA from the active descriptor */
++	struct dma_config tx_dma_cfg;
++	struct dma_block_config tx_dma_blk;
++	bool tx_dma_configured;
++#endif
+ 
+ 	/* Tx message variables */
+ 
+diff --git a/dts/bindings/tcpc/st,stm32-ucpd.yaml b/dts/bindings/tcpc/st,stm32-ucpd.yaml
+index 93b72faf0a9..49bcf9f3820 100644
+--- a/dts/bindings/tcpc/st,stm32-ucpd.yaml
++++ b/dts/bindings/tcpc/st,stm32-ucpd.yaml
+@@ -75,3 +75,16 @@ properties:
+ 
+   pinctrl-names:
+     required: true
++
++  dmas:
++    description: |
++      Optional DMA channels that read UCPD_RXDR ("rx") and write UCPD_TXDR
++      ("tx") with CONFIG_USBC_TCPC_STM32_DMA, instead of an interrupt per
++      byte. On the STM32G0 the DMAMUX requests are 58 UCPD1_RX, 59 UCPD1_TX,
++      60 UCPD2_RX and 61 UCPD2_TX. For example:
++        dmas = <&dmamux1 0 58 (STM32_DMA_PERIPH_RX | STM32_DMA_PRIORITY_VERY_HIGH)>,
++               <&dmamux1 1 59 (STM32_DMA_PERIPH_TX | STM32_DMA_PRIORITY_VERY_HIGH)>;
++
++  dma-names:
++    description: |
++      "rx", "tx", or both, in the order of dmas.
+-- 
+2.43.0
+
