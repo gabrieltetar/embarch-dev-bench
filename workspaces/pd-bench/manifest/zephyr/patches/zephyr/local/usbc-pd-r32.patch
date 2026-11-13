@@ -1145,12 +1145,15 @@ A review of parts 1 to 15 found these:
   driver both, and the references of a Get_Battery_Cap,
   Get_Battery_Status or Get_Manufacturer_Info are read through the new
   union pd_get_info_db.
+- usbc_pd.h includes <zephyr/toolchain.h>, which defines the __packed
+  that several of the structs this patch adds end with: a file that
+  included usbc_pd.h before any header that pulls it in did not compile.
 
 Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
 ---
  drivers/usb_c/tcpc/ucpd_stm32.c               |  341 +++-
  drivers/usb_c/tcpc/ucpd_stm32_priv.h          |   25 +
- include/zephyr/drivers/usb_c/usbc_pd.h        |  549 ++++-
+ include/zephyr/drivers/usb_c/usbc_pd.h        |  550 ++++-
  include/zephyr/usb_c/usbc.h                   |  345 +++-
  subsys/usb/usb_c/usbc_pe_common.c             | 1812 ++++++++++++++++-
  subsys/usb/usb_c/usbc_pe_common_internal.h    |  262 ++-
@@ -1168,7 +1171,7 @@ Signed-off-by: Gabriel Tetar <gabriel@intercreate.io>
  subsys/usb/usb_c/usbc_tc_src_states.c         |   23 +-
  subsys/usb/usb_c/usbc_timer.c                 |   30 +-
  subsys/usb/usb_c/usbc_timer.h                 |   14 +
- 20 files changed, 4881 insertions(+), 355 deletions(-)
+ 20 files changed, 4882 insertions(+), 355 deletions(-)
 
 diff --git a/drivers/usb_c/tcpc/ucpd_stm32.c b/drivers/usb_c/tcpc/ucpd_stm32.c
 index a79ab83b96a..449132b1fa8 100644
@@ -1793,10 +1796,19 @@ index e059a35d96e..170c050d45b 100644
  	int ucpd_crc_id;
  	/* Flag to receive or ignore SOP Prime messages */
 diff --git a/include/zephyr/drivers/usb_c/usbc_pd.h b/include/zephyr/drivers/usb_c/usbc_pd.h
-index 01077abc1f5..ebea79e17f2 100644
+index 01077abc1f5..273904975c1 100644
 --- a/include/zephyr/drivers/usb_c/usbc_pd.h
 +++ b/include/zephyr/drivers/usb_c/usbc_pd.h
-@@ -110,6 +110,66 @@ extern "C" {
+@@ -21,7 +21,8 @@
+  * @{
+  */
+
+ #include <zephyr/types.h>
++#include <zephyr/toolchain.h>
+
+ #ifdef __cplusplus
+ extern "C" {
+@@ -110,6 +111,66 @@ extern "C" {
   */
  #define PD_T_PS_HARD_RESET_MAX_MS 35
  
@@ -1863,7 +1875,7 @@ index 01077abc1f5..ebea79e17f2 100644
  /**
   * @brief Minimum time a Source waits after changing Rp from SinkTxOk to SinkTxNG
   *	  before initiating an AMS by sending a Message.
-@@ -174,6 +234,12 @@ extern "C" {
+@@ -174,6 +235,12 @@ extern "C" {
   */
  #define PD_V_SAFE_5V_MIN_MV 4750
  
@@ -1876,7 +1888,7 @@ index 01077abc1f5..ebea79e17f2 100644
  /**
   * @brief Time to reach PD_V_SAFE_0V_MV max in milliseconds.
   *	  See Table 7-24 Common Source/Sink Electrical Parameters
-@@ -181,6 +247,20 @@ extern "C" {
+@@ -181,6 +248,20 @@ extern "C" {
   */
  #define PD_T_SAFE_0V_MAX_MS  650
  
@@ -1897,7 +1909,7 @@ index 01077abc1f5..ebea79e17f2 100644
  /**
   * @brief Time to reach PD_V_SAFE_5V_MV max in milliseconds.
   *	  See Table 7-24 Common Source/Sink Electrical Parameters
-@@ -207,9 +287,9 @@ extern "C" {
+@@ -207,9 +288,9 @@ extern "C" {
  
  /**
   * @brief Minimum time a response must be sent from a Port Partner
@@ -1909,7 +1921,7 @@ index 01077abc1f5..ebea79e17f2 100644
  
  /**
   * @brief Nomiminal time a response must be sent from a Port Partner
-@@ -219,9 +299,9 @@ extern "C" {
+@@ -219,9 +300,9 @@ extern "C" {
  
  /**
   * @brief Maximum time a response must be sent from a Port Partner
@@ -1921,7 +1933,7 @@ index 01077abc1f5..ebea79e17f2 100644
  
  /**
   * @brief Minimum SPR Mode time for a power supply to transition to a new level
-@@ -344,6 +424,9 @@ union pd_header {
+@@ -344,6 +425,9 @@ union pd_header {
   */
  #define PD_GET_EXT_HEADER(c) ((c) & 0xffff)
  
@@ -1931,7 +1943,7 @@ index 01077abc1f5..ebea79e17f2 100644
  /**
   * @brief Build an extended message header
   *	  See Table 6-3 Extended Message Header
-@@ -691,6 +774,414 @@ union pd_augmented_supply_pdo_source {
+@@ -691,6 +775,414 @@ union pd_augmented_supply_pdo_source {
  	uint32_t raw_value;
  };
  
@@ -2346,7 +2358,7 @@ index 01077abc1f5..ebea79e17f2 100644
  /**
   * @brief Create Augmented Supply PDO Sink value
   *	  See Table 6-17 Programmable Power Supply APDO - Sink
-@@ -755,10 +1246,11 @@ union pd_rdo {
+@@ -755,10 +1247,11 @@ union pd_rdo {
  		uint32_t cap_mismatch : 1;
  		/** Give Back Flag */
  		uint32_t giveback : 1;
@@ -2362,7 +2374,7 @@ index 01077abc1f5..ebea79e17f2 100644
  	} fixed;
  
  	/**
-@@ -788,10 +1280,11 @@ union pd_rdo {
+@@ -788,10 +1281,11 @@ union pd_rdo {
  		uint32_t cap_mismatch : 1;
  		/** Give Back Flag */
  		uint32_t giveback : 1;
@@ -2378,7 +2390,7 @@ index 01077abc1f5..ebea79e17f2 100644
  	} variable;
  
  	/**
-@@ -815,10 +1308,11 @@ union pd_rdo {
+@@ -815,10 +1309,11 @@ union pd_rdo {
  		uint32_t cap_mismatch : 1;
  		/** Give Back Flag */
  		uint32_t giveback : 1;
@@ -2394,7 +2406,7 @@ index 01077abc1f5..ebea79e17f2 100644
  	} battery;
  
  	/**
-@@ -844,10 +1338,11 @@ union pd_rdo {
+@@ -844,10 +1339,11 @@ union pd_rdo {
  		uint32_t cap_mismatch : 1;
  		/** Reserved - Shall be set to zero */
  		uint32_t reserved2 : 1;
@@ -2410,7 +2422,7 @@ index 01077abc1f5..ebea79e17f2 100644
  	} augmented;
  	/** Raw RDO value */
  	uint32_t raw_value;
-@@ -950,9 +1445,13 @@ enum pd_ctrl_msg_type {
+@@ -950,9 +1446,13 @@ enum pd_ctrl_msg_type {
  	/** Get_Country_Codes Message */
  	PD_CTRL_GET_COUNTRY_CODES       = 21,
  	/** Get_Sink_Cap_Extended Message */
@@ -2426,7 +2438,7 @@ index 01077abc1f5..ebea79e17f2 100644
  };
  
  /**
-@@ -981,6 +1480,10 @@ enum pd_data_msg_type {
+@@ -981,6 +1481,10 @@ enum pd_data_msg_type {
  
  	/** Enter USB message */
  	PD_DATA_ENTER_USB       = 8,
@@ -2437,7 +2449,7 @@ index 01077abc1f5..ebea79e17f2 100644
  	/** Vendor Defined Message */
  	PD_DATA_VENDOR_DEF      = 15,
  };
-@@ -1020,6 +1523,8 @@ enum pd_ext_msg_type {
+@@ -1020,6 +1524,8 @@ enum pd_ext_msg_type {
  	PD_EXT_COUNTRY_INFO             = 13,
  	/** Country_Info Message */
  	PD_EXT_COUNTRY_CODES            = 14,

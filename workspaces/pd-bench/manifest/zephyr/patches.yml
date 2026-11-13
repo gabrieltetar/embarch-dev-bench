@@ -57,7 +57,7 @@ patches:
       sink-only SNK1M1 build is not affected. Drop when the pin moves to a
       release that contains it.
   - path: zephyr/local/usbc-pd-r32.patch
-    sha256sum: ad35f75d6a32fc02a612aa88c7bbbfcdad5bfe740ac29936b928e712490a1fa4
+    sha256sum: 962b3c20388b05b2bf5d975cb4a680930e9d90028b899296f2067b6e9a07b674
     module: zephyr
     author: Gabriel Tetar
     email: gabriel@intercreate.io

@@ -12,8 +12,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Before usbc_pd.h: the carried R3.2 stack patch gives it __packed structs without this include */
-#include <zephyr/toolchain.h>
 #include <zephyr/drivers/usb_c/usbc_pd.h>
 
 /* `pd max` never asks for more than a cable without an e-marker carries */
