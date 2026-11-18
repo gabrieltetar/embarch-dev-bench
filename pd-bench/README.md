@@ -137,6 +137,12 @@ west build -b nucleo_g0b1re -d build/pd-bench-drp -s pd-bench -- -DSHIELD=x_nucl
 `west patch apply` runs once after `west update`; after the pin or a patch
 changes, run `west patch clean && west update && west patch apply`.
 
+After editing a carried patch, refresh its `sha256sum` instead of pasting a
+hash by hand: from the repo root, `python3 scripts/patch-sums.py --update
+workspaces/pd-bench/manifest/zephyr/patches.yml` rewrites only the stale
+values, and `--check` (same argument) lists them and exits 1 without a west
+workspace. `west patch apply` otherwise finds a stale sum only after setup.
+
 The DRP1M1 build enables `CONFIG_USBC_CSM_DRP`, I2C and a 2 KB USB-C
 thread stack (`boards/shields/x_nucleo_drp1m1/x_nucleo_drp1m1.conf`).
 

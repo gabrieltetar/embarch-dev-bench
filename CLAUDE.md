@@ -17,3 +17,7 @@ The ask-first rule this replaces was written for **DUT** firmware and had been o
 ## Git
 
 **Work on a branch, land when the owner asks — no PRs (2026-11-03).** Work in a worktree, with one branch name across every repo the change touches, and push the branch. Land on `main` only when the repo owner asks: rebase on `origin/main`, confirm it builds and its tests and `clippy --all-targets -- -D warnings` are clean, fast-forward, push, delete the branch. The owner's explicit call ended the earlier commit-straight-to-`main` rule, and changing this one is the owner's call too, not an agent's read of what the project needs. The fleet lands under its own protocol. Reasoning, setup and the landing order across repos: [../embarch-doc/embarch-dev-workflow.md](../embarch-doc/embarch-dev-workflow.md) §6.
+
+## Before landing
+
+A change to a carried patch under `workspaces/*/manifest/zephyr/patches/` runs `python3 scripts/patch-sums.py --check workspaces/<ws>/manifest/zephyr/patches.yml` (and `python3 -m unittest discover scripts`); `--update` fixes a stale sum. There is no Cargo gate here.
