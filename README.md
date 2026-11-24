@@ -106,6 +106,17 @@ independent west topdir with its own manifest, symlinking in `app/` rather
 than copying it. `workspaces/pd-bench/` is the same shape, symlinking in
 `pd-bench/` instead.
 
+## Release: the bench-firmware list
+
+`scripts/bench-firmware-list.py <release> <image>...` writes
+`release/bench-firmware.json`, the list of bench firmware images a release
+ships (each as `app:board:path`, with identity and load segments from
+`embarch-study-designer`'s `image_segments` example, run through `cargo` in the
+sibling checkout). It is written once per release, from the built images, and
+committed with the release it names; flash exactly those images. See
+[spec/bench-firmware-list.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-dev-bench/spec/bench-firmware-list.md).
+Tests: `python3 -m unittest discover scripts`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). That covers this repo's own contents
