@@ -787,6 +787,55 @@ ZTEST(serial_protocol, test_decodes_cores_study_start_with_real_taps)
 
 }
 
+
+/* Schema v16 (EMB-474, `StreamSource::AnalogInput { sample_hz, channel }` at
+ * tag 5): a StudyStart whose first tap is an analog input, 32000 Hz on
+ * channel 0 -- the bytes `05 80 FA 01 00` the crate pins -- followed by a
+ * PowerFrontEnd tap, so a walker that reads the analog source at the wrong
+ * width shifts the second tap and fails `streams_crc`.
+ *
+ * Produced by the crate's own encoder (`postcard::to_slice` of the same
+ * `DevBenchMessage::StudyStart` as `dump_study_start_with_taps_wire_bytes`,
+ * with these two taps); regenerate the same way after any `StreamTap` change.
+ */
+static const uint8_t core_study_start_with_analog_tap_frame[] = {
+	0x06, 0x01, 0x09, 0x61, 0x64, 0x76, 0x65, 0x72, 0x74, 0x69, 0x73, 0x65,
+	0x00, 0x01, 0x11, 0x65, 0x6D, 0x62, 0x61, 0x72, 0x63, 0x68, 0x2D, 0x64,
+	0x65, 0x76, 0x2D, 0x62, 0x65, 0x6E, 0x63, 0x68, 0x00, 0x64, 0x88, 0x27,
+	0x00, 0x00, 0xE1, 0xDE, 0xFE, 0xC4, 0x08, 0x02, 0x00, 0x03, 0x6D, 0x69,
+	0x63, 0x05, 0x80, 0xFA, 0x01, 0x00, 0x00, 0x00, 0x01, 0x05, 0x70, 0x6F,
+	0x77, 0x65, 0x72, 0x01, 0xE8, 0x07, 0x00, 0x01, 0x00, 0x00, 0xF8, 0xC2,
+	0xCC, 0xEF, 0x06, 0x04, 0x00, 0x00,
+};
+
+ZTEST(serial_protocol, test_decodes_an_analog_input_tap)
+{
+	uint8_t framed[DBM_MAX_FRAME_LEN];
+	size_t framed_len = test_cobs_encode(core_study_start_with_analog_tap_frame,
+					     sizeof(core_study_start_with_analog_tap_frame), framed);
+
+	zassert_true(framed_len > 0, "COBS encode failed");
+
+	memset(&study_start_decoded, 0, sizeof(study_start_decoded));
+	zassert_equal(dbm_decode_frame(framed, framed_len, &study_start_decoded), 0,
+		      "failed to decode a StudyStart carrying an analog input tap");
+
+	const struct dbm_study_start *ss = &study_start_decoded.study_start;
+
+	zassert_equal(ss->streams_len, 2, "streams_len mismatch");
+	zassert_equal(ss->streams_crc, 0x6DF32178, "streams_crc mismatch");
+	zassert_true(ss->streams_crc_valid, "streams_crc must validate over the analog tap's bytes");
+
+	zassert_equal(ss->streams[0].source_tag, DBM_STREAM_SRC_ANALOG_INPUT, "tap 0 source");
+	zassert_equal(ss->streams[0].analog_sample_hz, 32000, "tap 0 rate");
+	zassert_equal(ss->streams[0].analog_channel, 0, "tap 0 channel");
+	zassert_equal(ss->streams[0].scope_tag, DBM_STREAM_SCOPE_WHOLE_STUDY, "tap 0 scope");
+	zassert_true(dbm_stream_tap_is_ours(&ss->streams[0]), "an analog tap is dev-bench's");
+
+	zassert_equal(ss->streams[1].source_tag, DBM_STREAM_SRC_POWER_FRONT_END, "tap 1 source");
+	zassert_equal(ss->streams[1].analog_sample_hz, 0, "another source keeps no analog rate");
+	zassert_equal(ss->streams[1].scope_tag, DBM_STREAM_SCOPE_STEPS, "tap 1 scope");
+}
 /* Schema v14's own cross-language pin (`embarch-study-designer`
  * decisions 52/53): a `StudyStart` whose first step is a
  * `GattMonitorSelectedStart` carrying two targets, whose second is a

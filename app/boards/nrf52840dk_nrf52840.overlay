@@ -58,8 +58,8 @@
  * The `label` of each is the port's USB interface string; the order is the
  * port order (cdc_acm_0, cdc_acm_1, cdc_acm_2 in the class registry).
  * The SMP port is the MCUmgr transport: image updates through MCUboot.
- * The control port is the Core link (`embarch,control-link`); nothing uses the
- * samples port yet.
+ * The control port is the Core link (`embarch,control-link`); the samples
+ * port carries the analog stream (src/samples_port.c).
  */
 &zephyr_udc0 {
 	cdc_acm_uart0: cdc_acm_uart0 {

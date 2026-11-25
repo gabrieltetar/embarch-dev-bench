@@ -466,8 +466,9 @@ enum dbm_stream_source_tag {
 	DBM_STREAM_SRC_GATT_TRANSCRIPT = CRATE_STREAM_SOURCE_GATT_TRANSCRIPT,
 	DBM_STREAM_SRC_DEV_BENCH_LOG = CRATE_STREAM_SOURCE_DEV_BENCH_LOG,
 	DBM_STREAM_SRC_SIGNAL = CRATE_STREAM_SOURCE_SIGNAL,
+	DBM_STREAM_SRC_ANALOG_INPUT = CRATE_STREAM_SOURCE_ANALOG_INPUT,
 };
-_Static_assert(CRATE_STREAM_SOURCE_COUNT == 5, "StreamSource gained or lost a variant");
+_Static_assert(CRATE_STREAM_SOURCE_COUNT == 6, "StreamSource gained or lost a variant");
 
 /* `StreamScope` (embarch-study-designer src/streams.rs). */
 enum dbm_stream_scope_tag {
@@ -524,6 +525,13 @@ struct dbm_stream_tap {
 	 * itself by, and a second 16-byte array per tap would be 128 bytes of
 	 * static RAM for a comparison nothing makes. */
 	uint8_t characteristic_uuid[16];
+	/* A DBM_STREAM_SRC_ANALOG_INPUT tap's rate and input index (schema v16,
+	 * `StreamSource::AnalogInput { sample_hz, channel }`): what starts the
+	 * analog capture. Both are the study's, so this node acts on them --
+	 * unlike an encoding they say what to do, not what the bytes mean.
+	 * Zero for every other source tag. */
+	uint32_t analog_sample_hz;
+	uint8_t analog_channel;
 };
 
 /* Mirrors `StreamScope::covers` (embarch-study-designer src/streams.rs) --

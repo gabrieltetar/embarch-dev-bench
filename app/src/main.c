@@ -31,6 +31,7 @@
 
 #include <zephyr/logging/log.h>
 
+#include "analog_capture.h"
 #include "ble_bridge.h"
 #include "dev_bench_log.h"
 #include "serial_protocol.h"
@@ -598,6 +599,24 @@ static void log_backend_sink(const char *line, bool panic)
 static void set_tap_open(uint32_t index, bool open, uint32_t dropped)
 {
 	struct dev_bench_tx_message *msg = &tx_scratch;
+
+	/* An analog tap's bytes go on the samples port, not on this link: the
+	 * tap's open starts the capture and its close ends it, and the blocks
+	 * the capture lost are the tap's `dropped`. A start that fails is
+	 * logged and the tap still opens, so Core sees an empty capture (no
+	 * start header) rather than a study that never answered. */
+	if (study_taps[index].source_tag == DBM_STREAM_SRC_ANALOG_INPUT) {
+		if (open) {
+			int err = analog_capture_start(study_taps[index].analog_sample_hz,
+						       study_taps[index].analog_channel);
+
+			if (err != 0) {
+				LOG_ERR("analog capture did not start (%d)", err);
+			}
+		} else {
+			dropped = analog_capture_stop();
+		}
+	}
 
 	k_mutex_lock(&link_tx_mutex, K_FOREVER);
 	memset(msg, 0, sizeof(*msg));

@@ -37,6 +37,21 @@ target_sources(app PRIVATE
   src/scan_seen_names.c
 )
 
+# The analog capture (dev-bench decisions 60 and 64): framing and sessions are
+# pure and build everywhere, so a native_sim test drives them with a fake
+# backend; only the backend and the USB port depend on the SoC.
+target_sources(app PRIVATE
+  src/analog_stream.c
+  src/analog_capture.c
+)
+if(CONFIG_SOC_SERIES_NRF52)
+  # The one stated exception to portable-APIs-only (decision 60): nrfx SAADC.
+  target_sources(app PRIVATE src/analog_source_nrf52.c)
+else()
+  target_sources(app PRIVATE src/analog_source_none.c)
+endif()
+target_sources_ifdef(CONFIG_USB_DEVICE_STACK_NEXT app PRIVATE src/samples_port.c)
+
 # The native USB composite device, only where a board conf selects the "next"
 # USB device stack (the nRF52840 DK).
 target_sources_ifdef(CONFIG_USB_DEVICE_STACK_NEXT app PRIVATE src/usb_device.c)

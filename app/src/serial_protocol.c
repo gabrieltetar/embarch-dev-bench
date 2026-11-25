@@ -164,6 +164,8 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 	 * this index held: a stale UUID here would route a notification into a
 	 * tap that isn't a GattNotify one at all. */
 	memset(out->characteristic_uuid, 0, sizeof(out->characteristic_uuid));
+	out->analog_sample_hz = 0;
+	out->analog_channel = 0;
 
 	/* name: heapless::String -- length-prefixed bytes. */
 	if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
@@ -200,6 +202,18 @@ static int pc_read_stream_tap(const uint8_t *raw, size_t raw_len, size_t *pos,
 		if (pc_skip_len_prefixed(raw, raw_len, pos, 1) != 0) {
 			return -1;
 		}
+		break;
+	case DBM_STREAM_SRC_ANALOG_INPUT: /* AnalogInput { sample_hz, channel } */
+		if (pc_read_varint(raw, raw_len, pos, &scratch) != 0 || scratch > UINT32_MAX) {
+			return -1;
+		}
+		out->analog_sample_hz = (uint32_t)scratch;
+		/* channel: u8, a raw byte like the tap's id. */
+		if (*pos >= raw_len) {
+			return -1;
+		}
+		out->analog_channel = raw[*pos];
+		(*pos)++;
 		break;
 	default:
 		return -1;

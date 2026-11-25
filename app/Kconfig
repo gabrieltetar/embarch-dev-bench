@@ -41,4 +41,32 @@ config EMBARCH_DEV_BENCH_REGOUT0_3V3
 	  UICR REGOUT0 the first time it boots with the default, then resets
 	  once, so an external analog front end gets 3.3 V on VDD.
 
+config EMBARCH_ANALOG_MAX_CHANNELS
+	int "Most analog channels one session can carry"
+	range 1 8
+	default 1
+	help
+	  Sizes every sample block buffer. The block format carries any channel
+	  count; the only backend (nRF52 SAADC on its internal timer) samples
+	  one channel, so a larger value only reserves RAM until a multi-channel
+	  backend exists.
+
+config EMBARCH_ANALOG_STREAM_SLOTS
+	int "Sample blocks buffered between the ADC and the samples port"
+	range 2 32
+	default 8
+	help
+	  Each slot is one block (528 bytes for one channel, 8 ms at 32 ksps).
+	  When all are in use the next block is dropped and counted, never
+	  waited for.
+
+config EMBARCH_SAMPLES_PORT_RING_BLOCKS
+	int "Sample blocks the samples USB port can queue"
+	depends on USB_DEVICE_STACK_NEXT
+	range 2 32
+	default 8
+	help
+	  The transmit ring in front of the samples CDC ACM port. A block that
+	  does not fit whole is refused and counted lost.
+
 source "Kconfig.zephyr"
