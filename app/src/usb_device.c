@@ -5,8 +5,7 @@
  * One composite device, three CDC ACM ports. Each port's interface string is
  * the `label` of its `zephyr,cdc-acm-uart` node in the board overlay, which
  * is also where the order is fixed:
- *   cdc_acm_uart0  control   (not switched over to yet, the link stays the
- *                             J-Link UART)
+ *   cdc_acm_uart0  control   (the Core link, `embarch,control-link`)
  *   cdc_acm_uart1  samples
  *   cdc_acm_uart2  SMP       (`zephyr,uart-mcumgr`, image updates through
  *                             MCUboot)

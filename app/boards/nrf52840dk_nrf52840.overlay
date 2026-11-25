@@ -2,11 +2,12 @@
  * nRF52840DK dev-bench board. Auto-merged by Zephyr's board devicetree
  * overlay convention, like the nRF54L15DK's overlay.
  *
- * The control link stays the J-Link UART: `zephyr,console` is already `&uart0`
- * on this board (VCOM0 of the on-board J-Link). Only the baud rate and flow
- * control change, to match `embarch-core::dev_bench_link::DEV_BENCH_BAUD`
- * (1 Mbaud) and the hardware flow control the nRF54L15DK link already uses.
- * `uart0_default` carries RTS on P0.05 and CTS on P0.07 alongside TX P0.06 /
+ * The control link is the native USB "EmbArch control" CDC ACM port, named by
+ * the `embarch,control-link` chosen entry below (decision 62); the link
+ * protocol on it is unchanged. The J-Link UART (`zephyr,console` is `&uart0`,
+ * VCOM0 of the on-board J-Link) is no longer the link, but keeps its 1 Mbaud
+ * and flow-control settings so a build that drops the chosen entry falls back
+ * to the same link the nRF54L15DK uses. `uart0_default` carries RTS on P0.05 and CTS on P0.07 alongside TX P0.06 /
  * RX P0.08, so nothing is rewired.
  *
  * Analog source. The input is a devicetree node the analog-source code reads
@@ -26,6 +27,7 @@
 	chosen {
 		embarch,analog-input = &embarch_analog_a0;
 		embarch,marker-input = &embarch_marker;
+		embarch,control-link = &cdc_acm_uart0;
 	};
 
 	embarch_analog_a0: analog-input-a0 {
@@ -56,7 +58,8 @@
  * The `label` of each is the port's USB interface string; the order is the
  * port order (cdc_acm_0, cdc_acm_1, cdc_acm_2 in the class registry).
  * The SMP port is the MCUmgr transport: image updates through MCUboot.
- * Nothing uses the control or samples port yet.
+ * The control port is the Core link (`embarch,control-link`); nothing uses the
+ * samples port yet.
  */
 &zephyr_udc0 {
 	cdc_acm_uart0: cdc_acm_uart0 {

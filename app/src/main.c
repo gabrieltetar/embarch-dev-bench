@@ -4,11 +4,12 @@
  * across both workspaces (nordic/native_sim) — only ble_bridge_real.c vs
  * ble_bridge_stub.c differs per workspace (decision 16).
  *
- * The link (decision 6, revised) is whatever UART the board's own
+ * The link (decision 6, revised; decision 62) is the UART the board's
+ * `embarch,control-link` chosen node names -- a CDC ACM port on the nRF52840
+ * DK's native USB -- and, where a board names none, whatever its own
  * `zephyr,console` chosen node names: the nRF54L15DK's on-board J-Link VCOM
  * for workspaces/nordic, native_sim's host-stdio-backed UART for
- * workspaces/native_sim. Using the same chosen node on both boards means this
- * file needs no per-workspace UART wiring. Zephyr's own console/log/shell
+ * workspaces/native_sim. Either way this file needs no per-board UART wiring. Zephyr's own console/log/shell
  * output must NOT also be routed to this device (prj.conf disables every
  * backend that would) — sharing the wire with raw log text would corrupt COBS
  * framing (decision 7); dev-bench's own log output travels as a `LogLine`
@@ -61,7 +62,13 @@ LOG_MODULE_REGISTER(dev_bench, LOG_LEVEL_DBG);
 #define APP_FIRMWARE_VERSION "dev-bench-unknown"
 #endif
 
-static const struct device *const link_uart = DEVICE_DT_GET(DT_CHOSEN(zephyr_console));
+/* The control link: `embarch,control-link` when the board names one, else the
+ * J-Link UART the board file already makes `zephyr,console`. */
+#define LINK_UART_NODE \
+	COND_CODE_1(DT_HAS_CHOSEN(embarch_control_link), (DT_CHOSEN(embarch_control_link)), \
+		    (DT_CHOSEN(zephyr_console)))
+
+static const struct device *const link_uart = DEVICE_DT_GET(LINK_UART_NODE);
 
 /* Shared outbound scratch, built and sent by exactly one of
  * send_log_line/send_study_done/send_step_result/handle_hello at a time —
