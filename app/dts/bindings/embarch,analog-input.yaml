@@ -1,0 +1,29 @@
+# One analog input of the dev bench's analog source (an analog sensor, e.g. a
+# microphone breakout, wired to a dev-kit pin). The analog-source code reads
+# the SAADC input number from here; no pin is hard-coded in C.
+description: EmbArch dev-bench analog input
+
+compatible: "embarch,analog-input"
+
+include: base.yaml
+
+properties:
+  label:
+    required: true
+    description: |
+      Name of the input as the study and the sample-stream start header show
+      it, e.g. "A0" for the Arduino-header pin.
+
+  saadc-input:
+    type: int
+    required: true
+    description: |
+      SAADC analog input number, N for AINn (nrf_saadc_input_t NRF_SAADC_AINn).
+      Must be the SAADC input of the pin in `gpios`.
+
+  gpios:
+    type: phandle-array
+    required: true
+    description: |
+      The pin carrying the input. Documents the wiring only; the pin is
+      never configured as a digital GPIO, the SAADC takes it over.

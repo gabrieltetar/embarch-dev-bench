@@ -1,0 +1,15 @@
+# A digital input the operator presses to drop a marker into the analog
+# sample stream (a dev-kit button).
+description: EmbArch dev-bench marker input
+
+compatible: "embarch,marker-input"
+
+include: base.yaml
+
+properties:
+  gpios:
+    type: phandle-array
+    required: true
+    description: |
+      The marker pin, with its polarity and pull flags
+      (e.g. GPIO_PULL_UP | GPIO_ACTIVE_LOW for a button to ground).

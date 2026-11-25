@@ -34,6 +34,9 @@ target_sources(app PRIVATE
   src/scan_seen_names.c
 )
 
+# UICR REGOUT0 = 3.3 V at boot (nRF52840 DK on native USB), see the file.
+target_sources_ifdef(CONFIG_EMBARCH_DEV_BENCH_REGOUT0_3V3 app PRIVATE src/board_regout0.c)
+
 # embarch-dev-bench/design.md §3 decision 16: ble_bridge_real.c (real Zephyr BT
 # host calls) vs ble_bridge_stub.c (canned Outcomes, no BLE host) are separate
 # files, not #ifdef branches inside one -- CONFIG_ARCH_POSIX is true exactly

@@ -31,4 +31,14 @@ config EMBARCH_DEV_BENCH_PANIC_AT_HANDSHAKE
 	  handshake, so no study can start.
 	default n
 
+config EMBARCH_DEV_BENCH_REGOUT0_3V3
+	bool "Set UICR REGOUT0 to 3.3 V at boot when unset"
+	depends on SOC_NRF52840
+	help
+	  For an nRF52840 DK powered only from its native USB: the chip runs in
+	  high-voltage mode and its VDD comes from regulator stage 0, whose
+	  erased default is 1.8 V. With this on, board_regout0.c writes 3.3 V to
+	  UICR REGOUT0 the first time it boots with the default, then resets
+	  once, so an external analog front end gets 3.3 V on VDD.
+
 source "Kconfig.zephyr"

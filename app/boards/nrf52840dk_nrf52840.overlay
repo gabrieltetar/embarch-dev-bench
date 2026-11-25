@@ -1,0 +1,52 @@
+/*
+ * nRF52840DK dev-bench board. Auto-merged by Zephyr's board devicetree
+ * overlay convention, like the nRF54L15DK's overlay.
+ *
+ * The control link stays the J-Link UART: `zephyr,console` is already `&uart0`
+ * on this board (VCOM0 of the on-board J-Link). Only the baud rate and flow
+ * control change, to match `embarch-core::dev_bench_link::DEV_BENCH_BAUD`
+ * (1 Mbaud) and the hardware flow control the nRF54L15DK link already uses.
+ * `uart0_default` carries RTS on P0.05 and CTS on P0.07 alongside TX P0.06 /
+ * RX P0.08, so nothing is rewired.
+ *
+ * Analog source. The input is a devicetree node the analog-source code reads
+ * (`DT_CHOSEN(embarch_analog_input)`), never a pin number in C. It is the
+ * Arduino-header A0 pin, P0.03 = AIN1 (the DK's own `arduino_adc` map says
+ * the same). The marker input is the DK's BUTTON2 (P0.12); BUTTON1 stays free
+ * for the MCUboot recovery button (`mcuboot-button0`).
+ *
+ * The SAADC is taken by the analog source through nrfx directly (advanced
+ * mode with its internal timer, which Zephyr's ADC driver does not expose),
+ * so `&adc` is disabled here: Zephyr's ADC driver must not also claim it. The
+ * DK's `arduino_adc` connector node keeps referring to it as a plain phandle,
+ * which needs no driver.
+ */
+
+/ {
+	chosen {
+		embarch,analog-input = &embarch_analog_a0;
+		embarch,marker-input = &embarch_marker;
+	};
+
+	embarch_analog_a0: analog-input-a0 {
+		compatible = "embarch,analog-input";
+		label = "A0";
+		saadc-input = <1>;	/* P0.03 = AIN1 */
+		gpios = <&gpio0 3 0>;
+	};
+
+	embarch_marker: marker-input {
+		compatible = "embarch,marker-input";
+		/* BUTTON2 (P0.12), to ground, so active low with the pull-up. */
+		gpios = <&gpio0 12 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+	};
+};
+
+&adc {
+	status = "disabled";
+};
+
+&uart0 {
+	current-speed = <1000000>;
+	hw-flow-control;
+};
