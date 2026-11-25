@@ -1397,6 +1397,66 @@ ZTEST(serial_protocol, test_study_done_round_trip)
 	zassert_false(decoded.study_done.completed, "completed mismatch");
 }
 
+/* `StudyStop` (schema v17, EMB-485). The pinned bytes are the ones
+ * embarch-study-designer's `study_stop_matches_dev_bench_firmwares_own_hand_written_encoding`
+ * pins: tag 9, then the reason as one varint (Cap 0, Done 1, Cancel 2). */
+ZTEST(serial_protocol, test_study_stop_round_trip_and_pinned_bytes)
+{
+	static const struct {
+		uint8_t reason;
+		uint8_t frame[4];
+	} cases[] = {
+		/* COBS of {09, rr}: a code byte, the two bytes, the delimiter; a
+		 * zero reason is the one case that stuffs. */
+		{DBM_STOP_REASON_CAP, {0x02, 0x09, 0x01, 0x00}},
+		{DBM_STOP_REASON_DONE, {0x03, 0x09, 0x01, 0x00}},
+		{DBM_STOP_REASON_CANCEL, {0x03, 0x09, 0x02, 0x00}},
+	};
+
+	for (size_t i = 0; i < ARRAY_SIZE(cases); i++) {
+		struct dev_bench_message msg = {.tag = DBM_TAG_STUDY_STOP,
+						.study_stop = {.reason = cases[i].reason}};
+		struct dev_bench_message decoded;
+		uint8_t frame[8];
+
+		int n = dbm_encode_frame(&msg, frame, sizeof(frame));
+
+		zassert_equal(n, 4, "length");
+		zassert_mem_equal(frame, cases[i].frame, 4, "pinned bytes");
+		zassert_equal(round_trip(&msg, &decoded), 0, "decode failed");
+		zassert_equal(decoded.tag, DBM_TAG_STUDY_STOP, "wrong tag");
+		zassert_equal(decoded.study_stop.reason, cases[i].reason, "reason mismatch");
+	}
+}
+
+ZTEST(serial_protocol, test_study_stop_with_an_unknown_reason_is_refused)
+{
+	/* tag 9, reason 3 (one past Cancel). */
+	static const uint8_t frame[] = {0x03, 0x09, 0x03};
+	static struct dev_bench_message decoded;
+	uint8_t reason;
+
+	zassert_true(dbm_decode_frame(frame, sizeof(frame), &decoded) < 0);
+	zassert_true(dbm_decode_study_stop(frame, sizeof(frame), &reason) < 0);
+}
+
+ZTEST(serial_protocol, test_the_light_stop_decoder_reads_only_a_stop)
+{
+	static const uint8_t stop[] = {0x03, 0x09, 0x02};
+	static const uint8_t done[] = {0x03, 0x08, 0x01};
+	static const uint8_t too_long[] = {0x06, 0x09, 0x01, 0x01, 0x01, 0x01};
+	uint8_t reason = 0xFF;
+
+	zassert_equal(dbm_decode_study_stop(stop, sizeof(stop), &reason), 0);
+	zassert_equal(reason, DBM_STOP_REASON_CANCEL);
+
+	reason = 0xFF;
+	zassert_true(dbm_decode_study_stop(done, sizeof(done), &reason) < 0, "StudyDone is not a stop");
+	zassert_true(dbm_decode_study_stop(too_long, sizeof(too_long), &reason) < 0);
+	zassert_true(dbm_decode_study_stop(stop, 0, &reason) < 0);
+	zassert_equal(reason, 0xFF, "a refusal leaves the reason alone");
+}
+
 /* ---- GATT transcript (`embarch-study-designer` decision 36) -------- */
 
 /* The exact bytes `dbm_encode_transcript_entry` must produce for one

@@ -40,6 +40,7 @@ ENUMS = (
     ("src/eap.rs", "TerminalOutcome", "CRATE_TERMINAL_OUTCOME"),
     # The link-level enums: what every message on the serial link crosses.
     ("src/protocol.rs", "DevBenchMessage", "CRATE_DEV_BENCH_MESSAGE"),
+    ("src/protocol.rs", "StopReason", "CRATE_STOP_REASON"),
     ("src/study.rs", "Action", "CRATE_ACTION"),
     ("src/study.rs", "GattOperation", "CRATE_GATT_OPERATION"),
     ("src/study.rs", "BleSecurityLevel", "CRATE_BLE_SECURITY_LEVEL"),

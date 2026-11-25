@@ -35,6 +35,7 @@
 #include "ble_bridge.h"
 #include "dev_bench_log.h"
 #include "serial_protocol.h"
+#include "study_stop.h"
 #include "usb_device.h"
 
 /* The wire schema version `HelloAck` reports, read out of the crate's own
@@ -705,6 +706,18 @@ static void close_all_taps(void)
 			continue;
 		}
 		set_tap_open(i, false, tap_dropped[i]);
+	}
+}
+
+/* Closes every analog tap still open, so a stop ends the capture at once
+ * instead of after the teardown's waits. Its `StreamClose.dropped` is the
+ * capture's own lost-block count, as at any other close. */
+static void close_analog_taps(void)
+{
+	for (uint32_t i = 0; i < study_taps_len; i++) {
+		if (study_taps[i].source_tag == DBM_STREAM_SRC_ANALOG_INPUT && tap_open[i]) {
+			set_tap_open(i, false, 0);
+		}
 	}
 }
 
@@ -1491,8 +1504,21 @@ static void dispatch_study(const struct dbm_study_start *study)
 	load_study_taps(study);
 	sync_taps_for_step(0);
 
+	/* From here Core can stop the study (schema v17, study_stop.h). The bridge
+	 * checks it inside a step's waits; this loop checks it between steps and
+	 * in a step's delay. */
+	bool stopped = false;
+
+	study_stop_begin(link_rx_byte);
+	ble_bridge_set_abort_poll(study_stop_poll);
+
 	for (uint32_t i = 0; i < study->steps_len; i++) {
 		const struct dbm_step *step = &study->steps[i];
+
+		if (study_stop_poll()) {
+			stopped = true;
+			break;
+		}
 
 		/* **Both indices of a `RunProtocol` step, checked before they
 		 * reach a C array subscript** (`embarch-study-designer`
@@ -1539,11 +1565,20 @@ static void dispatch_study(const struct dbm_study_start *study)
 		 * separating unsolicited traffic from a response to the write that
 		 * follows it. Not deducted from timeout_ms, which still bounds the
 		 * action alone. */
-		if (step->delay_before_ms > 0) {
-			k_sleep(K_MSEC(step->delay_before_ms));
+		if (step->delay_before_ms > 0 && study_stop_sleep_ms(step->delay_before_ms)) {
+			stopped = true;
+			break;
 		}
 
 		struct outcome bridge_outcome = ble_bridge_execute(&action, step->timeout_ms);
+
+		/* A step a stop cut short has no result to report: what the bridge
+		 * returns for it is its wait ending, not the DUT's answer. The
+		 * `StudyDone` that ends the study says it did not complete. */
+		if (study_stop_poll()) {
+			stopped = true;
+			break;
+		}
 
 		send_step_result(i, step->name, &bridge_outcome);
 
@@ -1551,6 +1586,18 @@ static void dispatch_study(const struct dbm_study_start *study)
 			completed = false;
 			break;
 		}
+	}
+
+	/* The teardown below makes bridge calls that must run to completion, so
+	 * the stop check comes off first. A stop is then ended the way a study
+	 * that failed a step ends: the same teardown, and a `StudyDone` with
+	 * `completed` false. */
+	ble_bridge_set_abort_poll(NULL);
+	study_stop_end();
+	if (stopped) {
+		completed = false;
+		LOG_INF("study stopped by Core (reason %u)", (unsigned int)study_stop_reason());
+		close_analog_taps();
 	}
 
 	/* A study that opened a capture window and never closed it -- either
@@ -1705,6 +1752,15 @@ int main(void)
 					      "handshake; ignoring");
 			}
 			awaiting_study = false;
+			break;
+		case DBM_TAG_STUDY_STOP:
+			/* No study is running here (a running one reads its own
+			 * stop, study_stop.h), so this one is either late -- the
+			 * study ended on its own first, and Core has its
+			 * `StudyDone` -- or has nothing to stop. Nothing to undo
+			 * and nothing to answer; the line is for whoever reads
+			 * the bench's log. */
+			send_log_line("StudyStop received with no study running; ignored");
 			break;
 		default:
 			/* Core only ever sends Hello then StudyStart on this link

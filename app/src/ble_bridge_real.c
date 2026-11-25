@@ -445,6 +445,59 @@ static k_timeout_t remaining(int64_t deadline)
 	return (left > 0) ? K_MSEC(left) : K_NO_WAIT;
 }
 
+/* main.c's stop check (ble_bridge.h), or NULL outside a study. */
+static ble_abort_poll abort_poll;
+
+/* How often a wait looks at abort_poll, which bounds how late a stop is
+ * noticed inside a step. */
+#define ABORT_POLL_SLICE_MS 10
+
+/* k_sem_take() until `deadline`, ending early with -ECANCELED when abort_poll
+ * says the study was stopped. Every caller treats a non-zero return as its
+ * wait timing out, so a stopped step fails the way a timed-out one does.
+ * With no abort_poll this is the single k_sem_take() it replaced. */
+static int wait_take(struct k_sem *sem, int64_t deadline)
+{
+	while (abort_poll != NULL) {
+		int64_t left = deadline - k_uptime_get();
+
+		if (left <= 0) {
+			break;
+		}
+		if (k_sem_take(sem, K_MSEC(MIN(left, ABORT_POLL_SLICE_MS))) == 0) {
+			return 0;
+		}
+		if (abort_poll()) {
+			return -ECANCELED;
+		}
+	}
+	return k_sem_take(sem, remaining(deadline));
+}
+
+/* wait_take() for a message queue. */
+static int wait_get(struct k_msgq *msgq, void *data, int64_t deadline)
+{
+	while (abort_poll != NULL) {
+		int64_t left = deadline - k_uptime_get();
+
+		if (left <= 0) {
+			break;
+		}
+		if (k_msgq_get(msgq, data, K_MSEC(MIN(left, ABORT_POLL_SLICE_MS))) == 0) {
+			return 0;
+		}
+		if (abort_poll()) {
+			return -ECANCELED;
+		}
+	}
+	return k_msgq_get(msgq, data, remaining(deadline));
+}
+
+void ble_bridge_set_abort_poll(ble_abort_poll poll)
+{
+	abort_poll = poll;
+}
+
 /* embarch-study-designer stores UUIDs big-endian (src/ids.rs); Zephyr's
  * bt_uuid_create() wants little-endian. */
 static void to_bt_uuid(const uint8_t be_bytes[16], struct bt_uuid_128 *out)
@@ -1216,7 +1269,7 @@ static struct outcome connect_as_central(const struct ble_connect_params *params
 		return outcome_fail("bt_le_scan_start failed (%d)", err);
 	}
 
-	if (k_sem_take(&conn_sem, remaining(deadline)) != 0) {
+	if (wait_take(&conn_sem, deadline) != 0) {
 		(void)bt_le_scan_stop();
 		/* Cancel a connection still being established, so a DUT that answers
 		 * just after the step gave up doesn't leave a link no step asked for
@@ -1285,7 +1338,7 @@ static struct outcome connect_as_peripheral(const struct ble_connect_params *par
 			}
 		}
 
-		if (k_sem_take(&conn_sem, remaining(deadline)) != 0) {
+		if (wait_take(&conn_sem, deadline) != 0) {
 			return outcome_timed_out();
 		}
 		if (conn_err != 0) {
@@ -1300,7 +1353,7 @@ static struct outcome connect_as_peripheral(const struct ble_connect_params *par
 		 * rather than reporting a Pass against the wrong peer. */
 		k_sem_reset(&disconn_sem);
 		(void)bt_conn_disconnect(active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-		if (k_sem_take(&disconn_sem, remaining(deadline)) != 0) {
+		if (wait_take(&disconn_sem, deadline) != 0) {
 			return outcome_timed_out();
 		}
 	}
@@ -1376,7 +1429,7 @@ static int run_discovery(uint8_t type, const struct bt_uuid *uuid, uint16_t star
 	if (err != 0) {
 		return err;
 	}
-	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+	if (wait_take(&gatt_sem, deadline) != 0) {
 		/* Abandon the procedure rather than leaving it pending: the host would
 		 * otherwise still own discover_params, making the next step's
 		 * discovery fail with -EBUSY. Cancelling drives the callback with a
@@ -1588,7 +1641,7 @@ static enum ccc_verdict subscribe_and_wait(struct bt_gatt_subscribe_params *sp,
 	} else if (err != 0) {
 		*start_err = err;
 		verdict = CCC_START_FAILED;
-	} else if (k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+	} else if (wait_take(&ccc_sem, deadline) != 0) {
 		ccc_waiting = NULL;
 		abandon(sp);
 		verdict = (link_lost || !conn_is_up(conn)) ? CCC_LINK_LOST : CCC_TIMED_OUT;
@@ -1723,7 +1776,7 @@ static struct outcome run_gatt_discovery(int64_t deadline)
 	if (err != 0) {
 		return outcome_fail("primary service discovery failed to start (%d)", err);
 	}
-	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+	if (wait_take(&gatt_sem, deadline) != 0) {
 		abandon(&all_services_params);
 		return outcome_timed_out();
 	}
@@ -1745,7 +1798,7 @@ static struct outcome run_gatt_discovery(int64_t deadline)
 		if (err != 0) {
 			return outcome_fail("characteristic discovery failed to start (%d)", err);
 		}
-		if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+		if (wait_take(&gatt_sem, deadline) != 0) {
 			abandon(&all_chars_params);
 			return outcome_timed_out();
 		}
@@ -2106,7 +2159,7 @@ static struct outcome execute_gatt_monitor_window(
 	 * budget is the window (`embarch-study-designer` decisions 20/21). Ends
 	 * on the deadline (the normal case) or early if the DUT drops the
 	 * link. */
-	bool dropped = link_lost || k_sem_take(&disconn_sem, remaining(deadline)) == 0;
+	bool dropped = link_lost || wait_take(&disconn_sem, deadline) == 0;
 
 	/* Unsubscribe everything this step subscribed, regardless of outcome --
 	 * a later step shouldn't keep receiving this step's notifications.
@@ -2279,7 +2332,7 @@ static struct outcome execute_read(uint16_t value_handle, int64_t deadline)
 				cached_characteristic_uuid(), 0, "bt_gatt_read failed", 19);
 		return outcome_fail("bt_gatt_read failed (%d)", err);
 	}
-	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+	if (wait_take(&gatt_sem, deadline) != 0) {
 		abandon(&read_params);
 		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
 				cached_characteristic_uuid(), 0, "read timed out", 14);
@@ -2328,7 +2381,7 @@ static struct outcome execute_write(uint16_t value_handle, const uint8_t *payloa
 				cached_characteristic_uuid(), 0, "bt_gatt_write failed", 20);
 		return outcome_fail("bt_gatt_write failed (%d)", err);
 	}
-	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+	if (wait_take(&gatt_sem, deadline) != 0) {
 		abandon(&write_params);
 		transcript_emit(BLE_GATT_DIR_LOCAL, BLE_GATT_EVT_ERROR, cached_service_uuid(),
 				cached_characteristic_uuid(), 0, "write timed out", 15);
@@ -2397,7 +2450,7 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 		subscribed = false;
 
 		if (bt_gatt_unsubscribe(conn, &subscribe_params) == 0 &&
-		    k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+		    wait_take(&ccc_sem, deadline) != 0) {
 			ccc_waiting = NULL;
 			abandon(&subscribe_params);
 			result = outcome_timed_out();
@@ -2431,7 +2484,7 @@ static struct outcome ensure_subscribed(uint16_t value_handle, uint16_t ccc_valu
 		goto done;
 	}
 
-	if (err == 0 && !covered && k_sem_take(&ccc_sem, remaining(deadline)) != 0) {
+	if (err == 0 && !covered && wait_take(&ccc_sem, deadline) != 0) {
 		ccc_waiting = NULL;
 		abandon(&subscribe_params);
 		result = outcome_timed_out();
@@ -2469,7 +2522,7 @@ static struct outcome await_notification(int64_t op_deadline, int64_t step_deadl
 {
 	int64_t deadline = (op_deadline < step_deadline) ? op_deadline : step_deadline;
 
-	if (k_sem_take(&notify_sem, remaining(deadline)) != 0) {
+	if (wait_take(&notify_sem, deadline) != 0) {
 		return outcome_timed_out();
 	}
 	if (link_lost) {
@@ -2699,7 +2752,7 @@ static struct outcome execute_set_security(const struct ble_set_security_params 
 		 * checked on the way out -- a DUT that drops the link rather
 		 * than answering is exactly the behaviour this action was added
 		 * to make legible. */
-		if (k_sem_take(&sec_sem, remaining(deadline)) != 0) {
+		if (wait_take(&sec_sem, deadline) != 0) {
 			if (link_lost) {
 				return outcome_disconnected("while establishing security");
 			}
@@ -3202,7 +3255,7 @@ static struct outcome protocol_write(const struct eap_protocol_def *def,
 	if (err != 0) {
 		return outcome_fail("protocol write failed (%d)", err);
 	}
-	if (k_sem_take(&gatt_sem, remaining(deadline)) != 0) {
+	if (wait_take(&gatt_sem, deadline) != 0) {
 		abandon(&write_params);
 		return outcome_timed_out();
 	}
@@ -3327,7 +3380,7 @@ static struct outcome execute_run_protocol(const struct run_protocol_params *par
 		int64_t state_deadline = protocol_state_deadline(&step, deadline);
 		struct protocol_notification note;
 
-		if (k_msgq_get(&protocol_notify_q, &note, remaining(state_deadline)) == 0) {
+		if (wait_get(&protocol_notify_q, &note, state_deadline) == 0) {
 			struct eap_event ev = {
 				.kind = EAP_EVENT_NOTIFY,
 				.source = note.source,

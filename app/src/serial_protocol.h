@@ -315,6 +315,10 @@ enum dbm_tag {
 	DBM_TAG_STUDY_START = CRATE_DEV_BENCH_MESSAGE_STUDY_START,
 	DBM_TAG_STEP_RESULT = CRATE_DEV_BENCH_MESSAGE_STEP_RESULT,
 	DBM_TAG_STUDY_DONE = CRATE_DEV_BENCH_MESSAGE_STUDY_DONE,
+	/* Core's request to stop the running study (schema v17, EMB-485). The
+	 * second message Core can send after `StudyStart`, and the only one this
+	 * bench reads while a study runs (study_stop.h). */
+	DBM_TAG_STUDY_STOP = CRATE_DEV_BENCH_MESSAGE_STUDY_STOP,
 	/* `GattTranscriptRecord`, tag 10 -- **retired by schema v8**
 	 * (`embarch-study-designer` decision 39) and, as of
 	 * Milestone 7 Phase B item 3, **no longer sent or encoded**. The
@@ -337,7 +341,17 @@ enum dbm_tag {
 	 * forward: it emits exactly the entry bytes a stream record's payload
 	 * holds, and is what the cross-language pinning covers. */
 };
-_Static_assert(CRATE_DEV_BENCH_MESSAGE_COUNT == 9, "DevBenchMessage gained or lost a variant");
+_Static_assert(CRATE_DEV_BENCH_MESSAGE_COUNT == 10, "DevBenchMessage gained or lost a variant");
+
+/* `StopReason` (embarch-study-designer src/protocol.rs): why Core sent a
+ * `StudyStop`. Informational -- the bench stops the same way for every value
+ * and only logs it. */
+enum dbm_stop_reason {
+	DBM_STOP_REASON_CAP = CRATE_STOP_REASON_CAP,
+	DBM_STOP_REASON_DONE = CRATE_STOP_REASON_DONE,
+	DBM_STOP_REASON_CANCEL = CRATE_STOP_REASON_CANCEL,
+};
+_Static_assert(CRATE_STOP_REASON_COUNT == 3, "StopReason gained or lost a variant");
 
 /* `GattDirection` (embarch-study-designer src/gatt.rs), values from the
  * crate's declaration order like `dbm_tag`. */
@@ -921,6 +935,10 @@ struct dbm_study_done {
 	bool completed;
 };
 
+struct dbm_study_stop {
+	uint8_t reason; /* enum dbm_stop_reason */
+};
+
 /* Every `DevBenchMessage` variant this bench sends: all but `Hello` and
  * `StudyStart`, which only Core sends. Listed once, so the two message types
  * below cannot disagree about them. */
@@ -940,6 +958,7 @@ struct dev_bench_message {
 	union {
 		struct dbm_hello hello;
 		struct dbm_study_start study_start;
+		struct dbm_study_stop study_stop;
 		DBM_TX_VARIANTS
 	};
 };
@@ -1034,5 +1053,14 @@ int dbm_decode_frame_why(const uint8_t *in, size_t in_len, struct dev_bench_mess
  * (`embarch-study-designer` interfaces/seals.md), so the name says which part
  * of the study arrived corrupt. main.c refuses a study this names. */
 const char *dbm_study_start_broken_seal(const struct dbm_study_start *ss);
+
+/* Decodes one frame (stuffed bytes, no trailing 0x00 delimiter) only far
+ * enough to say whether it is a `StudyStop`, without the multi-KB message
+ * struct dbm_decode_frame fills. Returns 0 and writes the reason (an enum
+ * dbm_stop_reason) when it is one; a negative value for anything else,
+ * including a malformed frame and an unknown reason. The mid-study reader
+ * (study_stop.c) uses it: a running study has no free message buffer, and a
+ * `StudyStop` is the only thing it is listening for. */
+int dbm_decode_study_stop(const uint8_t *in, size_t in_len, uint8_t *reason);
 
 #endif /* EMBARCH_DEV_BENCH_SERIAL_PROTOCOL_H_ */

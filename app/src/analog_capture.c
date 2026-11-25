@@ -111,8 +111,13 @@ uint32_t analog_capture_stop(void)
 	bool was_running = analog_stream_running();
 
 	analog_stream_stop(&stats);
-	if (was_running) {
-		marker_disable();
+	if (!was_running) {
+		/* analog_stream keeps the last session's totals until the next
+		 * start. A tap whose capture never started (or that a stop already
+		 * ended) has lost nothing of its own, and the totals left over
+		 * would be reported as its `StreamClose.dropped`. */
+		return 0;
 	}
+	marker_disable();
 	return stats.blocks_lost;
 }

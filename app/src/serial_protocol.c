@@ -1191,6 +1191,10 @@ static int encode_body(const struct dev_bench_message *msg, uint8_t *out, size_t
 		WRITE_VARINT(msg->hello.schema_version);
 		WRITE_VARINT(msg->hello.host_utc_ms);
 		return 0;
+	case DBM_TAG_STUDY_STOP:
+		/* Core-only, like StudyStart: encoded for the round-trip tests. */
+		WRITE_VARINT(msg->study_stop.reason);
+		return 0;
 	case DBM_TAG_STUDY_START:
 		/* dev-bench never sends StudyStart in practice (Core is the only
 		 * sender) -- this encode path exists for this file's own
@@ -2189,6 +2193,13 @@ static int decode_body(const uint8_t *raw, size_t raw_len, struct dev_bench_mess
 		}
 		msg->study_done.completed = raw[pos++] != 0;
 		return 0;
+	case DBM_TAG_STUDY_STOP:
+		if (pc_read_varint(raw, raw_len, &pos, &tmp) != 0 ||
+		    tmp >= CRATE_STOP_REASON_COUNT) {
+			return -1;
+		}
+		msg->study_stop.reason = (uint8_t)tmp;
+		return 0;
 	default:
 		return -1;
 	}
@@ -2225,6 +2236,32 @@ int dbm_decode_frame_why(const uint8_t *in, size_t in_len, struct dev_bench_mess
 int dbm_decode_frame(const uint8_t *in, size_t in_len, struct dev_bench_message *out)
 {
 	return dbm_decode_frame_why(in, in_len, out, NULL);
+}
+
+/* A `StudyStop` is a tag and one reason varint; COBS adds a code byte. */
+#define STUDY_STOP_MAX_RAW_LEN 4
+
+int dbm_decode_study_stop(const uint8_t *in, size_t in_len, uint8_t *reason)
+{
+	uint8_t raw[STUDY_STOP_MAX_RAW_LEN];
+	size_t pos = 0;
+	uint64_t tag;
+	uint64_t value;
+
+	if (in_len == 0 || in_len > STUDY_STOP_MAX_RAW_LEN + 1) {
+		return -1;
+	}
+	size_t raw_len = cobs_decode(in, in_len, raw, sizeof(raw));
+
+	if (raw_len == 0 || raw_len > sizeof(raw)) {
+		return -1;
+	}
+	if (pc_read_varint(raw, raw_len, &pos, &tag) != 0 || tag != DBM_TAG_STUDY_STOP ||
+	    pc_read_varint(raw, raw_len, &pos, &value) != 0 || value >= CRATE_STOP_REASON_COUNT) {
+		return -1;
+	}
+	*reason = (uint8_t)value;
+	return 0;
 }
 
 const char *dbm_study_start_broken_seal(const struct dbm_study_start *ss)

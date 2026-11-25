@@ -42,6 +42,8 @@ target_sources(app PRIVATE
 # backend; only the backend and the USB port depend on the SoC.
 target_sources(app PRIVATE
   src/analog_stream.c
+  # Core's StudyStop, read while a study runs; pure, so a native_sim test drives it.
+  src/study_stop.c
   src/analog_capture.c
 )
 if(CONFIG_SOC_SERIES_NRF52)

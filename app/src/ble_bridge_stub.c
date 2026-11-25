@@ -92,3 +92,10 @@ void ble_bridge_reset(void)
 	(void)transcript_sink;
 	(void)transcript_user_data;
 }
+
+/* The stub's one canned step returns at once, so there is no wait to end
+ * early. */
+void ble_bridge_set_abort_poll(ble_abort_poll poll)
+{
+	(void)poll;
+}

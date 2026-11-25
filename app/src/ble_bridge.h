@@ -463,4 +463,15 @@ void ble_bridge_clear_bonds(void);
  * capability forces it. */
 void ble_bridge_reset(void);
 
+/* Whether the study running now has been told to stop. */
+typedef bool (*ble_abort_poll)(void);
+
+/* Installs (or, with NULL, removes) the stop check ble_bridge_execute()'s
+ * waits make about every 10 ms. When it returns true the wait in progress
+ * ends as if it had timed out, so the step fails and returns promptly instead
+ * of running to its timeout. Called only from the thread that calls
+ * ble_bridge_execute(). main.c installs it around a study's steps and removes
+ * it before the teardown, whose own waits must run to completion. */
+void ble_bridge_set_abort_poll(ble_abort_poll poll);
+
 #endif /* EMBARCH_DEV_BENCH_BLE_BRIDGE_H_ */
