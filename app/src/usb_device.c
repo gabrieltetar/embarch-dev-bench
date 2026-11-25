@@ -87,6 +87,37 @@ static int register_ports(void)
 	return 0;
 }
 
+/* On a controller that detects VBUS (the nRF52840's does), the stack reports
+ * VBUS arriving and leaving, and the device is enabled and disabled on those
+ * messages, as Zephyr's own CDC ACM sample does: usbd_enable() before VBUS is
+ * ready leaves the controller off (USBD.ENABLE read 0 on the first nRF52840
+ * dev bench, 2026-11-25). Other messages need nothing from the bench. */
+static void usb_msg_cb(struct usbd_context *const ctx, const struct usbd_msg *const msg)
+{
+	int err;
+
+	if (!usbd_can_detect_vbus(ctx)) {
+		return;
+	}
+
+	switch (msg->type) {
+		case USBD_MSG_VBUS_READY:
+			err = usbd_enable(ctx);
+			if (err != 0) {
+				LOG_ERR("%s: usbd_enable failed (%d)", __func__, err);
+			}
+			break;
+		case USBD_MSG_VBUS_REMOVED:
+			err = usbd_disable(ctx);
+			if (err != 0) {
+				LOG_ERR("%s: usbd_disable failed (%d)", __func__, err);
+			}
+			break;
+		default:
+			break;
+	}
+}
+
 int usb_device_start(void)
 {
 	uint8_t hwid[USB_HWID_MAX_BYTES];
@@ -131,16 +162,25 @@ int usb_device_start(void)
 		return err;
 	}
 
+	err = usbd_msg_register_cb(&dev_bench_usbd, usb_msg_cb);
+	if (err != 0) {
+		LOG_ERR("%s: registering the message callback failed (%d)", __func__, err);
+		return err;
+	}
+
 	err = usbd_init(&dev_bench_usbd);
 	if (err != 0) {
 		LOG_ERR("%s: usbd_init failed (%d)", __func__, err);
 		return err;
 	}
 
-	err = usbd_enable(&dev_bench_usbd);
-	if (err != 0) {
-		LOG_ERR("%s: usbd_enable failed (%d)", __func__, err);
-		return err;
+	/* A controller that detects VBUS is enabled by usb_msg_cb() instead. */
+	if (!usbd_can_detect_vbus(&dev_bench_usbd)) {
+		err = usbd_enable(&dev_bench_usbd);
+		if (err != 0) {
+			LOG_ERR("%s: usbd_enable failed (%d)", __func__, err);
+			return err;
+		}
 	}
 
 	return 0;
