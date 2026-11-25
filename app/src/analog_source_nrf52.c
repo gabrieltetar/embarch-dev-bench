@@ -111,19 +111,23 @@ static int measure_vdd_mv(void)
 
 	err = nrfx_saadc_channel_config(&channel);
 	if (err != 0) {
+		LOG_ERR("%s: channel config failed (%d)", __func__, err);
 		return -EIO;
 	}
 	err = nrfx_saadc_simple_mode_set(nrfx_saadc_channels_configured_get(), RESOLUTION,
 					 NRF_SAADC_OVERSAMPLE_DISABLED, NULL);
 	if (err != 0) {
+		LOG_ERR("%s: simple mode failed (%d)", __func__, err);
 		return -EIO;
 	}
 	err = nrfx_saadc_buffer_set(&code, 1);
 	if (err != 0) {
+		LOG_ERR("%s: buffer refused (%d)", __func__, err);
 		return -EIO;
 	}
 	err = nrfx_saadc_mode_trigger();
 	if (err != 0) {
+		LOG_ERR("%s: conversion failed (%d)", __func__, err);
 		return -EIO;
 	}
 	/* Deliberately not clamped: a negative code is an offset error worth
@@ -196,9 +200,14 @@ static int nrf52_prepare(const struct analog_source_params *params, struct analo
 	/* VDD first, on its own channel; then the data channel replaces it. */
 	vdd_mv = measure_vdd_mv();
 	if (vdd_mv < 0) {
-		LOG_ERR("%s: measuring VDD failed (%d)", __func__, vdd_mv);
-		release();
-		return vdd_mv;
+		/* Survivable: the samples are raw codes and need no VDD; only a
+		 * conversion to volts does, and a header VDD of 0 says it was
+		 * not measured. The data channel set below replaces whatever the
+		 * failed reading left configured. */
+		LOG_WRN("%s: measuring VDD failed (%d); the header says VDD unmeasured", __func__,
+			vdd_mv);
+		nrfx_saadc_abort();
+		vdd_mv = 0;
 	}
 
 	err = configure_data_channel();
