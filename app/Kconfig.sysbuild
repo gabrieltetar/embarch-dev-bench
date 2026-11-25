@@ -1,0 +1,12 @@
+# Sysbuild Kconfig for this app. Replaces the sysbuild root, so it sources
+# Zephyr's own first.
+#
+# MCUboot is built for the nRF52840 DK only (image updates over the SMP USB
+# port). Every other board keeps its current flash layout: a default on the
+# bootloader choice, set before Zephyr's own declaration so it is the first
+# default found.
+choice BOOTLOADER
+	default BOOTLOADER_MCUBOOT if BOARD = "nrf52840dk"
+endchoice
+
+source "share/sysbuild/Kconfig"

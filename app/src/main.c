@@ -33,6 +33,7 @@
 #include "ble_bridge.h"
 #include "dev_bench_log.h"
 #include "serial_protocol.h"
+#include "usb_device.h"
 
 /* The wire schema version `HelloAck` reports, read out of the crate's own
  * source at configure time for every board (decision 20). */
@@ -1617,6 +1618,13 @@ int main(void)
 	 * link ahead of the logging subsystem. */
 	LOG_INF("dev-bench up: fw %s, wire schema v%u", APP_FIRMWARE_VERSION,
 		(unsigned int)DEV_BENCH_WIRE_SCHEMA_VERSION);
+
+	/* Control still runs over the J-Link UART (the USB control port is not
+	 * switched over to yet), so a USB failure degrades the bench to its
+	 * probe-only state instead of stopping it: logged here, never silent. */
+	if (IS_ENABLED(CONFIG_USB_DEVICE_STACK_NEXT) && usb_device_start() != 0) {
+		LOG_ERR("usb_device_start failed; no native USB link or SMP update path");
+	}
 
 	if (ble_bridge_init() != 0) {
 		LOG_ERR("ble_bridge_init failed; this bench cannot run a study");

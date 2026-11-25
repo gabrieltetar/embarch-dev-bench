@@ -11,6 +11,9 @@ target_include_directories(app PRIVATE src)
 target_sources(app PRIVATE
   src/main.c
   src/serial_protocol.c
+  # EmbArch USB identity arithmetic (VID, PID, serial string); pure, so it
+  # builds everywhere and a native_sim test pins it.
+  src/usb_ids.c
   # embarch-study-designer/design.md §3 decisions 58-62: the `.eap` protocol
   # interpreter. Built for every board, including native_sim -- it is pure C
   # with no BLE and no Zephyr in it, which is what lets the ztest suite drive
@@ -33,6 +36,10 @@ target_sources(app PRIVATE
   # behaviour even though ble_bridge_real.c itself never builds here.
   src/scan_seen_names.c
 )
+
+# The native USB composite device, only where a board conf selects the "next"
+# USB device stack (the nRF52840 DK).
+target_sources_ifdef(CONFIG_USB_DEVICE_STACK_NEXT app PRIVATE src/usb_device.c)
 
 # UICR REGOUT0 = 3.3 V at boot (nRF52840 DK on native USB), see the file.
 target_sources_ifdef(CONFIG_EMBARCH_DEV_BENCH_REGOUT0_3V3 app PRIVATE src/board_regout0.c)

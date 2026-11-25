@@ -50,3 +50,35 @@
 	current-speed = <1000000>;
 	hw-flow-control;
 };
+
+/*
+ * Native USB: three CDC ACM ports on the nRF USB connector (src/usb_device.c).
+ * The `label` of each is the port's USB interface string; the order is the
+ * port order (cdc_acm_0, cdc_acm_1, cdc_acm_2 in the class registry).
+ * The SMP port is the MCUmgr transport: image updates through MCUboot.
+ * Nothing uses the control or samples port yet.
+ */
+&zephyr_udc0 {
+	cdc_acm_uart0: cdc_acm_uart0 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "EmbArch control";
+	};
+
+	cdc_acm_uart1: cdc_acm_uart1 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "EmbArch samples";
+	};
+
+	cdc_acm_uart2: cdc_acm_uart2 {
+		compatible = "zephyr,cdc-acm-uart";
+		label = "EmbArch SMP";
+	};
+};
+
+/ {
+	chosen {
+		/* The board file points this at the J-Link UART, which is the
+		 * console and the control link. */
+		zephyr,uart-mcumgr = &cdc_acm_uart2;
+	};
+};
