@@ -1617,6 +1617,99 @@ static int cmd_not_drp(const struct shell *sh, size_t argc, char **argv)
 
 #endif /* CONFIG_USBC_CSM_DRP */
 
+/* The PD bench's own build: version from CMake, the commit as built, the shield */
+#ifdef CONFIG_USBC_CSM_DRP
+#define PD_BENCH_SHIELD "x_nucleo_drp1m1"
+#else
+#define PD_BENCH_SHIELD "x_nucleo_snk1m1"
+#endif
+
+static int cmd_hello(const struct shell *sh, size_t argc, char **argv)
+{
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	shell_print(sh, "pd-bench version %s commit %s shield %s", PD_BENCH_VERSION,
+		    PD_BENCH_COMMIT, PD_BENCH_SHIELD);
+	shell_print(sh, "pd: ok");
+
+	return 0;
+}
+
+BUILD_ASSERT((int)DR_ACCEPT == (int)PD_LOGIC_REPLY_ACCEPT, "idle names DR accept");
+BUILD_ASSERT((int)SNK_REQUEST_VALID == (int)PD_LOGIC_REPLY_ACCEPT, "idle names Request accept");
+
+/*
+ * Puts every setting a test may have changed back, drops the contract and, on the DRP1M1, turns
+ * VBUS off and discharged: the start HIL tests expect (notes/hil/03-test.md, "One test")
+ */
+static int cmd_idle(const struct shell *sh, size_t argc, char **argv)
+{
+	struct pd_logic_idle idle;
+	k_spinlock_key_t key;
+	int ret = 0;
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	PdLogicIdle(IS_ENABLED(CONFIG_USBC_CSM_DRP), &idle);
+
+	self.keepalive_off = !idle.keepalive_on;
+	dr_answer_set((enum dr_answer)idle.dr_reply);
+	key = k_spin_lock(&self.lock);
+	self.want = (struct pd_logic_want){.kind = idle.want_kind};
+#ifdef CONFIG_USBC_CSM_DRP
+	self.pr_answer = PR_ACCEPT;
+	self.req_answer = (enum usbc_snk_req_reply_t)idle.request_reply;
+	if (idle.offer_from_devicetree) {
+		const uint32_t dt_offer[] = DT_PROP(PORT_NODE, source_pdos);
+
+		memcpy(self.offer, dt_offer, sizeof(dt_offer));
+		self.offer_cnt = ARRAY_SIZE(dt_offer);
+		self.offer[0] = drd_bit(self.offer[0], self.dr_answer);
+	}
+#endif
+	k_spin_unlock(&self.lock, key);
+
+#ifdef CONFIG_USBC_CSM_DRP
+	if (idle.vbus_off) {
+		bool was_source;
+
+		ret = source_off();
+		key = k_spin_lock(&self.lock);
+		was_source = self.attached && self.source;
+		k_spin_unlock(&self.lock, key);
+		if (ret < 0) {
+			shell_print(sh, "pd: error VBUS not off and discharged (%d)", ret);
+			return ret;
+		}
+		if (was_source) {
+			/* The supply is gone under an attached sink: start from an unattached port */
+			detach();
+			ret = usbc_request(port_dev, REQUEST_TC_ERROR_RECOVERY);
+		}
+	}
+#endif
+	if (ret == 0 && idle.drop_contract) {
+		key = k_spin_lock(&self.lock);
+		bool held = self.contract && !self.source;
+
+		k_spin_unlock(&self.lock, key);
+		contract_end();
+		if (held) {
+			/* The source forgets a contract only on a Hard Reset */
+			ret = usbc_request(port_dev, REQUEST_PE_HARD_RESET_SEND);
+		}
+	}
+	if (ret < 0) {
+		shell_print(sh, "pd: error request %d", ret);
+		return ret;
+	}
+	shell_print(sh, "pd: ok");
+
+	return 0;
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(
 	sub_pd,
 	SHELL_CMD_ARG(status, NULL, "Rp, partner, contract, roles and VBUS", cmd_status, 1, 0),
@@ -1641,6 +1734,10 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(answer, NULL,
 		      "Answer a sink's Request: pd answer <accept|reject|wait> (DRP build)",
 		      DRP_CMD(cmd_answer), 2, 0),
+	SHELL_CMD_ARG(idle, NULL, "Put every setting back, drop the contract, VBUS off",
+		      cmd_idle, 1, 0),
+	SHELL_CMD_ARG(hello, NULL, "Name the app, its version, commit and shield", cmd_hello, 1,
+		      0),
 	SHELL_CMD_ARG(srccaps, NULL,
 		      "List or set the offer: pd srccaps [<mV>:<mA> ...] (DRP build)",
 		      DRP_CMD(cmd_srccaps), 1, PDO_MAX_DATA_OBJECTS),

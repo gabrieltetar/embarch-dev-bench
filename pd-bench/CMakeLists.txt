@@ -15,3 +15,17 @@ project(pd_bench)
 
 target_sources(app PRIVATE src/main.c src/pd_logic.c)
 target_sources_ifdef(CONFIG_USBC_CSM_DRP app PRIVATE src/tcpp03.c)
+
+# What `pd hello` names: the version, and the commit this build's sources are at
+set(PD_BENCH_VERSION 1.0.0)
+execute_process(
+  COMMAND git -C ${CMAKE_CURRENT_SOURCE_DIR} describe --always --dirty --abbrev=12
+  OUTPUT_VARIABLE PD_BENCH_COMMIT
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+  ERROR_QUIET)
+if(NOT PD_BENCH_COMMIT)
+  set(PD_BENCH_COMMIT unknown)
+endif()
+target_compile_definitions(app PRIVATE
+  PD_BENCH_VERSION="${PD_BENCH_VERSION}"
+  PD_BENCH_COMMIT="${PD_BENCH_COMMIT}")

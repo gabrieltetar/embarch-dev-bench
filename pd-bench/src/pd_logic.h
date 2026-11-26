@@ -68,6 +68,33 @@ struct pd_logic_offer_refusal {
 	int max_ma;
 };
 
+/* How the bench answers a partner's DR_Swap, PR_Swap or a sink's Request */
+enum pd_logic_reply {
+	PD_LOGIC_REPLY_ACCEPT,
+	PD_LOGIC_REPLY_REJECT,
+};
+
+/* What `pd idle` puts back: every setting a test may have changed, as a build leaves them at boot */
+struct pd_logic_idle {
+	/* A PPS contract gets its keep-alive Request (`pd keepalive on`) */
+	bool keepalive_on;
+	/* The answers to DR_Swap, PR_Swap and a Request (`pd dr`, `pd pr`, `pd answer`) */
+	enum pd_logic_reply dr_reply;
+	enum pd_logic_reply pr_reply;
+	enum pd_logic_reply request_reply;
+	/* What the sink asks for: the highest power fixed PDO, as `pd max` */
+	enum pd_logic_want_kind want_kind;
+	/* The Source_Capabilities are the devicetree's, as `pd srccaps` with no PDO would list */
+	bool offer_from_devicetree;
+	/* Any contract in force is dropped */
+	bool drop_contract;
+	/* VBUS is off and discharged (the DRP1M1, which sources) */
+	bool vbus_off;
+};
+
+/* The settings `pd idle` restores; `drp` is a build that sources, which also turns VBUS off */
+void PdLogicIdle(bool drp, struct pd_logic_idle *idle);
+
 /* Whether a PDO is a fixed supply PDO */
 bool PdLogicPdoIsFixed(uint32_t pdo);
 

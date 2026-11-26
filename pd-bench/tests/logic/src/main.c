@@ -203,3 +203,46 @@ ZTEST(pd_logic, test_srccaps_bad_text)
 	zassert_equal(refusal.err, PD_LOGIC_OFFER_BAD_NUMBER);
 	zassert_str_equal(refusal.bad_number, "lots");
 }
+
+ZTEST(pd_logic, test_idle_restores_every_setting_on_the_sink)
+{
+	struct pd_logic_idle idle;
+
+	PdLogicIdle(false, &idle);
+	zassert_true(idle.keepalive_on);
+	zassert_equal(idle.dr_reply, PD_LOGIC_REPLY_ACCEPT);
+	zassert_equal(idle.pr_reply, PD_LOGIC_REPLY_ACCEPT);
+	zassert_equal(idle.request_reply, PD_LOGIC_REPLY_ACCEPT);
+	zassert_equal(idle.want_kind, PD_LOGIC_WANT_HIGHEST_POWER);
+	zassert_true(idle.drop_contract);
+}
+
+ZTEST(pd_logic, test_idle_sink_has_no_offer_and_no_vbus_to_turn_off)
+{
+	struct pd_logic_idle idle;
+
+	PdLogicIdle(false, &idle);
+	zassert_false(idle.offer_from_devicetree);
+	zassert_false(idle.vbus_off);
+}
+
+ZTEST(pd_logic, test_idle_drp_restores_the_offer_and_turns_vbus_off)
+{
+	struct pd_logic_idle idle;
+
+	PdLogicIdle(true, &idle);
+	zassert_true(idle.offer_from_devicetree);
+	zassert_true(idle.vbus_off);
+	zassert_true(idle.keepalive_on);
+	zassert_true(idle.drop_contract);
+}
+
+ZTEST(pd_logic, test_idle_overwrites_what_it_is_given)
+{
+	struct pd_logic_idle idle;
+
+	memset(&idle, 0xff, sizeof(idle));
+	PdLogicIdle(false, &idle);
+	zassert_false(idle.offer_from_devicetree);
+	zassert_false(idle.vbus_off);
+}

@@ -14,6 +14,20 @@
 /* A base-10 number */
 #define DECIMAL    10
 
+void PdLogicIdle(bool drp, struct pd_logic_idle *idle)
+{
+	*idle = (struct pd_logic_idle){
+		.keepalive_on = true,
+		.dr_reply = PD_LOGIC_REPLY_ACCEPT,
+		.pr_reply = PD_LOGIC_REPLY_ACCEPT,
+		.request_reply = PD_LOGIC_REPLY_ACCEPT,
+		.want_kind = PD_LOGIC_WANT_HIGHEST_POWER,
+		.offer_from_devicetree = drp,
+		.drop_contract = true,
+		.vbus_off = drp,
+	};
+}
+
 bool PdLogicPdoIsFixed(uint32_t pdo)
 {
 	union pd_fixed_supply_pdo_source fixed = {.raw_value = pdo};
