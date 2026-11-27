@@ -225,12 +225,30 @@ Every `pd` command ends its output with one line, `pd: ok` or
 | `pd pr <accept\|reject>` | How the bench answers a partner's PR_Swap (default accept; DRP1M1) |
 | `pd answer <accept\|reject\|wait>` | How the bench, as source, answers a sink's Request (default accept; DRP1M1) |
 | `pd idle` | Every setting back to its boot state: keep-alive on, `dr`, `pr` and `answer` accept, `pd max`, the devicetree's Source_Capabilities; any contract dropped (a Hard Reset for a sink holding one); on the DRP1M1 VBUS off and discharged, and an attached sink starts over (ErrorRecovery). The start of every HIL test |
+| `pd times` | The last eight PD events with the bench's uptime in microseconds (`event <name> <us>`), then one `<name> <us>` line per interval that has both ends, then `pd: ok`. Cleared by `pd idle` |
 | `pd hello` | `pd-bench version <v> commit <c> shield <s>`, the build the board runs |
 | `pd srccaps [<mV>:<mA> ...]` | The bench's Source_Capabilities: listed, or set and sent at once to a sink attached (DRP1M1) |
 
 On the SNK1M1 `pd prswap`, `pd pr`, `pd answer` and `pd srccaps` answer `pd: error not a DRP build`. `devmem`
 is enabled too, for reading the UCPD and GPIO registers without halting
 the core.
+
+### `pd times`
+
+A PD timing is measured on the bench's own clock, not a host stamp through the serial bridge. Each event the
+stack reports to the app is stamped with the bench's uptime in microseconds (the kernel tick's resolution, not
+yet characterised) as the app sees it: `attach`, `src_caps`, `request`, `accept`, `ps_rdy`, `hard_reset_sent`,
+`hard_reset_received`, `keepalive_stopped`. `pd times` lists the last eight, oldest first, then the intervals.
+An interval runs from the last event of its start to the last of its end, and has no line when either is
+missing or the start is the later (a new cycle whose end has not come). `pd idle` clears the stamps.
+
+| Interval | Starts on | Ends on |
+|---|---|---|
+| `attach_to_src_caps` | `attach`: the Policy Engine starts in a power role with no partner held | `src_caps`: Source_Capabilities received (sink role) |
+| `request_to_ps_rdy` | `request`: the stack asked the app for its Request, so the bench is about to send it | `ps_rdy`: PS_RDY received (sink) or the contract entered (source) |
+| `keepalive_stopped_to_hard_reset` | `keepalive_stopped`: the first PPS keep-alive due and skipped under `pd keepalive off`, one keep-alive period after the last Request the source saw | `hard_reset_received`: a Hard Reset from the partner |
+
+What each event's callback adds to an interval is not yet measured on a board.
 
 A choice is checked against the caps held and refused at once when it is
 not offered. `pd status` also shows the data role, the DR_Swap answer and

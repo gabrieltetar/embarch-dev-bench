@@ -212,6 +212,13 @@ static struct {
 
 	struct k_work_delayable keepalive;
 	struct k_sem ask_sem;
+	/* Its own lock: stamps are taken with `lock` held and without it */
+	struct k_spinlock times_lock;
+	struct pd_logic_times times;
+	/* A Hard Reset was requested: the transition to default that follows is not a received one */
+	bool hard_reset_sent;
+	/* The first skipped keep-alive of a contract is stamped once */
+	bool keepalive_stop_stamped;
 #ifdef CONFIG_USBC_CSM_DRP
 	/* The stack thread's own: the caps last sent, and the source's supply timing */
 	uint32_t sent_caps[PDO_MAX_DATA_OBJECTS];
@@ -229,6 +236,35 @@ static struct {
 	.pr_answer = PR_ACCEPT,
 #endif
 };
+
+/* The bench's uptime in microseconds, from the kernel tick */
+static uint64_t uptime_us(void)
+{
+	return k_ticks_to_us_near64(k_uptime_ticks());
+}
+
+/* Stamps a PD event with the bench's own clock, as the stack reports it */
+static void event_stamp(enum pd_logic_event event)
+{
+	uint64_t us = uptime_us();
+	k_spinlock_key_t key = k_spin_lock(&self.times_lock);
+
+	PdLogicTimesAdd(&self.times, event, us);
+	k_spin_unlock(&self.times_lock, key);
+}
+
+/* Asks the stack for a Hard Reset, stamping it when it is queued */
+static int hard_reset_request(void)
+{
+	int ret = usbc_request(port_dev, REQUEST_PE_HARD_RESET_SEND);
+
+	if (ret == 0) {
+		self.hard_reset_sent = true;
+		event_stamp(PD_LOGIC_EVENT_HARD_RESET_SENT);
+	}
+
+	return ret;
+}
 
 static int policy_get_snk_cap(const struct device *dev, uint32_t **pdos, int *num_pdos)
 {
@@ -281,6 +317,7 @@ static uint32_t policy_get_rdo(const struct device *dev)
 		LOG_WRN("choice not valid (%s), asking vSafe5V", why);
 	}
 	LOG_INF("Request 0x%08x", rdo);
+	event_stamp(PD_LOGIC_EVENT_REQUEST_SENT);
 
 	return rdo;
 }
@@ -292,9 +329,18 @@ static void keepalive_handler(struct k_work *work)
 
 	ARG_UNUSED(work);
 
+	bool stopped = self.contract && PdLogicPdoIsPps(self.contract_pdo) && self.keepalive_off &&
+		       !self.keepalive_stop_stamped;
+
 	self.refresh = pps;
+	if (stopped) {
+		self.keepalive_stop_stamped = true;
+	}
 	k_spin_unlock(&self.lock, key);
 
+	if (stopped) {
+		event_stamp(PD_LOGIC_EVENT_KEEPALIVE_STOPPED);
+	}
 	if (!pps) {
 		return;
 	}
@@ -313,6 +359,7 @@ static void contract_end(void)
 
 	self.contract = false;
 	self.refresh = false;
+	self.keepalive_stop_stamped = false;
 	k_spin_unlock(&self.lock, key);
 	k_work_cancel_delayable(&self.keepalive);
 }
@@ -366,11 +413,14 @@ static void role_set(bool source)
 {
 	k_spinlock_key_t key = k_spin_lock(&self.lock);
 	bool swapped = self.attached && source != self.source;
+	bool new_attach = false;
 
 	if (!self.attached) {
 		/* A new attach: the Source starts as the DFP (USB Type-C) */
 		self.attached = true;
 		self.dfp = source;
+		self.hard_reset_sent = false;
+		new_attach = true;
 	} else if (swapped && self.partner_swap) {
 		self.partner_swap = false;
 	} else if (swapped && self.prs_pending) {
@@ -391,6 +441,9 @@ static void role_set(bool source)
 #endif
 	k_spin_unlock(&self.lock, key);
 
+	if (new_attach) {
+		event_stamp(PD_LOGIC_EVENT_ATTACH);
+	}
 	if (source) {
 		contract_end();
 	}
@@ -763,7 +816,14 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 	case POWER_ROLE_IS_SINK:
 		role_set(notify == POWER_ROLE_IS_SOURCE);
 		break;
+	case SOURCE_CAPABILITIES_RECEIVED:
+		event_stamp(PD_LOGIC_EVENT_SRC_CAPS);
+		break;
+	case MSG_ACCEPT_RECEIVED:
+		event_stamp(PD_LOGIC_EVENT_ACCEPT);
+		break;
 	case TRANSITION_PS:
+		event_stamp(PD_LOGIC_EVENT_PS_RDY);
 		key = k_spin_lock(&self.lock);
 #ifdef CONFIG_USBC_CSM_DRP
 		if (self.source) {
@@ -852,6 +912,11 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 		break;
 	case SNK_TRANSITION_TO_DEFAULT:
 		key = k_spin_lock(&self.lock);
+		if (self.hard_reset_sent) {
+			self.hard_reset_sent = false;
+		} else {
+			event_stamp(PD_LOGIC_EVENT_HARD_RESET_RECEIVED);
+		}
 		swap_failed_locked();
 		k_spin_unlock(&self.lock, key);
 		contract_end();
@@ -859,6 +924,7 @@ static void policy_notify(const struct device *dev, const enum usbc_policy_notif
 		break;
 #ifdef CONFIG_USBC_CSM_DRP
 	case HARD_RESET_RECEIVED:
+		event_stamp(PD_LOGIC_EVENT_HARD_RESET_RECEIVED);
 		src_hard_reset();
 		break;
 #endif
@@ -1310,7 +1376,45 @@ static int cmd_hardreset(const struct shell *sh, size_t argc, char **argv)
 	ARG_UNUSED(argc);
 	ARG_UNUSED(argv);
 
-	return dpm_request(sh, REQUEST_PE_HARD_RESET_SEND);
+	int ret = hard_reset_request();
+
+	if (ret < 0) {
+		shell_print(sh, "pd: error request %d", ret);
+		return ret;
+	}
+	shell_print(sh, "pd: ok");
+
+	return 0;
+}
+
+/* The last events with their stamps, then the intervals a PD timing test reads */
+static int cmd_times(const struct shell *sh, size_t argc, char **argv)
+{
+	struct pd_logic_times t;
+	k_spinlock_key_t key = k_spin_lock(&self.times_lock);
+
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	t = self.times;
+	k_spin_unlock(&self.times_lock, key);
+
+	for (int i = 0; i < PdLogicTimesCount(&t); i++) {
+		struct pd_logic_stamp stamp = PdLogicTimesGet(&t, i);
+
+		shell_print(sh, "event %s %llu", PdLogicEventName(stamp.event),
+			    (unsigned long long)stamp.us);
+	}
+	for (int i = 0; i < PD_LOGIC_INTERVAL_MAX; i++) {
+		uint64_t us;
+
+		if (PdLogicInterval(&t, i, &us)) {
+			shell_print(sh, "%s %llu", PdLogicIntervalName(i), (unsigned long long)us);
+		}
+	}
+	shell_print(sh, "pd: ok");
+
+	return 0;
 }
 
 static void print_answer(const struct shell *sh, enum ask_kind kind)
@@ -1655,6 +1759,9 @@ static int cmd_idle(const struct shell *sh, size_t argc, char **argv)
 	PdLogicIdle(IS_ENABLED(CONFIG_USBC_CSM_DRP), &idle);
 
 	self.keepalive_off = !idle.keepalive_on;
+	key = k_spin_lock(&self.times_lock);
+	PdLogicTimesClear(&self.times);
+	k_spin_unlock(&self.times_lock, key);
 	dr_answer_set((enum dr_answer)idle.dr_reply);
 	key = k_spin_lock(&self.lock);
 	self.want = (struct pd_logic_want){.kind = idle.want_kind};
@@ -1698,7 +1805,7 @@ static int cmd_idle(const struct shell *sh, size_t argc, char **argv)
 		contract_end();
 		if (held) {
 			/* The source forgets a contract only on a Hard Reset */
-			ret = usbc_request(port_dev, REQUEST_PE_HARD_RESET_SEND);
+			ret = hard_reset_request();
 		}
 	}
 	if (ret < 0) {
@@ -1720,6 +1827,8 @@ SHELL_STATIC_SUBCMD_SET_CREATE(
 	SHELL_CMD_ARG(pps, NULL, "Ask a PPS APDO: pd pps <pos> <mV> <mA>", cmd_pps, 4, 0),
 	SHELL_CMD_ARG(max, NULL, "Ask the highest power fixed PDO (the default)", cmd_max, 1, 0),
 	SHELL_CMD_ARG(getcaps, NULL, "Send Get_Source_Cap", cmd_getcaps, 1, 0),
+	SHELL_CMD_ARG(times, NULL, "PD event stamps and intervals on the bench's clock", cmd_times,
+		      1, 0),
 	SHELL_CMD_ARG(hardreset, NULL, "Send Hard Reset Signaling", cmd_hardreset, 1, 0),
 	SHELL_CMD_ARG(drswap, NULL, "Send DR_Swap", cmd_drswap, 1, 0),
 	SHELL_CMD_ARG(keepalive, NULL, "PPS keep-alive Requests: pd keepalive <on|off>",

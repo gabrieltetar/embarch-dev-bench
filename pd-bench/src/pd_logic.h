@@ -137,4 +137,72 @@ int PdLogicParseInt(const char *s, int *val);
 int PdLogicOfferPdo(char *arg, int prev_mv, const uint32_t *offer_max, size_t offer_max_cnt,
 		    uint32_t *pdo, int *mv, struct pd_logic_offer_refusal *refusal);
 
+/* A PD event the stack reports to the app, stamped with the bench's own clock as it is seen */
+enum pd_logic_event {
+	/* A partner attached: the Policy Engine started in a power role */
+	PD_LOGIC_EVENT_ATTACH,
+	/* Source_Capabilities received (sink role) */
+	PD_LOGIC_EVENT_SRC_CAPS,
+	/* The stack asked the app for a Request, which it sends */
+	PD_LOGIC_EVENT_REQUEST_SENT,
+	/* The Request was answered with Accept */
+	PD_LOGIC_EVENT_ACCEPT,
+	/* PS_RDY: the contract is in force */
+	PD_LOGIC_EVENT_PS_RDY,
+	/* A Hard Reset was requested of the stack */
+	PD_LOGIC_EVENT_HARD_RESET_SENT,
+	/* A Hard Reset arrived from the partner */
+	PD_LOGIC_EVENT_HARD_RESET_RECEIVED,
+	/* The PPS keep-alive Request was due and skipped (`pd keepalive off`) */
+	PD_LOGIC_EVENT_KEEPALIVE_STOPPED,
+	PD_LOGIC_EVENT_MAX,
+};
+
+/* The intervals a PD timing test needs, each from the last event of one kind to the last of another */
+enum pd_logic_interval {
+	PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS,
+	PD_LOGIC_INTERVAL_REQUEST_TO_PS_RDY,
+	PD_LOGIC_INTERVAL_KEEPALIVE_STOPPED_TO_HARD_RESET,
+	PD_LOGIC_INTERVAL_MAX,
+};
+
+/* How many of the latest events `pd times` lists */
+#define PD_LOGIC_TIMES_KEPT 8
+
+struct pd_logic_stamp {
+	enum pd_logic_event event;
+	uint64_t us;
+};
+
+/* The latest events in order, and the last stamp of each kind */
+struct pd_logic_times {
+	struct pd_logic_stamp kept[PD_LOGIC_TIMES_KEPT];
+	/* Events added since the clear, which may exceed what is kept */
+	int total;
+	uint64_t last_us[PD_LOGIC_EVENT_MAX];
+	bool seen[PD_LOGIC_EVENT_MAX];
+};
+
+/* Forgets every event (`pd idle`) */
+void PdLogicTimesClear(struct pd_logic_times *t);
+
+/* Records `event` seen at `us` microseconds of the bench's uptime */
+void PdLogicTimesAdd(struct pd_logic_times *t, enum pd_logic_event event, uint64_t us);
+
+/* How many events `PdLogicTimesGet` has */
+int PdLogicTimesCount(const struct pd_logic_times *t);
+
+/* The `i`th kept event, 0 the oldest */
+struct pd_logic_stamp PdLogicTimesGet(const struct pd_logic_times *t, int i);
+
+/* An event's name as `pd times` prints it */
+const char *PdLogicEventName(enum pd_logic_event event);
+
+/* An interval's name as `pd times` prints it */
+const char *PdLogicIntervalName(enum pd_logic_interval interval);
+
+/* An interval in microseconds; false when an end is missing or the start is after the end */
+bool PdLogicInterval(const struct pd_logic_times *t, enum pd_logic_interval interval,
+		     uint64_t *us);
+
 #endif /* PD_BENCH_PD_LOGIC_H_ */

@@ -7,6 +7,7 @@
 #include <string.h>
 
 #include <zephyr/dt-bindings/usb-c/pd.h>
+#include <zephyr/sys/__assert.h>
 #include <zephyr/sys/util.h>
 
 /* Power in mW from mV and mA */
@@ -236,4 +237,110 @@ int PdLogicOfferPdo(char *arg, int prev_mv, const uint32_t *offer_max, size_t of
 	}
 
 	return offer_refuse(refusal, PD_LOGIC_OFFER_NOT_IN_DEVICETREE, *mv);
+}
+
+void PdLogicTimesClear(struct pd_logic_times *t)
+{
+	*t = (struct pd_logic_times){0};
+}
+
+void PdLogicTimesAdd(struct pd_logic_times *t, enum pd_logic_event event, uint64_t us)
+{
+	__ASSERT_NO_MSG(event < PD_LOGIC_EVENT_MAX);
+
+	t->kept[t->total % PD_LOGIC_TIMES_KEPT] = (struct pd_logic_stamp){event, us};
+	t->total++;
+	t->last_us[event] = us;
+	t->seen[event] = true;
+}
+
+int PdLogicTimesCount(const struct pd_logic_times *t)
+{
+	return MIN(t->total, PD_LOGIC_TIMES_KEPT);
+}
+
+struct pd_logic_stamp PdLogicTimesGet(const struct pd_logic_times *t, int i)
+{
+	__ASSERT_NO_MSG(i >= 0 && i < PdLogicTimesCount(t));
+
+	return t->kept[(t->total - PdLogicTimesCount(t) + i) % PD_LOGIC_TIMES_KEPT];
+}
+
+const char *PdLogicEventName(enum pd_logic_event event)
+{
+	switch (event) {
+	case PD_LOGIC_EVENT_ATTACH:
+		return "attach";
+	case PD_LOGIC_EVENT_SRC_CAPS:
+		return "src_caps";
+	case PD_LOGIC_EVENT_REQUEST_SENT:
+		return "request";
+	case PD_LOGIC_EVENT_ACCEPT:
+		return "accept";
+	case PD_LOGIC_EVENT_PS_RDY:
+		return "ps_rdy";
+	case PD_LOGIC_EVENT_HARD_RESET_SENT:
+		return "hard_reset_sent";
+	case PD_LOGIC_EVENT_HARD_RESET_RECEIVED:
+		return "hard_reset_received";
+	case PD_LOGIC_EVENT_KEEPALIVE_STOPPED:
+		return "keepalive_stopped";
+	default:
+		__ASSERT_NO_MSG(false);
+		return "";
+	}
+}
+
+/* The two events an interval runs between */
+static void interval_ends(enum pd_logic_interval interval, enum pd_logic_event *from,
+			  enum pd_logic_event *to)
+{
+	switch (interval) {
+	case PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS:
+		*from = PD_LOGIC_EVENT_ATTACH;
+		*to = PD_LOGIC_EVENT_SRC_CAPS;
+		break;
+	case PD_LOGIC_INTERVAL_REQUEST_TO_PS_RDY:
+		*from = PD_LOGIC_EVENT_REQUEST_SENT;
+		*to = PD_LOGIC_EVENT_PS_RDY;
+		break;
+	case PD_LOGIC_INTERVAL_KEEPALIVE_STOPPED_TO_HARD_RESET:
+		*from = PD_LOGIC_EVENT_KEEPALIVE_STOPPED;
+		*to = PD_LOGIC_EVENT_HARD_RESET_RECEIVED;
+		break;
+	default:
+		__ASSERT_NO_MSG(false);
+		*from = *to = PD_LOGIC_EVENT_ATTACH;
+		break;
+	}
+}
+
+const char *PdLogicIntervalName(enum pd_logic_interval interval)
+{
+	switch (interval) {
+	case PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS:
+		return "attach_to_src_caps";
+	case PD_LOGIC_INTERVAL_REQUEST_TO_PS_RDY:
+		return "request_to_ps_rdy";
+	case PD_LOGIC_INTERVAL_KEEPALIVE_STOPPED_TO_HARD_RESET:
+		return "keepalive_stopped_to_hard_reset";
+	default:
+		__ASSERT_NO_MSG(false);
+		return "";
+	}
+}
+
+bool PdLogicInterval(const struct pd_logic_times *t, enum pd_logic_interval interval,
+		     uint64_t *us)
+{
+	enum pd_logic_event from;
+	enum pd_logic_event to;
+
+	interval_ends(interval, &from, &to);
+	if (!t->seen[from] || !t->seen[to] || t->last_us[from] > t->last_us[to]) {
+		return false;
+	}
+	*us = t->last_us[to] - t->last_us[from];
+
+	return true;
 }

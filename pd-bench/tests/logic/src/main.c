@@ -246,3 +246,98 @@ ZTEST(pd_logic, test_idle_overwrites_what_it_is_given)
 	zassert_false(idle.offer_from_devicetree);
 	zassert_false(idle.vbus_off);
 }
+
+ZTEST_SUITE(pd_logic_times, NULL, NULL, NULL, NULL, NULL);
+
+ZTEST(pd_logic_times, test_every_interval_from_a_scripted_event_list)
+{
+	struct pd_logic_times t;
+	uint64_t us;
+
+	PdLogicTimesClear(&t);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ATTACH, 1000);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_SRC_CAPS, 1350);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_REQUEST_SENT, 1400);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ACCEPT, 1500);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_PS_RDY, 1900);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_KEEPALIVE_STOPPED, 9000000);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_HARD_RESET_RECEIVED, 23000000);
+
+	zassert_true(PdLogicInterval(&t, PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS, &us));
+	zassert_equal(us, 350);
+	zassert_true(PdLogicInterval(&t, PD_LOGIC_INTERVAL_REQUEST_TO_PS_RDY, &us));
+	zassert_equal(us, 500);
+	zassert_true(PdLogicInterval(&t, PD_LOGIC_INTERVAL_KEEPALIVE_STOPPED_TO_HARD_RESET, &us));
+	zassert_equal(us, 14000000);
+}
+
+ZTEST(pd_logic_times, test_a_missing_event_gives_no_interval)
+{
+	struct pd_logic_times t;
+	uint64_t us = 77;
+
+	PdLogicTimesClear(&t);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ATTACH, 10);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_REQUEST_SENT, 20);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_HARD_RESET_RECEIVED, 30);
+
+	zassert_false(PdLogicInterval(&t, PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS, &us));
+	zassert_false(PdLogicInterval(&t, PD_LOGIC_INTERVAL_REQUEST_TO_PS_RDY, &us));
+	zassert_false(PdLogicInterval(&t, PD_LOGIC_INTERVAL_KEEPALIVE_STOPPED_TO_HARD_RESET, &us));
+	zassert_equal(us, 77, "a missing interval leaves the value alone");
+}
+
+ZTEST(pd_logic_times, test_a_start_after_its_end_is_a_new_cycle_not_a_negative_interval)
+{
+	struct pd_logic_times t;
+	uint64_t us;
+
+	PdLogicTimesClear(&t);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ATTACH, 100);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_SRC_CAPS, 400);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ATTACH, 5000);
+
+	zassert_false(PdLogicInterval(&t, PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS, &us));
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_SRC_CAPS, 5200);
+	zassert_true(PdLogicInterval(&t, PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS, &us));
+	zassert_equal(us, 200);
+}
+
+ZTEST(pd_logic_times, test_the_list_keeps_the_latest_events_oldest_first)
+{
+	struct pd_logic_times t;
+
+	PdLogicTimesClear(&t);
+	zassert_equal(PdLogicTimesCount(&t), 0);
+	for (int i = 0; i < PD_LOGIC_TIMES_KEPT + 3; i++) {
+		PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ACCEPT, 100 + i);
+	}
+	zassert_equal(PdLogicTimesCount(&t), PD_LOGIC_TIMES_KEPT);
+	zassert_equal(PdLogicTimesGet(&t, 0).us, 103);
+	zassert_equal(PdLogicTimesGet(&t, PD_LOGIC_TIMES_KEPT - 1).us, 100 + PD_LOGIC_TIMES_KEPT + 2);
+}
+
+ZTEST(pd_logic_times, test_clear_forgets_everything)
+{
+	struct pd_logic_times t;
+	uint64_t us;
+
+	PdLogicTimesClear(&t);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_ATTACH, 1);
+	PdLogicTimesClear(&t);
+	zassert_equal(PdLogicTimesCount(&t), 0);
+	PdLogicTimesAdd(&t, PD_LOGIC_EVENT_SRC_CAPS, 5);
+	zassert_false(PdLogicInterval(&t, PD_LOGIC_INTERVAL_ATTACH_TO_SRC_CAPS, &us));
+}
+
+ZTEST(pd_logic_times, test_every_name_is_distinct)
+{
+	for (int i = 0; i < PD_LOGIC_EVENT_MAX; i++) {
+		for (int j = i + 1; j < PD_LOGIC_EVENT_MAX; j++) {
+			zassert_not_equal(strcmp(PdLogicEventName(i), PdLogicEventName(j)), 0);
+		}
+	}
+	for (int i = 0; i < PD_LOGIC_INTERVAL_MAX; i++) {
+		zassert_true(strlen(PdLogicIntervalName(i)) > 0);
+	}
+}
